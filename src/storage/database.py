@@ -169,6 +169,22 @@ class Database:
             async with self._pg_pool.acquire() as conn:
                 await conn.execute(query, *args)
 
+    async def execute_many(self, query: str, args_list: list) -> None:
+        if not args_list:
+            return
+        if self.is_sqlite:
+            import re
+            q = query
+            placeholders = re.findall(r"\$(\d+)", query)
+            max_idx = max(int(p) for p in placeholders) if placeholders else 0
+            for i in range(max_idx, 0, -1):
+                q = q.replace(f"${i}", "?")
+            await self._sqlite_conn.executemany(q, args_list)
+            await self._sqlite_conn.commit()
+        else:
+            async with self._pg_pool.acquire() as conn:
+                await conn.executemany(query, args_list)
+
     async def fetch_one(self, query: str, *args) -> Optional[Dict[str, Any]]:
         if self.is_sqlite:
             q = query

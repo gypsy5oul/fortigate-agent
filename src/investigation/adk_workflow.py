@@ -24,11 +24,13 @@ class ADKInvestigationWorkflow:
         api_key: str = "EMPTY",
         timeout_seconds: float = 60.0,
         action_catalog_path: Optional[str] = None,
+        max_output_tokens: int = 3500,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout_seconds
+        self.max_output_tokens = max_output_tokens
 
         if not action_catalog_path:
             action_catalog_path = os.path.join(
@@ -66,7 +68,7 @@ class ADKInvestigationWorkflow:
                 {"role": "user", "content": build_user_prompt(packet_json)},
             ],
             "temperature": 0.1,
-            "max_tokens": 1500,
+            "max_tokens": self.max_output_tokens,
             "response_format": {"type": "json_object"},
         }
 

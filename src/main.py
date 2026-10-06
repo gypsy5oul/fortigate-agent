@@ -58,8 +58,8 @@ class IntelligenceService:
             repository=self.repo,
             selector=self.settings.loki_selector,
             overlap_seconds=self.settings.loki_replay_overlap_seconds,
-            query_end_delay_seconds=15,
-            default_bootstrap_seconds=600,
+            query_end_delay_seconds=5,
+            default_bootstrap_seconds=60,
             limit=self.settings.loki_max_entries_per_query,
         )
 
@@ -75,6 +75,7 @@ class IntelligenceService:
             model=self.settings.llm_model,
             api_key=self.settings.llm_api_key,
             timeout_seconds=self.settings.llm_timeout_seconds,
+            max_output_tokens=self.settings.llm_max_output_tokens,
         )
 
         self.outbox_worker = OutboxWorker(
@@ -155,10 +156,13 @@ class IntelligenceService:
                         routing = rule_eval["routing_outcome"]
                         inc_id = ep["incident_id"]
 
+                        existing = await self.repo.get_incident(inc_id)
+                        is_new = existing is None
+
                         # 1. Upsert incident
                         inc_data = {
                             "id": inc_id,
-                            "current_revision": 1,
+                            "current_revision": existing["current_revision"] if existing else 1,
                             "status": "ACTIVE",
                             "severity": sev_floor,
                             "enforcement": ep["enforcement"],
@@ -172,8 +176,8 @@ class IntelligenceService:
                         }
                         await self.repo.upsert_incident(inc_data)
 
-                        # 2. Urgent deterministic alert to Outbox immediately
-                        if routing == "URGENT_ALERT_AND_INVESTIGATE":
+                        # 2. Urgent deterministic alert to Outbox immediately if new
+                        if is_new and routing == "URGENT_ALERT_AND_INVESTIGATE":
                             urgent_card = build_gchat_card(
                                 incident=inc_data,
                                 revision=1,
@@ -188,8 +192,8 @@ class IntelligenceService:
                             )
                             await self.repo.enqueue_notification(inc_id, 1, "URGENT", urgent_card)
 
-                        # 3. Enqueue investigation job for ADK & Qwen
-                        if self.settings.llm_enabled:
+                        # 3. Enqueue investigation job for ADK & Qwen if new
+                        if is_new and self.settings.llm_enabled:
                             job_payload = {
                                 "incident_id": inc_id,
                                 "episode": ep,
@@ -288,7 +292,8 @@ class IntelligenceService:
 
 def main():
     service = IntelligenceService()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     def _sig_handler():
         logger.info("Received termination signal.")

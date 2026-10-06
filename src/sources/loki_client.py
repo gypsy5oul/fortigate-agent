@@ -105,7 +105,9 @@ class LokiClient:
         start_ns: int,
         end_ns: int,
         limit: int = 1000,
-        min_window_ns: int = 1_000_000_000,  # 1 second bisection floor
+        min_window_ns: int = 2_000_000_000,  # 2 second bisection floor
+        max_depth: int = 4,
+        _depth: int = 0,
     ) -> Tuple[List[Tuple[int, str]], bool]:
         """Query Loki with automatic interval bisection if results hit the limit.
         
@@ -116,18 +118,27 @@ class LokiClient:
         if len(records) < limit:
             return records, False
 
-        # Interval saturated: bisect if window > min_window_ns
+        # Interval saturated: bisect if window > min_window_ns and depth < max_depth
         window_size = end_ns - start_ns
-        if window_size <= min_window_ns:
-            logger.warning("Unresolvable saturation in window [%s, %s] with %s entries", start_ns, end_ns, len(records))
+        if window_size <= min_window_ns or _depth >= max_depth:
+            logger.warning(
+                "Query saturation limit reached in window [%s, %s] with %s entries (depth=%s)",
+                start_ns, end_ns, len(records), _depth,
+            )
             return records, True
 
         mid_ns = start_ns + (window_size // 2)
-        logger.info("Splitting saturated interval [%s, %s] into [%s, %s] and [%s, %s]",
-                    start_ns, end_ns, start_ns, mid_ns, mid_ns, end_ns)
+        logger.info(
+            "Splitting saturated interval [%s, %s] (depth %s) into [%s, %s] and [%s, %s]",
+            start_ns, end_ns, _depth, start_ns, mid_ns, mid_ns, end_ns,
+        )
 
-        left_records, left_sat = await self.query_range_safe(query, start_ns, mid_ns, limit, min_window_ns)
-        right_records, right_sat = await self.query_range_safe(query, mid_ns, end_ns, limit, min_window_ns)
+        left_records, left_sat = await self.query_range_safe(
+            query, start_ns, mid_ns, limit, min_window_ns, max_depth, _depth + 1
+        )
+        right_records, right_sat = await self.query_range_safe(
+            query, mid_ns, end_ns, limit, min_window_ns, max_depth, _depth + 1
+        )
 
         combined = left_records + right_records
         return combined, (left_sat or right_sat)

@@ -50,58 +50,52 @@ class Repository:
 
     # --- Selected Events (Deduplicated) ---
     async def save_events(self, events: List[Dict[str, Any]]) -> int:
-        saved_count = 0
-        for ev in events:
-            if self.db.is_sqlite:
-                query = """
-                INSERT INTO selected_events (
-                    id, loki_ts_ns, eventtime_ns, devid, logid, log_type, subtype,
-                    action_raw, action_normalized, srcip, srcport, dstip, dstport,
-                    proto, service, policyid, sessionid, signature, url, http_method,
-                    severity_raw, raw_message
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
-                ON CONFLICT(id) DO NOTHING
-                """
-            else:
-                query = """
-                INSERT INTO selected_events (
-                    id, loki_ts_ns, eventtime_ns, devid, logid, log_type, subtype,
-                    action_raw, action_normalized, srcip, srcport, dstip, dstport,
-                    proto, service, policyid, sessionid, signature, url, http_method,
-                    severity_raw, raw_message
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
-                ON CONFLICT (id) DO NOTHING
-                """
+        if not events:
+            return 0
+        query = """
+        INSERT INTO selected_events (
+            id, loki_ts_ns, eventtime_ns, devid, logid, log_type, subtype,
+            action_raw, action_normalized, srcip, srcport, dstip, dstport,
+            proto, service, policyid, sessionid, signature, url, http_method,
+            severity_raw, raw_message
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+        ON CONFLICT (id) DO NOTHING
+        """
+        rows = [
+            (
+                ev["id"],
+                ev["loki_ts_ns"],
+                ev.get("eventtime_ns"),
+                ev.get("devid"),
+                ev.get("logid"),
+                ev["log_type"],
+                ev.get("subtype"),
+                ev.get("action_raw"),
+                ev["action_normalized"],
+                ev["srcip"],
+                ev.get("srcport"),
+                ev["dstip"],
+                ev.get("dstport"),
+                ev.get("proto"),
+                ev.get("service"),
+                ev.get("policyid"),
+                ev.get("sessionid"),
+                ev.get("signature"),
+                ev.get("url"),
+                ev.get("http_method"),
+                ev.get("severity_raw"),
+                ev["raw_message"],
+            )
+            for ev in events
+        ]
+        chunk_size = 500
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i : i + chunk_size]
             try:
-                await self.db.execute(
-                    query,
-                    ev["id"],
-                    ev["loki_ts_ns"],
-                    ev.get("eventtime_ns"),
-                    ev.get("devid"),
-                    ev.get("logid"),
-                    ev["log_type"],
-                    ev.get("subtype"),
-                    ev.get("action_raw"),
-                    ev["action_normalized"],
-                    ev["srcip"],
-                    ev.get("srcport"),
-                    ev["dstip"],
-                    ev.get("dstport"),
-                    ev.get("proto"),
-                    ev.get("service"),
-                    ev.get("policyid"),
-                    ev.get("sessionid"),
-                    ev.get("signature"),
-                    ev.get("url"),
-                    ev.get("http_method"),
-                    ev.get("severity_raw"),
-                    ev["raw_message"],
-                )
-                saved_count += 1
+                await self.db.execute_many(query, chunk)
             except Exception as e:
-                logger.error("Failed to insert event %s: %s", ev.get("id"), e)
-        return saved_count
+                logger.error("Failed to batch insert events chunk: %s", e)
+        return len(rows)
 
     # --- Incidents & Revisions ---
     async def get_incident(self, incident_id: str) -> Optional[Dict[str, Any]]:
@@ -165,7 +159,7 @@ class Repository:
     async def add_incident_revision(self, revision: Dict[str, Any]):
         rule_ids = revision.get("rule_ids", [])
         evidence_ids = revision.get("evidence_ids", [])
-        assessment_json = json.dumps(revision.get("assessment_json", {}))
+        assessment_json = json.dumps(revision.get("assessment_json", {}), default=str)
 
         if self.db.is_sqlite:
             query = """
@@ -208,14 +202,14 @@ class Repository:
 
     # --- Leased Job Queue ---
     async def enqueue_job(self, job_id: str, job_type: str, payload: Dict[str, Any], priority: int = 10):
-        payload_str = json.dumps(payload)
+        payload_str = json.dumps(payload, default=str)
         if self.db.is_sqlite:
             query = """
             INSERT INTO jobs (id, job_type, payload_json, priority, status, next_run_at)
             VALUES ($1, $2, $3, $4, 'PENDING', CURRENT_TIMESTAMP)
             ON CONFLICT(id) DO UPDATE SET
                 priority = excluded.priority,
-                status = 'PENDING',
+                status = CASE WHEN jobs.status IN ('COMPLETED', 'LEASED') THEN jobs.status ELSE 'PENDING' END,
                 updated_at = CURRENT_TIMESTAMP
             """
         else:
@@ -224,7 +218,7 @@ class Repository:
             VALUES ($1, $2, $3::jsonb, $4, 'PENDING', NOW())
             ON CONFLICT (id) DO UPDATE SET
                 priority = EXCLUDED.priority,
-                status = 'PENDING',
+                status = CASE WHEN jobs.status IN ('COMPLETED', 'LEASED') THEN jobs.status ELSE 'PENDING' END,
                 updated_at = NOW()
             """
         await self.db.execute(query, job_id, job_type, payload_str, priority)
@@ -308,7 +302,7 @@ class Repository:
 
     # --- Notification Outbox ---
     async def enqueue_notification(self, incident_id: str, revision: int, notif_type: str, payload: Dict[str, Any]):
-        payload_str = json.dumps(payload)
+        payload_str = json.dumps(payload, default=str)
         if self.db.is_sqlite:
             query = """
             INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status)

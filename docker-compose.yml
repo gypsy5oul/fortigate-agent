@@ -21,6 +21,7 @@ services:
       - forti_net
 
   app:
+    image: forti-intel-agent:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -33,6 +34,8 @@ services:
       - .env
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-forti_intel}:${POSTGRES_PASSWORD:-forti_secret_pw_2026}@postgres:5432/${POSTGRES_DB:-forti_intelligence}
+      - METRICS_PORT=8000
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
     extra_hosts:
       # Map internal gateway hosts to their corporate IPs
       - "loki-readonly.6dcorp.internal:10.0.20.150"
@@ -40,6 +43,8 @@ services:
       - "${METRICS_PORT:-8085}:8000"
     volumes:
       - ./config:/app/config:ro
+      - ./src:/app/src:ro
+      - /etc/pki/tls/certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
     networks:
       - forti_net
 

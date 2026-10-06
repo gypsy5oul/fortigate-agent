@@ -1,22 +1,5 @@
-# Multi-stage Dockerfile for FortiGate Firewall Intelligence Service
-# Base stage: Builder
-FROM python:3.12-slim AS builder
-
-WORKDIR /build
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN python -m venv /opt/venv && \
-    /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
-
-# Final stage: Runtime
-FROM python:3.12-slim AS runtime
+# Hardened container for FortiGate Firewall Intelligence Service
+FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -24,18 +7,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user with explicitly defined UID/GID
-RUN groupadd -g 10001 appgroup && \
-    useradd -u 10001 -g appgroup -s /sbin/nologin -d /app appuser
+RUN groupadd -f -g 10001 appgroup && \
+    (id -u appuser >/dev/null 2>&1 || useradd -u 10001 -g appgroup -s /sbin/nologin -d /app appuser)
 
 WORKDIR /app
 
-# Copy virtualenv from builder
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy application source
+# Copy application configuration and source
 COPY config/ /app/config/
 COPY src/ /app/src/
 COPY replay.py /app/replay.py
