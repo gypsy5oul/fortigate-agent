@@ -1,0 +1,53 @@
+version: "1.0.0"
+rules:
+  - id: "RULE_NONBLOCKED_EXPLOIT_ATTEMPT"
+    name: "Non-Blocked High-Impact Exploit Detection"
+    description: "UTM IPS or WAF detected exploit payload where enforcement was NOT blocked (passthrough/monitor mode)."
+    priority: "URGENT_ALERT_AND_INVESTIGATE"
+    min_severity: "CRITICAL"
+    condition:
+      type: "utm"
+      subtypes: ["ips", "waf"]
+      enforcement: ["ALLOWED_OR_DETECTED", "MIXED"]
+    reason_template: "FortiGate DPI detected high-impact attack payload ({signature}) reaching application without perimeter blocking."
+
+  - id: "RULE_MIXED_ENFORCEMENT_SEQUENCE"
+    name: "Mixed Enforcement Attack Sequence"
+    description: "Source IP exhibits both blocked probes and allowed connections within the same episode."
+    priority: "URGENT_ALERT_AND_INVESTIGATE"
+    min_severity: "HIGH"
+    condition:
+      enforcement: ["MIXED"]
+      min_events: 2
+    reason_template: "Attacker observed probing with blocked requests followed by accepted application flows."
+
+  - id: "RULE_HIGH_FREQUENCY_SCANNER"
+    name: "High Frequency Perimeter Scanner"
+    description: "Source IP repeatedly blocked across multiple services or endpoints within the correlation window."
+    priority: "DIGEST"
+    min_severity: "MEDIUM"
+    condition:
+      enforcement: ["BLOCKED"]
+      min_events: 10
+    reason_template: "Persistent external automated scanner detected ({event_count} blocked attempts)."
+
+  - id: "RULE_SSL_INSPECTION_ANOMALY"
+    name: "Deep Inspection SSL Evasion Attempt"
+    description: "TLS handshake anomalies, unsupported cipher suites, or untrusted certs during inbound deep inspection."
+    priority: "INVESTIGATE"
+    min_severity: "HIGH"
+    condition:
+      type: "utm"
+      subtypes: ["ssl"]
+      status_not: ["success"]
+    reason_template: "Inbound deep SSL inspection failure or evasion anomaly detected: {reason}"
+
+  - id: "RULE_ANTIVIRUS_DETECTION"
+    name: "Malicious Payload / Virus Detected"
+    description: "FortiGate Antivirus profile matched a malicious file transfer."
+    priority: "URGENT_ALERT_AND_INVESTIGATE"
+    min_severity: "CRITICAL"
+    condition:
+      type: "utm"
+      subtypes: ["virus"]
+    reason_template: "Antivirus inspection detected malware signature: {signature}"

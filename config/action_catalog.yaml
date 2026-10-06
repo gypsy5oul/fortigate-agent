@@ -1,0 +1,60 @@
+version: "1.0.0"
+actions:
+  - id: "ACT_QUARANTINE_SRC_IP"
+    name: "Quarantine Source IP on Perimeter"
+    category: "PERIMETER_ENFORCEMENT"
+    description: "Temporarily ban malicious source IP using FortiOS banned-ip diagnostic table."
+    risk_level: "MEDIUM"
+    requires_approval: true
+    cli_template: "diagnose user banned-ip add src4 {source_ip} {expiry_seconds} \"Automated SOC Quarantine Incident {incident_id}\""
+    rollback_template: "diagnose user banned-ip delete src4 {source_ip}"
+    default_expiry_seconds: 3600
+
+  - id: "ACT_ADD_FIREWALL_BLOCKLIST"
+    name: "Add Source IP to Threat Address Group"
+    category: "PERIMETER_ENFORCEMENT"
+    description: "Add malicious IP to FortiOS address group referenced in perimeter deny policy."
+    risk_level: "HIGH"
+    requires_approval: true
+    cli_template: |
+      config firewall address
+          edit "AUTO_BLOCK_{sanitized_ip}"
+              set subnet {source_ip}/32
+              set comment "Incident {incident_id} Auto-Block"
+          next
+      end
+      config firewall addrgrp
+          edit "G_THREAT_ACTORS"
+              append member "AUTO_BLOCK_{sanitized_ip}"
+          next
+      end
+    rollback_template: |
+      config firewall addrgrp
+          edit "G_THREAT_ACTORS"
+              unselect member "AUTO_BLOCK_{sanitized_ip}"
+          next
+      end
+      config firewall address
+          delete "AUTO_BLOCK_{sanitized_ip}"
+      end
+
+  - id: "ACT_SWITCH_IPS_TO_BLOCK"
+    name: "Switch IPS Profile from Monitor to Protect"
+    category: "PROFILE_TUNING"
+    description: "Tune policy security profile to actively drop matching exploit signatures rather than monitor/passthrough."
+    risk_level: "MEDIUM"
+    requires_approval: true
+
+  - id: "ACT_INSPECT_APPLICATION_LOGS"
+    name: "Inspect Backend Web Application Logs"
+    category: "INVESTIGATION_STEP"
+    description: "Correlate FortiGate DPI timestamp with application access logs to verify backend HTTP response code."
+    risk_level: "LOW"
+    requires_approval: false
+
+  - id: "ACT_MONITOR_AND_DIGEST"
+    name: "Log and Monitor in Weekly Threat Digest"
+    category: "OBSERVATION"
+    description: "No perimeter changes required; signature was contained by existing firewall drop rules."
+    risk_level: "LOW"
+    requires_approval: false

@@ -1,0 +1,123 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Raw Logs Fetched vs Normalized Events Ingested",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "rate(forti_poller_raw_lines_total[1m])",
+          "legendFormat": "Raw Lines/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(forti_poller_normalized_events_total[1m])",
+          "legendFormat": "Normalized Events/sec",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "id": 2,
+      "title": "Active Incident Episodes in Memory",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "forti_incidents_active_count",
+          "legendFormat": "Active Incidents",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "id": 3,
+      "title": "Google Chat Outbox Delivery Status",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "rate(forti_outbox_delivered_total[1m])",
+          "legendFormat": "Delivered Alerts/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(forti_outbox_failures_total[1m])",
+          "legendFormat": "Delivery Failures/sec",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 4,
+      "title": "Loki Poller Query Duration (p95 / p50)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(forti_poller_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 Duration",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(forti_poller_query_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 Duration",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 5,
+      "title": "Local Qwen Investigation Latency & Failures",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "rate(forti_model_inference_duration_seconds_sum[5m]) / rate(forti_model_inference_duration_seconds_count[5m])",
+          "legendFormat": "Average Latency (s)",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(forti_model_failures_total[5m])",
+          "legendFormat": "Inference Failures/sec",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["fortigate", "agent-ops", "monitoring"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": "prometheus", "value": "prometheus" },
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus Data Source"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "FortiGate Agent Operations & Telemetry",
+  "uid": "fortigate-agent-operations",
+  "version": 1
+}

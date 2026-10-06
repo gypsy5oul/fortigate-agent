@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: forti-intel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-forti_intel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forti_secret_pw_2026}
+      POSTGRES_DB: ${POSTGRES_DB:-forti_intelligence}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forti_intel} -d ${POSTGRES_DB:-forti_intelligence}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - forti_net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: forti-intel-agent
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-forti_intel}:${POSTGRES_PASSWORD:-forti_secret_pw_2026}@postgres:5432/${POSTGRES_DB:-forti_intelligence}
+    extra_hosts:
+      # Map internal gateway hosts to their corporate IPs
+      - "loki-readonly.6dcorp.internal:10.0.20.150"
+    ports:
+      - "${METRICS_PORT:-8085}:8000"
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - forti_net
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  forti_net:
+    driver: bridge

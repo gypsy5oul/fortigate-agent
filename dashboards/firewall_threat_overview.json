@@ -1,0 +1,117 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "UTM Security Events by Subtype (FortiGate 200G)",
+      "type": "timeseries",
+      "datasource": { "type": "loki", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (subtype) (rate({service_name=\"forticlient\"} |= `type=\"utm\"` [1m]))",
+          "legendFormat": "{{subtype}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "title": "Blocked vs Allowed/Detected Security Actions",
+      "type": "timeseries",
+      "datasource": { "type": "loki", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (action) (rate({service_name=\"forticlient\"} |= `type=\"utm\"` [1m]))",
+          "legendFormat": "{{action}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "id": 3,
+      "title": "Top Source IPs (Blocked Port Scans / Denies)",
+      "type": "barchart",
+      "datasource": { "type": "loki", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (srcip) (count_over_time({service_name=\"forticlient\"} |= `action=\"deny\"` [15m])))",
+          "legendFormat": "{{srcip}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "id": 4,
+      "title": "Top Targeted Destination VIPs",
+      "type": "barchart",
+      "datasource": { "type": "loki", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (dstip) (count_over_time({service_name=\"forticlient\"} |= `type=\"utm\"` [15m])))",
+          "legendFormat": "{{dstip}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "id": 5,
+      "title": "Top Triggered Attack / Web Signatures",
+      "type": "barchart",
+      "datasource": { "type": "loki", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (attack) (count_over_time({service_name=\"forticlient\"} |= `attack=\"` [15m])))",
+          "legendFormat": "{{attack}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+      "id": 6,
+      "title": "Live FortiGate UTM & Security Log Stream",
+      "type": "logs",
+      "datasource": { "type": "loki", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "{service_name=\"forticlient\"} |= `type=\"utm\"`",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["fortigate", "security", "threat-intelligence"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": "loki", "value": "loki" },
+        "name": "datasource",
+        "type": "datasource",
+        "query": "loki",
+        "label": "Loki Data Source"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "FortiGate 200G - Perimeter Threat Overview",
+  "uid": "fortigate-threat-overview",
+  "version": 1
+}

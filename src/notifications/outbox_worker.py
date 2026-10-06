@@ -1,0 +1,70 @@
+"""Durable outbox dispatcher for Google Chat with rate-limiting and dry-run safety."""
+
+import asyncio
+import logging
+from typing import Optional
+import httpx
+from src.storage.repository import Repository
+
+logger = logging.getLogger(__name__)
+
+
+class OutboxWorker:
+    def __init__(
+        self,
+        repository: Repository,
+        webhook_url: Optional[str] = None,
+        dry_run: bool = True,
+        rate_limit_delay_seconds: float = 2.0,
+    ):
+        self.repo = repository
+        self.webhook_url = webhook_url
+        self.dry_run = dry_run
+        self.delay = rate_limit_delay_seconds
+        self._client = httpx.AsyncClient(timeout=10.0)
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def process_outbox_batch(self, limit: int = 10) -> int:
+        """Process pending outbox notifications."""
+        pending = await self.repo.fetch_pending_notifications(limit)
+        if not pending:
+            return 0
+
+        dispatched = 0
+        for item in pending:
+            outbox_id = item["id"]
+            payload = item.get("payload", {})
+            incident_id = item.get("incident_id")
+            rev = item.get("revision")
+
+            if self.dry_run or not self.webhook_url:
+                logger.info(
+                    "[DRY-RUN GCHAT] Incident %s (Rev %s) Outbox ID %s:\n%s",
+                    incident_id, rev, outbox_id, payload.get("text", "")
+                )
+                await self.repo.mark_notification_sent(outbox_id)
+                dispatched += 1
+                await asyncio.sleep(0.1)
+                continue
+
+            try:
+                resp = await self._client.post(self.webhook_url, json=payload)
+                resp.raise_for_status()
+                await self.repo.mark_notification_sent(outbox_id)
+                logger.info("Successfully delivered Google Chat alert for Incident %s (Rev %s)", incident_id, rev)
+                dispatched += 1
+            except httpx.HTTPStatusError as e:
+                err_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+                logger.error("Failed to send Google Chat message for Incident %s: %s", incident_id, err_msg)
+                await self.repo.mark_notification_failed(outbox_id, err_msg)
+            except Exception as e:
+                err_msg = str(e)
+                logger.error("Network error sending Google Chat message for Incident %s: %s", incident_id, err_msg)
+                await self.repo.mark_notification_failed(outbox_id, err_msg)
+
+            # Honor per-space rate limiter
+            await asyncio.sleep(self.delay)
+
+        return dispatched
