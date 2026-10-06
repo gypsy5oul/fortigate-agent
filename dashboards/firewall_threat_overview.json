@@ -102,7 +102,7 @@
   "templating": {
     "list": [
       {
-        "current": { "selected": true, "text": "loki", "value": "loki" },
+        "current": { "selected": true, "text": "Loki", "value": "565491e5-7c30-490f-87d9-2d132f1fb067" },
         "name": "datasource",
         "type": "datasource",
         "query": "loki",

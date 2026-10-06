@@ -39,6 +39,7 @@ services:
     extra_hosts:
       # Map internal gateway hosts to their corporate IPs
       - "loki-readonly.6dcorp.internal:10.0.20.150"
+      - "grafana.6dcorp.internal:10.0.20.150"
     ports:
       - "${METRICS_PORT:-8085}:8000"
     volumes:

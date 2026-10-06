@@ -108,7 +108,7 @@
   "templating": {
     "list": [
       {
-        "current": { "selected": true, "text": "prometheus", "value": "prometheus" },
+        "current": { "selected": true, "text": "utility-cluster", "value": "ec573432-9867-4970-ba22-44f36e42b218" },
         "name": "datasource",
         "type": "datasource",
         "query": "prometheus",
