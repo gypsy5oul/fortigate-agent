@@ -4,6 +4,7 @@ import asyncio
 import time
 import argparse
 import logging
+from typing import Set
 from src.storage.database import Database
 from src.storage.repository import Repository
 from src.parsing.normalizer import normalize_event
@@ -36,9 +37,10 @@ async def run_replay(event_count: int, burst_size: int, delay_between_bursts: fl
     ]
 
     total_ingested = 0
-    total_incidents = 0
+    unique_incidents: Set[str] = set()
     t0 = time.time()
 
+    # Step 1: Ingest all burst batches into the durable inbox
     for i in range(0, event_count, burst_size):
         burst_events = []
         batch_limit = min(burst_size, event_count - i)
@@ -49,31 +51,41 @@ async def run_replay(event_count: int, burst_size: int, delay_between_bursts: fl
             if ev:
                 burst_events.append(ev)
 
-        # Ingest into DB
         saved = await repo.save_events(burst_events)
         total_ingested += saved
-
-        # Correlate into episodes
-        episodes = aggregator.process_events(burst_events)
-
-        # Rule evaluation
-        for ep in episodes:
-            eval_res = rule_engine.evaluate_episode(ep)
-            if eval_res["matched_rule_ids"]:
-                total_incidents += 1
-                logger.info(
-                    "Replay Triggered: Incident %s -> %s (Floor: %s)",
-                    ep["incident_id"], eval_res["matched_rule_ids"], eval_res["severity_floor"]
-                )
 
         if delay_between_bursts > 0:
             await asyncio.sleep(delay_between_bursts)
 
+    # Step 2: Drain durable inbox in order matching production
+    total_processed = 0
+    while True:
+        pending = await repo.fetch_pending_events(limit=100)
+        if not pending:
+            break
+
+        episodes = aggregator.process_events(pending)
+        for ep in episodes:
+            eval_res = rule_engine.evaluate_episode(ep)
+            if eval_res["matched_rule_ids"]:
+                inc_id = ep["incident_id"]
+                if inc_id not in unique_incidents:
+                    unique_incidents.add(inc_id)
+                    logger.info(
+                        "Replay Triggered: Incident %s -> %s (Floor: %s)",
+                        inc_id, eval_res["matched_rule_ids"], eval_res["severity_floor"]
+                    )
+
+        eids = [e["id"] for e in pending]
+        await repo.mark_events_processed(eids)
+        total_processed += len(eids)
+
     elapsed = time.time() - t0
     eps = total_ingested / max(elapsed, 0.001)
     logger.info("=== REPLAY BENCHMARK COMPLETE ===")
-    logger.info("Total Events Processed: %s in %.2fs (%.2f events/sec)", total_ingested, elapsed, eps)
-    logger.info("Total Incidents Flagged: %s", total_incidents)
+    logger.info("Total Events Ingested: %s (Processed: %s) in %.2fs (%.2f events/sec)",
+                total_ingested, total_processed, elapsed, eps)
+    logger.info("Unique Incidents Flagged: %s", len(unique_incidents))
 
     await db.close()
 
@@ -82,7 +94,7 @@ def main():
     parser = argparse.ArgumentParser(description="Deterministic Firewall Replay Harness")
     parser.add_argument("--count", type=int, default=100, help="Total events to replay")
     parser.add_argument("--burst", type=int, default=20, help="Burst batch size")
-    parser.add_argument("--delay", type=float, default=0.05, help="Delay between bursts (seconds)")
+    parser.add_argument("--delay", type=float, default=0.01, help="Delay between bursts (seconds)")
     args = parser.parse_args()
 
     asyncio.run(run_replay(args.count, args.burst, args.delay))

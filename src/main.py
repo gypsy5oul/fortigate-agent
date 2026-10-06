@@ -60,6 +60,7 @@ class IntelligenceService:
             overlap_seconds=self.settings.loki_replay_overlap_seconds,
             query_end_delay_seconds=5,
             default_bootstrap_seconds=60,
+            slice_seconds=self.settings.loki_slice_seconds,
             limit=self.settings.loki_max_entries_per_query,
         )
 
@@ -127,7 +128,9 @@ class IntelligenceService:
 
     # --- Supervised Loops ---
     async def _run_poller_loop(self):
-        """Continuously polls Loki, correlates events, and runs deterministic rules."""
+        """Continuously polls Loki, drains durable inbox, correlates events, and runs deterministic rules."""
+        severity_ranks = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
         while self.running:
             try:
                 t0 = time.time()
@@ -137,14 +140,15 @@ class IntelligenceService:
                 RAW_LINES_TOTAL.inc(raw_count)
                 NORMALIZED_EVENTS_TOTAL.inc(saved_count)
 
-                # Fetch recently saved events to correlate
-                if saved_count > 0:
-                    events = await self.db.fetch_all(
-                        "SELECT * FROM selected_events ORDER BY created_at DESC LIMIT $1",
-                        min(saved_count, 100)
-                    )
-                    episodes = self.aggregator.process_events(events)
+                # Drain durable inbox (all pending events in stable ascending order)
+                while self.running:
+                    pending_events = await self.repo.fetch_pending_events(limit=100)
+                    if not pending_events:
+                        break
+
+                    episodes = self.aggregator.process_events(pending_events)
                     INCIDENTS_ACTIVE.set(len(episodes))
+                    pending_ids = [ev["id"] for ev in pending_events]
 
                     for ep in episodes:
                         rule_eval = self.rule_engine.evaluate_episode(ep)
@@ -159,47 +163,106 @@ class IntelligenceService:
                         existing = await self.repo.get_incident(inc_id)
                         is_new = existing is None
 
-                        # 1. Upsert incident
+                        material_change = False
+                        if is_new:
+                            material_change = True
+                            next_rev = 1
+                        else:
+                            current_sev = existing.get("severity", "LOW")
+                            current_enf = existing.get("enforcement", "UNKNOWN")
+                            # Escalation evaluation
+                            if severity_ranks.get(sev_floor, 1) > severity_ranks.get(current_sev, 1):
+                                material_change = True
+                            elif current_enf == "BLOCKED" and ep["enforcement"] in ("ALLOWED_OR_DETECTED", "MIXED"):
+                                material_change = True
+                            elif any(r in matched_rules for r in ("RULE_NONBLOCKED_EXPLOIT_ATTEMPT", "RULE_ANTIVIRUS_DETECTION")) and current_sev != "CRITICAL":
+                                material_change = True
+
+                            next_rev = (existing.get("current_revision", 1) + 1) if material_change else existing.get("current_revision", 1)
+
                         inc_data = {
                             "id": inc_id,
-                            "current_revision": existing["current_revision"] if existing else 1,
+                            "current_revision": next_rev,
                             "status": "ACTIVE",
                             "severity": sev_floor,
                             "enforcement": ep["enforcement"],
                             "exploitation_assessment": "ATTEMPT_OBSERVED" if ep["enforcement"] in ("ALLOWED_OR_DETECTED", "MIXED") else "INSUFFICIENT_EVIDENCE",
+                            "vd": ep.get("vdom", "root"),
+                            "direction": ep.get("direction", "INBOUND"),
                             "source_ip": ep["source_ip"],
                             "target_ip": ep["target_ip"],
+                            "target_port": ep.get("target_port"),
+                            "target_service": ep.get("target_service"),
                             "first_seen": ep["first_seen"],
                             "last_seen": ep["last_seen"],
                             "event_count": ep["event_count"],
                             "summary": "; ".join(rule_eval["reasons"]),
                         }
-                        await self.repo.upsert_incident(inc_data)
 
-                        # 2. Urgent deterministic alert to Outbox immediately if new
-                        if is_new and routing == "URGENT_ALERT_AND_INVESTIGATE":
-                            urgent_card = build_gchat_card(
-                                incident=inc_data,
-                                revision=1,
-                                assessment={
+                        rev_data = None
+                        notif_card = None
+                        job_data = None
+
+                        if material_change:
+                            rev_data = {
+                                "incident_id": inc_id,
+                                "revision": next_rev,
+                                "rule_ids": matched_rules,
+                                "severity": sev_floor,
+                                "enforcement": ep["enforcement"],
+                                "assessment_json": {
                                     "severity": sev_floor,
                                     "enforcement": ep["enforcement"],
-                                    "summary": f"[DETERMINISTIC PERIMETER ALERT] {'; '.join(rule_eval['reasons'])}",
-                                    "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS", "ACT_QUARANTINE_SRC_IP"],
+                                    "summary": f"[DETERMINISTIC PERIMETER ALERT - REV {next_rev}] {'; '.join(rule_eval['reasons'])}",
+                                    "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS", "ACT_QUARANTINE_SRC_IP"] if sev_floor in ("CRITICAL", "HIGH") else ["ACT_MONITOR_AND_DIGEST"],
                                 },
-                                grafana_base_url=self.settings.grafana_base_url,
-                                datasource_uid=self.settings.grafana_datasource_uid,
-                            )
-                            await self.repo.enqueue_notification(inc_id, 1, "URGENT", urgent_card)
-
-                        # 3. Enqueue investigation job for ADK & Qwen if new
-                        if is_new and self.settings.llm_enabled:
-                            job_payload = {
-                                "incident_id": inc_id,
-                                "episode": ep,
-                                "rule_eval": rule_eval,
+                                "model_name": None,
+                                "reasoning_summary": "; ".join(rule_eval["reasons"]),
+                                "evidence_ids": ep.get("evidence_ids", [])[:5],
                             }
-                            await self.repo.enqueue_job(f"JOB-{inc_id}-1", "INVESTIGATE_INCIDENT", job_payload, priority=20)
+
+                            if routing == "URGENT_ALERT_AND_INVESTIGATE":
+                                notif_card = {
+                                    "incident_id": inc_id,
+                                    "revision": next_rev,
+                                    "notification_type": "URGENT",
+                                    "payload": build_gchat_card(
+                                        incident=inc_data,
+                                        revision=next_rev,
+                                        assessment=rev_data["assessment_json"],
+                                        grafana_base_url=self.settings.grafana_base_url,
+                                        datasource_uid=self.settings.grafana_datasource_uid,
+                                    ),
+                                }
+
+                            # Only queue LLM investigation for URGENT or INVESTIGATE (never DIGEST)
+                            if routing in ("URGENT_ALERT_AND_INVESTIGATE", "INVESTIGATE") and self.settings.llm_enabled:
+                                job_payload = {
+                                    "incident_id": inc_id,
+                                    "revision": next_rev,
+                                    "episode": ep,
+                                    "rule_eval": rule_eval,
+                                }
+                                job_data = {
+                                    "id": f"JOB-{inc_id}-{next_rev}",
+                                    "job_type": "INVESTIGATE_INCIDENT",
+                                    "payload": job_payload,
+                                    "priority": 20 if sev_floor in ("CRITICAL", "HIGH") else 10,
+                                }
+
+                        # Atomically persist transition and acknowledge processed events
+                        await self.repo.record_incident_transition(
+                            incident=inc_data,
+                            revision=rev_data,
+                            notification=notif_card,
+                            job=job_data,
+                            processed_event_ids=pending_ids,
+                        )
+                        pending_ids = []
+
+                    # If events in batch did not trigger an incident rule, acknowledge them
+                    if pending_ids:
+                        await self.repo.mark_events_processed(pending_ids)
 
                 self.aggregator.prune_stale_episodes()
             except Exception as e:
@@ -221,14 +284,17 @@ class IntelligenceService:
                 ep = payload.get("episode", {})
                 rule_eval = payload.get("rule_eval", {})
                 inc_id = payload.get("incident_id")
+                trigger_rev = payload.get("revision", 1)
+                target_rev = trigger_rev + 1
 
-                logger.info("Processing investigation job %s for Incident %s", job_id, inc_id)
+                logger.info("Processing investigation job %s for Incident %s (Target Rev %s)", job_id, inc_id, target_rev)
 
                 packet = IncidentPacket(
                     incident_id=inc_id,
-                    incident_revision=2,
+                    incident_revision=target_rev,
                     source_ip=ep["source_ip"],
                     target_ip=ep["target_ip"],
+                    target_app=ep.get("target_service") or f"Target ({ep['target_ip']})",
                     first_seen=str(ep["first_seen"]),
                     last_seen=str(ep["last_seen"]),
                     event_count=ep["event_count"],
@@ -246,28 +312,58 @@ class IntelligenceService:
                 assessment = await self.adk_workflow.investigate_packet(packet)
                 MODEL_INFERENCE_DURATION.observe(time.time() - t0)
 
-                # Record revision in database
-                await self.repo.add_incident_revision({
-                    "incident_id": inc_id,
-                    "revision": 2,
-                    "rule_ids": rule_eval.get("matched_rule_ids", []),
-                    "severity": assessment.severity,
-                    "enforcement": assessment.enforcement,
-                    "assessment_json": assessment.model_dump(),
-                    "model_name": self.settings.llm_model,
-                    "reasoning_summary": assessment.summary,
-                    "evidence_ids": [f.evidence_ids[0] for f in assessment.findings if f.evidence_ids],
-                })
-
-                # Build updated Google Chat card and enqueue to outbox
+                # Atomic incident revision and outbox transition
                 card_payload = build_gchat_card(
-                    incident={"id": inc_id, "source_ip": ep["source_ip"], "target_ip": ep["target_ip"], "event_count": ep["event_count"]},
-                    revision=2,
+                    incident={
+                        "id": inc_id,
+                        "source_ip": ep["source_ip"],
+                        "target_ip": ep["target_ip"],
+                        "event_count": ep["event_count"],
+                        "target_app": ep.get("target_service") or f"Target Host ({ep['target_ip']})",
+                    },
+                    revision=target_rev,
                     assessment=assessment.model_dump(),
                     grafana_base_url=self.settings.grafana_base_url,
                     datasource_uid=self.settings.grafana_datasource_uid,
                 )
-                await self.repo.enqueue_notification(inc_id, 2, "INVESTIGATION_UPDATE", card_payload)
+
+                await self.repo.record_incident_transition(
+                    incident={
+                        "id": inc_id,
+                        "current_revision": target_rev,
+                        "status": "ACTIVE",
+                        "severity": assessment.severity,
+                        "enforcement": assessment.enforcement,
+                        "exploitation_assessment": assessment.exploitation_assessment,
+                        "vd": ep.get("vdom", "root"),
+                        "direction": ep.get("direction", "INBOUND"),
+                        "source_ip": ep["source_ip"],
+                        "target_ip": ep["target_ip"],
+                        "target_port": ep.get("target_port"),
+                        "target_service": ep.get("target_service"),
+                        "first_seen": ep["first_seen"],
+                        "last_seen": ep["last_seen"],
+                        "event_count": ep["event_count"],
+                        "summary": assessment.summary,
+                    },
+                    revision={
+                        "incident_id": inc_id,
+                        "revision": target_rev,
+                        "rule_ids": rule_eval.get("matched_rule_ids", []),
+                        "severity": assessment.severity,
+                        "enforcement": assessment.enforcement,
+                        "assessment_json": assessment.model_dump(),
+                        "model_name": self.settings.llm_model,
+                        "reasoning_summary": assessment.summary,
+                        "evidence_ids": [f.evidence_ids[0] for f in assessment.findings if f.evidence_ids],
+                    },
+                    notification={
+                        "incident_id": inc_id,
+                        "revision": target_rev,
+                        "notification_type": "INVESTIGATION_UPDATE",
+                        "payload": card_payload,
+                    },
+                )
 
                 # Complete job
                 await self.repo.complete_job(job_id, job["version_token"])

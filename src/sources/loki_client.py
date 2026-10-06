@@ -82,12 +82,13 @@ class LokiClient:
             logger.error("Loki query error: %s", e)
             raise
 
-        results: List[Tuple[int, str]] = []
         if data.get("status") != "success":
-            logger.warning("Loki returned non-success status: %s", data.get("status"))
-            return results
+            err_text = data.get("message") or data.get("error") or str(data.get("status"))
+            logger.error("Loki query failed with non-success status: %s", err_text)
+            raise RuntimeError(f"Loki returned non-success envelope: {err_text}")
 
         streams = data.get("data", {}).get("result", [])
+        results: List[Tuple[int, str]] = []
         for stream in streams:
             values = stream.get("values", [])
             for ts_str, raw_line in values:

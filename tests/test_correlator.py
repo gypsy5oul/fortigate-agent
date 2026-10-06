@@ -14,9 +14,10 @@ def test_session_aggregator_mixed_enforcement():
 
     # Event 1: blocked deny
     ev_blocked = normalize_event(1791271940000000000, SAMPLE_TRAFFIC_DENY)
-    # Align src and dst to same target
+    # Align src, dst, and direction to same target
     ev_blocked["srcip"] = "198.51.100.45"
     ev_blocked["dstip"] = "10.0.14.120"
+    ev_blocked["direction"] = "INBOUND"
 
     # Event 2: allowed exploit detection
     ev_allowed = normalize_event(1791271941000000000, SAMPLE_IPS_NONBLOCKED_EXPLOIT)

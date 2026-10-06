@@ -35,8 +35,22 @@ def build_gchat_card(
     # Deep drilldown Grafana Explore URL
     explore_url = f"{grafana_base_url.rstrip('/')}/explore?left=%5B%22now-1h%22,%22now%22,%22{datasource_uid}%22,%7B%22expr%22:%22%7Bservice_name%3D%5C%22forticlient%5C%22%7D%20%7C%3D%20%5C%22{source_ip}%5C%22%22%7D%5D"
 
-    # CLI mitigation snippet suggestion
-    cli_snippet = f"diagnose user banned-ip add src4 {source_ip} 3600 \"SOC auto-quarantine {incident_id}\""
+    # CLI mitigation snippet suggestion (conditional on explicit recommendation)
+    cli_snippet = None
+    if "ACT_QUARANTINE_SRC_IP" in actions:
+        import ipaddress
+        try:
+            ip_obj = ipaddress.ip_address(source_ip)
+            if ip_obj.version == 4:
+                cli_snippet = f"diagnose user banned-ip add src4 {source_ip} 3600 \"SOC auto-quarantine {incident_id}\""
+            elif ip_obj.version == 6:
+                cli_snippet = f"diagnose user banned-ip add src6 {source_ip} 3600 \"SOC auto-quarantine {incident_id}\""
+        except ValueError:
+            cli_snippet = None
+
+    action_text = f"<b>Recommended Actions:</b> {', '.join(actions) if actions else 'None'}"
+    if cli_snippet:
+        action_text += f"<br><code>{cli_snippet}</code>"
 
     widgets: List[Dict[str, Any]] = [
         {
@@ -74,7 +88,7 @@ def build_gchat_card(
         },
         {
             "textParagraph": {
-                "text": f"<b>Recommended Actions:</b> {', '.join(actions) if actions else 'None'}<br><code>{cli_snippet}</code>"
+                "text": action_text
             }
         },
         {

@@ -19,6 +19,7 @@ class PollerOrchestrator:
         overlap_seconds: int = 120,
         query_end_delay_seconds: int = 15,
         default_bootstrap_seconds: int = 600,
+        slice_seconds: int = 30,
         limit: int = 1000,
     ):
         self.client = loki_client
@@ -27,6 +28,7 @@ class PollerOrchestrator:
         self.overlap_ns = overlap_seconds * 1_000_000_000
         self.end_delay_ns = query_end_delay_seconds * 1_000_000_000
         self.bootstrap_ns = default_bootstrap_seconds * 1_000_000_000
+        self.slice_ns = slice_seconds * 1_000_000_000
         self.limit = limit
         self.stream_name = selector
 
@@ -49,15 +51,18 @@ class PollerOrchestrator:
             # Overlap lookback for late arrival recovery
             start_ns = last_checkpoint - self.overlap_ns
 
-        if start_ns >= end_ns:
-            logger.debug("Query start >= end, skipping cycle.")
+        # Apply budgeted time slice
+        target_end_ns = min(end_ns, start_ns + self.slice_ns)
+
+        if start_ns >= target_end_ns:
+            logger.debug("Query start >= target_end, skipping cycle.")
             return 0, 0
 
-        logger.debug("Polling Loki %s: [%s, %s]", self.stream_name, start_ns, end_ns)
+        logger.debug("Polling Loki %s: [%s, %s]", self.stream_name, start_ns, target_end_ns)
         raw_records, had_saturation = await self.client.query_range_safe(
             self.selector,
             start_ns,
-            end_ns,
+            target_end_ns,
             limit=self.limit,
         )
 
@@ -65,7 +70,7 @@ class PollerOrchestrator:
             await self.repo.record_coverage_gap(
                 self.stream_name,
                 start_ns,
-                end_ns,
+                target_end_ns,
                 "Unresolvable query saturation exceeding limit",
             )
 
@@ -76,12 +81,24 @@ class PollerOrchestrator:
             if ev:
                 normalized_events.append(ev)
 
-        # Persist events idempotently
+        # Persist events idempotently (propagates errors on failure)
         saved_count = await self.repo.save_events(normalized_events)
 
-        # Advance durable checkpoint to end_ns
-        await self.repo.save_checkpoint(self.stream_name, end_ns)
+        # Advance durable checkpoint
+        if not had_saturation:
+            await self.repo.save_checkpoint(self.stream_name, target_end_ns)
+        elif raw_records:
+            highest_ts = max(ts_ns for ts_ns, _ in raw_records)
+            await self.repo.save_checkpoint(self.stream_name, highest_ts)
+            logger.warning(
+                "Query saturation detected: checkpoint advanced only to %s (not interval end %s)",
+                highest_ts, target_end_ns,
+            )
+        else:
+            logger.warning("Query saturation detected with no records: checkpoint retained at %s", last_checkpoint)
 
-        logger.info("Poll cycle completed: %s raw lines, %s normalized events saved",
-                    len(raw_records), saved_count)
+        logger.info(
+            "Poll cycle completed: %s raw lines, %s normalized events newly inserted",
+            len(raw_records), saved_count,
+        )
         return len(raw_records), saved_count

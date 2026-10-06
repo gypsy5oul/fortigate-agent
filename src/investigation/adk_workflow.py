@@ -86,6 +86,10 @@ class ADKInvestigationWorkflow:
 
     def _apply_guardrails(self, assessment: QwenAssessment, packet: IncidentPacket) -> QwenAssessment:
         """Enforce architectural constraints: severity floors, action allowlists, and evidence integrity."""
+        # Enforce incident identity
+        assessment.incident_id = packet.incident_id
+        assessment.incident_revision = packet.incident_revision
+
         # 1. Enforce deterministic severity floor
         floor_rank = SEVERITY_RANKS.get(packet.deterministic_severity_floor, 1)
         model_rank = SEVERITY_RANKS.get(assessment.severity, 1)
@@ -98,14 +102,33 @@ class ADKInvestigationWorkflow:
             if act_id in self.valid_action_ids
         ]
 
-        # 3. Evidence ID integrity: remove fabricated evidence references
-        valid_evidence_ids = {e["id"] for e in packet.evidence_events}
+        # 3. Grounded CVE validation: strip hallucinated CVEs not grounded in packet evidence
+        import re
+        cve_regex = re.compile(r"^CVE-\d{4}-\d{4,}$")
+        evidence_text = json.dumps([e.get("raw_message", "") for e in packet.evidence_events] + packet.signatures + packet.deterministic_reasons)
+        grounded_cves = []
+        for cve in assessment.cve_references:
+            cve_clean = cve.strip().upper()
+            if cve_regex.match(cve_clean) and cve_clean in evidence_text.upper():
+                grounded_cves.append(cve_clean)
+        assessment.cve_references = grounded_cves
+
+        # 4. Evidence ID integrity: remove fabricated evidence references
+        valid_evidence_ids = {e["id"] for e in packet.evidence_events if "id" in e}
         cleaned_findings = []
         for finding in assessment.findings:
             valid_ids = [eid for eid in finding.evidence_ids if eid in valid_evidence_ids]
             if valid_ids:
                 finding.evidence_ids = valid_ids
                 cleaned_findings.append(finding)
+
+        if not cleaned_findings and valid_evidence_ids:
+            first_id = next(iter(valid_evidence_ids))
+            cleaned_findings.append(FindingItem(
+                kind="OBSERVATION",
+                statement=f"Observed network traffic matching {', '.join(packet.deterministic_rule_ids)}.",
+                evidence_ids=[first_id],
+            ))
         assessment.findings = cleaned_findings
 
         return assessment

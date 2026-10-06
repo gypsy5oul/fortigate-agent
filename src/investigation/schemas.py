@@ -1,7 +1,7 @@
 """Pydantic schemas and guardrails for bounded ADK investigation."""
 
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field, constr
+from pydantic import BaseModel, Field, ConfigDict
 
 VisibilityScope = Literal["FIREWALL_ONLY"]
 SeverityLevel = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
@@ -19,12 +19,16 @@ AttackCategory = Literal[
 
 
 class FindingItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     kind: FindingKind
     statement: str = Field(..., max_length=400)
     evidence_ids: List[str] = Field(..., min_length=1, max_length=10)
 
 
 class QwenAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     incident_id: str
     incident_revision: int
     visibility_scope: VisibilityScope = "FIREWALL_ONLY"
@@ -34,13 +38,18 @@ class QwenAssessment(BaseModel):
     enforcement: EnforcementState
     summary: str = Field(..., max_length=1200)
     findings: List[FindingItem] = Field(default_factory=list, max_length=10)
-    cve_references: List[str] = Field(default_factory=list, max_length=10)
+    cve_references: List[str] = Field(
+        default_factory=list,
+        max_length=10,
+    )
     visibility_gaps: List[str] = Field(default_factory=list, max_length=10)
     recommended_action_ids: List[str] = Field(default_factory=list, max_length=6)
     analyst_follow_up: List[str] = Field(default_factory=list, max_length=5)
 
 
 class IncidentPacket(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     incident_id: str
     incident_revision: int
     visibility_scope: VisibilityScope = "FIREWALL_ONLY"

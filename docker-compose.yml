@@ -45,6 +45,8 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./pytest.ini:/app/pytest.ini:ro
       - /etc/pki/tls/certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
     networks:
       - forti_net

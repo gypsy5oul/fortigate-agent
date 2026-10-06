@@ -21,6 +21,8 @@ class OutboxWorker:
         self.webhook_url = webhook_url
         self.dry_run = dry_run
         self.delay = rate_limit_delay_seconds
+        if not dry_run and not webhook_url:
+            logger.warning("GCHAT_DRY_RUN is false but GCHAT_WEBHOOK_URL is not set. Outbox will mark items as SIMULATED.")
         self._client = httpx.AsyncClient(timeout=10.0)
 
     async def close(self):
@@ -41,12 +43,12 @@ class OutboxWorker:
 
             if self.dry_run or not self.webhook_url:
                 logger.info(
-                    "[DRY-RUN GCHAT] Incident %s (Rev %s) Outbox ID %s:\n%s",
+                    "[DRY-RUN / SIMULATED GCHAT] Incident %s (Rev %s) Outbox ID %s:\n%s",
                     incident_id, rev, outbox_id, payload.get("text", "")
                 )
-                await self.repo.mark_notification_sent(outbox_id)
+                await self.repo.mark_notification_simulated(outbox_id)
                 dispatched += 1
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
 
             try:

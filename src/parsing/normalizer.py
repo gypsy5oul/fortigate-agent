@@ -1,15 +1,24 @@
 """Normalizer for parsed FortiOS events into typed security event representations."""
 
 import hashlib
+import ipaddress
 from typing import Dict, Any, Optional
 from src.parsing.fortios_parser import parse_fortios_line
 
+# Security blocking actions: firewall or UTM dropped/denied/quarantined the traffic
 BLOCKED_ACTIONS = frozenset([
-    "deny", "drop", "blocked", "reset", "close", "client-rst", "server-rst", "clear_session"
+    "deny", "drop", "blocked", "block", "dropped", "ip-block", "quarantine",
+    "reset", "reset-client", "reset-server", "reset-both"
 ])
 
+# Permitted actions: firewall or UTM allowed the traffic to pass / detected without blocking
 ALLOWED_ACTIONS = frozenset([
     "accept", "pass", "passthrough", "detected", "monitor", "permit"
+])
+
+# Normal session termination actions: routine TCP closure, RST, or timeout
+SESSION_CLOSE_ACTIONS = frozenset([
+    "close", "client-rst", "server-rst", "timeout", "clear_session"
 ])
 
 
@@ -22,7 +31,64 @@ def normalize_action(action_raw: Optional[str]) -> str:
         return "BLOCKED"
     if act in ALLOWED_ACTIONS:
         return "ALLOWED_OR_DETECTED"
+    if act in SESSION_CLOSE_ACTIONS:
+        return "SESSION_CLOSED"
     return "UNKNOWN"
+
+
+INTERNAL_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("::1/128"),
+)
+
+
+def classify_direction(
+    srcip: str,
+    dstip: str,
+    srcintfrole: Optional[str] = None,
+    dstintfrole: Optional[str] = None,
+    raw_direction: Optional[str] = None,
+) -> str:
+    """Classify traffic flow direction (INBOUND, OUTBOUND, LATERAL, EXTERNAL, UNKNOWN)."""
+    # 1. Direct log direction token (from UTM / IPS logs)
+    if raw_direction:
+        d = raw_direction.strip().lower()
+        if d in ("incoming", "inbound"):
+            return "INBOUND"
+        if d in ("outgoing", "outbound"):
+            return "OUTBOUND"
+
+    # 2. Interface roles
+    s_role = (srcintfrole or "").strip().lower()
+    d_role = (dstintfrole or "").strip().lower()
+    if s_role == "wan" and d_role in ("lan", "dmz", "undefined", ""):
+        return "INBOUND"
+    if s_role in ("lan", "dmz") and d_role == "wan":
+        return "OUTBOUND"
+
+    # 3. IP address scope (RFC 1918 / CGNAT / Local vs Global)
+    try:
+        s_ip = ipaddress.ip_address(srcip)
+        d_ip = ipaddress.ip_address(dstip)
+        s_priv = any(s_ip in net for net in INTERNAL_NETWORKS)
+        d_priv = any(d_ip in net for net in INTERNAL_NETWORKS)
+
+        if not s_priv and d_priv:
+            return "INBOUND"
+        if s_priv and not d_priv:
+            return "OUTBOUND"
+        if s_priv and d_priv:
+            return "LATERAL"
+        return "EXTERNAL"
+    except ValueError:
+        return "UNKNOWN"
 
 
 def generate_event_id(loki_ts_ns: int, raw_line: str, parsed: Dict[str, str]) -> str:
@@ -71,6 +137,12 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         parsed.get("vuln_name")
     )
 
+    srcintfrole = parsed.get("srcintfrole")
+    dstintfrole = parsed.get("dstintfrole")
+    raw_direction = parsed.get("direction")
+    vd = parsed.get("vd", "root")
+    direction = classify_direction(srcip, dstip, srcintfrole, dstintfrole, raw_direction)
+
     event_id = generate_event_id(loki_ts_ns, raw_line, parsed)
 
     return {
@@ -78,6 +150,10 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         "loki_ts_ns": loki_ts_ns,
         "eventtime_ns": _to_int(parsed.get("eventtime")),
         "devid": parsed.get("devid"),
+        "vd": vd,
+        "direction": direction,
+        "srcintfrole": srcintfrole,
+        "dstintfrole": dstintfrole,
         "logid": parsed.get("logid"),
         "log_type": parsed.get("type", "unknown"),
         "subtype": parsed.get("subtype"),
@@ -96,4 +172,5 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         "http_method": parsed.get("httpmethod"),
         "severity_raw": parsed.get("level") or parsed.get("crlevel") or parsed.get("severity"),
         "raw_message": raw_line,
+        "processing_status": "PENDING",
     }
