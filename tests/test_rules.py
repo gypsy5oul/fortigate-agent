@@ -150,23 +150,6 @@ def test_multi_service_port_scanner_rule(rule_engine):
     assert "RULE_PORT_SCAN_MULTI_SERVICE" not in neg_res["matched_rule_ids"]
 
 
-def test_distributed_attack_rule(rule_engine):
-    """RULE_DISTRIBUTED_ATTACK matches when multiple sources target the same destination."""
-    pos_ep = {
-        "incident_id": "INC-DIST-POS",
-        "source_ip": "198.51.100.1",
-        "target_ip": "10.0.14.120",
-        "direction": "INBOUND",
-        "source_ips": ["198.51.100.1", "198.51.100.2", "198.51.100.3"],
-        "event_count": 3,
-        "events": [],
-    }
-    res = rule_engine.evaluate_episode(pos_ep)
-    assert "RULE_DISTRIBUTED_ATTACK" in res["matched_rule_ids"]
-    assert res["severity_floor"] == "HIGH"
-    assert res["routing_outcome"] == "INVESTIGATE"
-
-
 def test_antivirus_blocked_vs_allowed(rule_engine):
     """RULE_ANTIVIRUS_DETECTION (CRITICAL/URGENT) vs RULE_ANTIVIRUS_BLOCKED (MEDIUM/DIGEST)."""
     # Blocked AV
@@ -211,16 +194,23 @@ def test_antivirus_blocked_vs_allowed(rule_engine):
     assert res_a["routing_outcome"] == "URGENT_ALERT_AND_INVESTIGATE"
 
 
-def test_health_alert_rules(rule_engine):
-    """Health alerts route to RETAIN_WITH_VISIBILITY_GAP with priority DIGEST."""
-    health_ep = {
-        "incident_id": "INC-HEALTH-GAP",
-        "source_ip": "127.0.0.1",
-        "target_ip": "127.0.0.1",
-        "health_metric": "parser_errors",
-        "event_count": 6,
-        "events": [],
+def test_restored_episode_evaluation(rule_engine):
+    """Restored episodes without raw events in memory evaluate against signatures and enforcement_counts."""
+    restored_ep = {
+        "incident_id": "INC-RESTORED-001",
+        "source_ip": "198.51.100.45",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
+        "enforcement": "ALLOWED_OR_DETECTED",
+        "enforcement_counts": {"ALLOWED_OR_DETECTED": 3},
+        "event_count": 3,
+        "signatures": ["CVE-2021-44228"],
+        "restored": True,
+        "events": [],  # No raw events in memory
     }
-    res = rule_engine.evaluate_episode(health_ep)
-    assert "RULE_HIGH_PARSER_ERROR_RATE" in res["matched_rule_ids"]
-    assert res["routing_outcome"] == "RETAIN_WITH_VISIBILITY_GAP"
+    res = rule_engine.evaluate_episode(restored_ep)
+    assert "RULE_NONBLOCKED_EXPLOIT_ATTEMPT" in res["matched_rule_ids"]
+    assert res["severity_floor"] == "CRITICAL"
+    assert res["routing_outcome"] == "URGENT_ALERT_AND_INVESTIGATE"
+    assert "CVE-2021-44228" in res["reasons"][0]
+

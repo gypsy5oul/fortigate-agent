@@ -87,6 +87,10 @@ def redact_evidence_record(record: Dict[str, Any], include_usernames: bool = Fal
     if "user" in redacted and redacted["user"]:
         redacted["user"] = sanitize_username(redacted["user"], include_usernames=include_usernames)
 
+    # Sanitize http_method
+    if "http_method" in redacted and redacted["http_method"]:
+        redacted["http_method"] = clean_and_truncate_text(redacted["http_method"], max_len=16)
+
     # Never expose raw_message to model
     redacted.pop("raw_message", None)
 

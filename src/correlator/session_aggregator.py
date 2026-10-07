@@ -12,16 +12,17 @@ class Episode:
     def __init__(
         self,
         source_ip: str,
-        target_ip: str,
+        target_ip: Optional[str],
         first_seen_ts: float,
         vdom: str = "root",
         direction: str = "INBOUND",
         service: Optional[str] = None,
         incident_id: Optional[str] = None,
         status: str = "OPEN",
+        restored: bool = False,
     ):
         self.source_ip = source_ip
-        self.target_ip = target_ip
+        self.target_ip = target_ip or "*"
         self.first_seen_ts = first_seen_ts
         self.last_seen_ts = first_seen_ts
         self.last_event_ts_ns = int(first_seen_ts * 1e9)
@@ -29,6 +30,7 @@ class Episode:
         self.direction = direction
         self.service = service
         self.status = status
+        self.restored = restored
         self.events: List[Dict[str, Any]] = []
         self.seen_event_ids: Set[str] = set()
         self.signatures: Set[str] = set()
@@ -47,11 +49,11 @@ class Episode:
         if incident_id:
             self.incident_id = incident_id
         else:
-            seed = f"{vdom}|{direction}|{source_ip}|{target_ip}|{int(first_seen_ts)}"
+            seed = f"{vdom}|{direction}|{source_ip}|{self.target_ip}|{int(first_seen_ts)}"
             self.incident_id = f"INC-{hashlib.sha256(seed.encode()).hexdigest()[:12].upper()}"
 
         # Durable episode primary key: vdom + direction + source + target + start
-        self.episode_id = f"EP-{hashlib.sha256(f'{vdom}|{direction}|{source_ip}|{target_ip}|{int(first_seen_ts)}'.encode()).hexdigest()[:16].upper()}"
+        self.episode_id = f"EP-{hashlib.sha256(f'{vdom}|{direction}|{source_ip}|{self.target_ip}|{int(first_seen_ts)}'.encode()).hexdigest()[:16].upper()}"
 
     def add_event(self, event: Dict[str, Any], event_ts: float) -> bool:
         """Add event to episode with identity deduplication."""
@@ -173,6 +175,7 @@ class Episode:
             "events": self.events,
             "evidence_ids": [str(e["id"]) for e in self.events if "id" in e],
             "session_ids": sorted(list(self.session_ids)),
+            "restored": getattr(self, "restored", False),
         }
 
 
@@ -189,9 +192,16 @@ class SessionAggregator:
         self.active_episodes: Dict[str, Episode] = {}
         self.recent_incidents: Dict[str, Tuple[str, float]] = {}
         self.latest_event_ts: float = 0.0
+        self._closed_episode_ids: List[str] = []
 
-    def _get_key(self, vdom: str, direction: str, source_ip: str, target_ip: str) -> str:
-        return f"{vdom}:{direction}:{source_ip}->{target_ip}"
+    def _get_key(self, vdom: str, direction: str, source_ip: str, target_ip: Optional[str]) -> str:
+        tgt = target_ip if target_ip is not None else "*"
+        return f"{vdom}:{direction}:{source_ip}->{tgt}"
+
+    def pop_closed_episode_ids(self) -> List[str]:
+        ids = list(self._closed_episode_ids)
+        self._closed_episode_ids.clear()
+        return ids
 
     def load_open_episodes(self, records: List[Dict[str, Any]]):
         """Restore active episodes from the persistent episodes database table on startup."""
@@ -199,7 +209,7 @@ class SessionAggregator:
             vdom = rec.get("vdom", "root")
             direction = rec.get("direction", "INBOUND")
             src = rec["source_ip"]
-            dst = rec["target_ip"]
+            dst = rec.get("target_ip")
             svc = rec.get("service")
             key = self._get_key(vdom, direction, src, dst)
 
@@ -217,14 +227,50 @@ class SessionAggregator:
                 service=svc,
                 incident_id=rec.get("incident_id"),
                 status="OPEN",
+                restored=True,
             )
             ep.last_seen_ts = last_ts
             ep.last_event_ts_ns = rec.get("last_event_ts_ns", int(last_ts * 1e9))
             ep.episode_id = rec.get("id", ep.episode_id)
 
+            # Restore enforcement counts
+            enf_counts = rec.get("enforcement_counts")
+            if isinstance(enf_counts, str):
+                try:
+                    enf_counts = json.loads(enf_counts)
+                except Exception:
+                    enf_counts = {}
+            if isinstance(enf_counts, dict) and enf_counts:
+                ep.enforcement_counts.update(enf_counts)
+
+            # Restore signatures
+            sigs = rec.get("signatures")
+            if isinstance(sigs, str):
+                try:
+                    sigs = json.loads(sigs)
+                except Exception:
+                    sigs = []
+            if isinstance(sigs, (list, set)):
+                ep.signatures = set(sigs)
+
+            # Restore evidence IDs if present
+            ev_ids = rec.get("evidence_ids")
+            if isinstance(ev_ids, str):
+                try:
+                    ev_ids = json.loads(ev_ids)
+                except Exception:
+                    ev_ids = []
+            if isinstance(ev_ids, list):
+                ep.seen_event_ids = set(ev_ids)
+
+            # Reconcile event count if stored event_count exceeds enforcement counts sum
+            rec_ev_count = rec.get("event_count", 0)
+            cur_sum = sum(ep.enforcement_counts.values())
+            if rec_ev_count > cur_sum:
+                ep.enforcement_counts["UNKNOWN"] += (rec_ev_count - cur_sum)
+
             self.active_episodes[key] = ep
-            src_key = f"{vdom}:{direction}:{src}"
-            self.recent_incidents[src_key] = (ep.incident_id, last_ts)
+            self.recent_incidents[key] = (ep.incident_id, last_ts)
             self.latest_event_ts = max(self.latest_event_ts, last_ts)
 
     def process_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -234,7 +280,7 @@ class SessionAggregator:
 
         for ev in events:
             src = ev["srcip"]
-            dst = ev["dstip"]
+            dst = ev.get("dstip")
             vdom = ev.get("vd", "root")
             direction = ev.get("direction", "INBOUND")
             svc = ev.get("service")
@@ -243,7 +289,6 @@ class SessionAggregator:
             ev_ts = (ev.get("eventtime_ns") or ev.get("loki_ts_ns") or int(now * 1e9)) / 1e9
             self.latest_event_ts = max(self.latest_event_ts, ev_ts)
 
-            src_key = f"{vdom}:{direction}:{src}"
             assigned_inc_id = None
 
             if key in self.active_episodes:
@@ -251,14 +296,15 @@ class SessionAggregator:
                 # Check idle timeout (120 s) or max duration (600 s) based on event time
                 if (ev_ts - ep.last_seen_ts > self.idle_timeout) or (ev_ts - ep.first_seen_ts > self.max_episode):
                     ep.status = "CLOSED"
-                    # Campaign window check (30 min)
+                    self._closed_episode_ids.append(ep.episode_id)
+                    # Campaign window check (30 min) for same target key
                     if (ev_ts - ep.last_seen_ts) <= self.campaign_window:
                         assigned_inc_id = ep.incident_id
                     new_ep = Episode(src, dst, ev_ts, vdom=vdom, direction=direction, service=svc, incident_id=assigned_inc_id)
                     self.active_episodes[key] = new_ep
             else:
-                # Check campaign window across recent incidents for this source
-                recent_info = self.recent_incidents.get(src_key)
+                # Check campaign window across recent incidents for this specific target key
+                recent_info = self.recent_incidents.get(key)
                 if recent_info and (ev_ts - recent_info[1] <= self.campaign_window):
                     assigned_inc_id = recent_info[0]
                 new_ep = Episode(src, dst, ev_ts, vdom=vdom, direction=direction, service=svc, incident_id=assigned_inc_id)
@@ -266,20 +312,23 @@ class SessionAggregator:
 
             current_ep = self.active_episodes[key]
             current_ep.add_event(ev, ev_ts)
-            self.recent_incidents[src_key] = (current_ep.incident_id, ev_ts)
+            self.recent_incidents[key] = (current_ep.incident_id, ev_ts)
             if current_ep not in touched_episodes:
                 touched_episodes.append(current_ep)
 
         return [ep.to_dict() for ep in touched_episodes]
 
-    def prune_stale_episodes(self, current_event_time: Optional[float] = None) -> int:
+    def prune_stale_episodes(self, current_event_time: Optional[float] = None) -> List[str]:
         """Close episodes exceeding idle timeout using event timestamp progression."""
         ref_time = current_event_time or self.latest_event_ts
         stale_keys = [
             k for k, ep in self.active_episodes.items()
             if (ref_time - ep.last_seen_ts > self.idle_timeout)
         ]
+        closed_ids = []
         for k in stale_keys:
-            self.active_episodes[k].status = "CLOSED"
+            ep = self.active_episodes[k]
+            ep.status = "CLOSED"
+            closed_ids.append(ep.episode_id)
             del self.active_episodes[k]
-        return len(stale_keys)
+        return closed_ids

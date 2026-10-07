@@ -1,5 +1,7 @@
 # Implementation brief for Gemini: remediate `feature/gate-a-core-repair` and build the investigator agent
 
+> **Superseded in part (2026-10-07):** sections 3 (Phase B) and 4 (Phase C) of this brief are replaced by `docs/GEMINI-PHASE-B1-AND-PHASE-C-ADK-PLAN.md`. Sections 0 and 6 (rules of engagement, report format) still apply.
+
 Repository: `gypsy5oul/fortigate-agent`. Base branch for this work: `feature/gate-a-core-repair` at commit `02f97d5`.
 All `path:line` references below are against that commit. Re-check them before editing; if a reference no longer matches, find the code by its description and say so in your report. Do not guess.
 

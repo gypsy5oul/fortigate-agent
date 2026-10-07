@@ -54,6 +54,19 @@ class PollerOrchestrator:
 
             last_checkpoint = await self.repo.get_checkpoint(self.stream_name)
             if last_checkpoint is None:
+                # Carry-over: when profile stream key has no checkpoint but bare selector does, seed from bare minus overlap
+                if "#" in self.stream_name and self.selector:
+                    bare_checkpoint = await self.repo.get_checkpoint(self.selector)
+                    if bare_checkpoint is not None:
+                        seeded_checkpoint = max(0, bare_checkpoint - self.overlap_ns)
+                        logger.info(
+                            "Seeding profile checkpoint for %s from bare selector checkpoint (%s - overlap %s ns = %s)",
+                            self.stream_name, bare_checkpoint, self.overlap_ns, seeded_checkpoint,
+                        )
+                        await self.repo.save_checkpoint(self.stream_name, seeded_checkpoint)
+                        last_checkpoint = seeded_checkpoint
+
+            if last_checkpoint is None:
                 # First run: bootstrap looking back default_bootstrap_seconds
                 start_ns = end_bound_ns - self.bootstrap_ns
                 target_end_ns = min(end_bound_ns, start_ns + self.slice_ns)

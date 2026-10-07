@@ -92,6 +92,17 @@ def _render_traffic_baseline(selector: str, params: Dict[str, Any]) -> str:
     return query
 
 
+def _render_security_events(selector: str, params: Dict[str, Any]) -> str:
+    return f'{selector} |~ "type=\\"utm\\"|type=\\"event\\"|action=\\"deny\\"|utmaction=\\"block\\""'
+
+
+SECURITY_EVENTS_PROFILE = QueryProfile(
+    name="security_events",
+    version=1,
+    template_fn=_render_security_events,
+    description="Selects FortiOS UTM, events, and blocked/denied traffic for security monitoring",
+)
+
 UTM_DETECTIONS_PROFILE = QueryProfile(
     name="utm_detections",
     version=1,
@@ -121,6 +132,7 @@ TRAFFIC_BASELINE_PROFILE = QueryProfile(
 )
 
 QUERY_PROFILES: Dict[str, QueryProfile] = {
+    SECURITY_EVENTS_PROFILE.name: SECURITY_EVENTS_PROFILE,
     UTM_DETECTIONS_PROFILE.name: UTM_DETECTIONS_PROFILE,
     FIREWALL_EVENTS_PROFILE.name: FIREWALL_EVENTS_PROFILE,
     TRAFFIC_CONTEXT_PROFILE.name: TRAFFIC_CONTEXT_PROFILE,

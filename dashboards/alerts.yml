@@ -1,0 +1,47 @@
+groups:
+  - name: fortigate_intel_operational_alerts
+    rules:
+      - alert: FortiGateHighParserErrorRate
+        expr: increase(forti_intel_parser_errors_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High FortiOS log parser error rate"
+          description: "Parser error burst observed indicating possible log format mismatch or corrupted log stream."
+
+      - alert: FortiGateLogSilence
+        expr: forti_intel_loki_last_success_age_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki ingestion silence detected"
+          description: "Poller observed zero successful fetches for over 120 seconds."
+
+      - alert: FortiGateCoverageGap
+        expr: increase(forti_intel_coverage_gaps_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki query coverage gap detected"
+          description: "Coverage gap recorded due to query saturation or rate limits in Loki stream."
+
+      - alert: FortiGateProcessingBacklog
+        expr: forti_intel_backlog_pending_events > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Event processing inbox backlog high"
+          description: "Pending events inbox backlog has exceeded 500 items for over 5 minutes."
+
+      - alert: FortiGateModelDegraded
+        expr: forti_intel_model_consecutive_failures >= 3
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Investigation model degraded"
+          description: "LLM endpoint has failed 3 or more consecutive calls; service is using deterministic fallback."

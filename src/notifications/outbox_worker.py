@@ -2,6 +2,7 @@
 
 import re
 import json
+import time
 import random
 import asyncio
 import logging
@@ -38,6 +39,7 @@ class OutboxWorker:
 
         if not dry_run and not webhook_url:
             logger.warning("GCHAT_DRY_RUN is false but GCHAT_WEBHOOK_URL is not set. Outbox will mark items as SIMULATED.")
+        self.last_success_time = time.time()
         self._client = httpx.AsyncClient(timeout=10.0)
 
     async def close(self):
@@ -91,6 +93,8 @@ class OutboxWorker:
                     incident_id, rev, outbox_id, payload.get("text", "")
                 )
                 await self.repo.mark_notification_simulated(outbox_id)
+                self.last_success_time = time.time()
+                CHAT_LAST_SUCCESS_AGE_SECONDS.set(0)
                 dispatched += 1
                 await asyncio.sleep(0.05)
                 continue
@@ -102,6 +106,7 @@ class OutboxWorker:
                 await self.repo.mark_notification_sent(outbox_id)
                 logger.info("Successfully delivered Google Chat alert for Incident %s (Rev %s)", incident_id, rev)
                 OUTBOX_DELIVERED_TOTAL.inc()
+                self.last_success_time = time.time()
                 CHAT_LAST_SUCCESS_AGE_SECONDS.set(0)
                 dispatched += 1
             except httpx.HTTPStatusError as e:
@@ -110,22 +115,31 @@ class OutboxWorker:
                 err_msg = f"HTTP {status_code}: {body_clean}"
                 OUTBOX_FAILURES_TOTAL.inc()
 
-                # Permanent 4xx client errors (excluding 429 rate limits)
-                if 400 <= status_code < 500 and status_code != 429:
+                # Permanent 4xx client errors (excluding 408 Request Timeout and 429 rate limits)
+                if 400 <= status_code < 500 and status_code not in (408, 429):
                     logger.error("Permanent HTTP %s error delivering alert %s; moving to DEAD_LETTER: %s", status_code, outbox_id, err_msg)
                     OUTBOX_DEAD_LETTER_TOTAL.inc()
                     await self.repo.mark_notification_failed(outbox_id, err_msg, dead_letter=True)
                 elif status_code == 429:
-                    # Rate limit with Retry-After header
+                    # Rate limit with Retry-After header (seconds or HTTP date)
                     retry_header = e.response.headers.get("Retry-After")
-                    try:
-                        retry_delay = float(retry_header) if retry_header else 3.0
-                    except ValueError:
-                        retry_delay = 3.0
+                    retry_delay = 3.0
+                    if retry_header:
+                        try:
+                            retry_delay = float(retry_header)
+                        except ValueError:
+                            from email.utils import parsedate_to_datetime
+                            from datetime import datetime, timezone
+                            try:
+                                dt = parsedate_to_datetime(retry_header)
+                                now_dt = datetime.now(timezone.utc)
+                                retry_delay = max(1.0, (dt - now_dt).total_seconds())
+                            except Exception:
+                                retry_delay = 3.0
                     logger.warning("Google Chat rate limited (429); backoff for %s s on alert %s", retry_delay, outbox_id)
                     await self.repo.mark_notification_failed(outbox_id, err_msg, retry_after_seconds=retry_delay)
                 else:
-                    # 5xx server errors: exponential backoff with jitter
+                    # 408 or 5xx server errors: exponential backoff with jitter
                     backoff = min(900.0, 30.0 * (2 ** attempts)) + random.uniform(0.5, 3.0)
                     logger.warning("Temporary HTTP %s on alert %s; retry in %.1f s", status_code, outbox_id, backoff)
                     await self.repo.mark_notification_failed(outbox_id, err_msg, retry_after_seconds=backoff)

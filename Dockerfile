@@ -26,9 +26,10 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy application configuration, source, and entrypoint
+# Copy application configuration, source, entrypoint, and migrations
 COPY config/ /app/config/
 COPY src/ /app/src/
+COPY migrations/ /app/migrations/
 COPY replay.py /app/replay.py
 
 # Create writable temp directory for appuser

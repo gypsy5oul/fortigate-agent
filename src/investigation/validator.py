@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 SEVERITY_LEVELS = ["INFORMATIONAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
 FORBIDDEN_CLAIMS_PATTERN = re.compile(
-    r"\b(confirmed compromise|exfiltrated|reverse shell|successfully exploited|attacker is)\b",
+    r"\b(confirmed compromise|exfiltrated|reverse shell|successfully exploited)\b",
     re.IGNORECASE,
 )
 
@@ -128,6 +128,9 @@ def validate_assessment(
             clean_actions.append(act_id)
         else:
             reasons.append("INELIGIBLE_ACTION_STRIPPED")
+    if not clean_actions:
+        clean_actions = ["ACT_INSPECT_APPLICATION_LOGS"]
+        reasons.append("DEFAULT_ACTION_APPLIED")
     assessment.recommended_action_ids = clean_actions
 
     # 10. Length Caps

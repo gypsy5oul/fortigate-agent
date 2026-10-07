@@ -4,6 +4,7 @@ import json
 import logging
 import hashlib
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from src.storage.database import Database
@@ -33,11 +34,6 @@ class Repository:
         row = await self.db.fetch_one(query, stream_name)
         if row:
             return row["last_queried_ts_ns"]
-        if "#" not in stream_name:
-            prefix_query = "SELECT last_queried_ts_ns FROM query_checkpoints WHERE stream_name LIKE $1 ORDER BY updated_at DESC LIMIT 1"
-            row = await self.db.fetch_one(prefix_query, f"{stream_name}#%")
-            if row:
-                return row["last_queried_ts_ns"]
         return None
 
     async def save_checkpoint(self, stream_name: str, ts_ns: int):
@@ -73,11 +69,7 @@ class Repository:
 
     async def get_coverage_gaps(self, stream_name: str) -> List[Dict[str, Any]]:
         query = "SELECT * FROM coverage_gaps WHERE stream_name = $1 ORDER BY start_ts_ns ASC"
-        rows = await self.db.fetch_all(query, stream_name)
-        if not rows and "#" not in stream_name:
-            prefix_query = "SELECT * FROM coverage_gaps WHERE stream_name LIKE $1 ORDER BY start_ts_ns ASC"
-            rows = await self.db.fetch_all(prefix_query, f"{stream_name}#%")
-        return rows
+        return await self.db.fetch_all(query, stream_name)
 
     # --- Selected Events (Deduplicated with Accurate Counts) ---
     async def save_events(self, events: List[Dict[str, Any]]) -> int:
@@ -260,7 +252,7 @@ class Repository:
     async def upsert_incident(self, incident: Dict[str, Any]):
         first_seen_dt = to_utc_datetime(incident["first_seen"])
         last_seen_dt = to_utc_datetime(incident["last_seen"])
-        last_urgent_at_dt = to_utc_datetime(incident.get("last_urgent_at"))
+        last_urgent_at_dt = to_utc_datetime(incident["last_urgent_at"]) if incident.get("last_urgent_at") is not None else None
         rule_ids = incident.get("deterministic_rule_ids", [])
         if isinstance(rule_ids, set):
             rule_ids = list(rule_ids)
@@ -419,6 +411,89 @@ class Repository:
                 assessment_source,
             )
 
+    async def record_model_run(
+        self,
+        incident_id: str,
+        revision: int,
+        model_run: Dict[str, Any],
+        commit_status: str = "PENDING",
+    ) -> Optional[int]:
+        """Record model run audit row in an independent transaction with commit_status."""
+        m_run = dict(model_run)
+        m_reason_codes = m_run.get("reason_codes", [])
+        if isinstance(m_reason_codes, set):
+            m_reason_codes = list(m_reason_codes)
+
+        if self.db.is_sqlite:
+            m_query = """
+            INSERT INTO model_runs (
+                incident_id, revision, model_id, server_reported_model,
+                prompt_version, schema_version, rule_pack_version, catalog_version,
+                action_map_version, input_hash, input_tokens, output_tokens,
+                latency_ms, structured_output_mode, validation_result, reason_codes, commit_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            """
+            await self.db.execute(
+                m_query,
+                incident_id,
+                revision,
+                m_run.get("model_id", "qwen3.8-27b"),
+                m_run.get("server_reported_model"),
+                m_run.get("prompt_version", "1.0.0"),
+                m_run.get("schema_version", "1.0.0"),
+                m_run.get("rule_pack_version", "1.0.0"),
+                m_run.get("catalog_version", "1.0.0"),
+                m_run.get("action_map_version", "1.0.0"),
+                m_run.get("input_hash", ""),
+                m_run.get("input_tokens", 0),
+                m_run.get("output_tokens", 0),
+                m_run.get("latency_ms", 0),
+                m_run.get("structured_output_mode", "json_schema"),
+                m_run.get("validation_result", "VALID"),
+                json.dumps(m_reason_codes),
+                commit_status,
+            )
+            row = await self.db.fetch_one("SELECT last_insert_rowid() as id")
+            return row["id"] if row else None
+        else:
+            m_query = """
+            INSERT INTO model_runs (
+                incident_id, revision, model_id, server_reported_model,
+                prompt_version, schema_version, rule_pack_version, catalog_version,
+                action_map_version, input_hash, input_tokens, output_tokens,
+                latency_ms, structured_output_mode, validation_result, reason_codes, commit_status
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            RETURNING id
+            """
+            row = await self.db.fetch_one(
+                m_query,
+                incident_id,
+                revision,
+                m_run.get("model_id", "qwen3.8-27b"),
+                m_run.get("server_reported_model"),
+                m_run.get("prompt_version", "1.0.0"),
+                m_run.get("schema_version", "1.0.0"),
+                m_run.get("rule_pack_version", "1.0.0"),
+                m_run.get("catalog_version", "1.0.0"),
+                m_run.get("action_map_version", "1.0.0"),
+                m_run.get("input_hash", ""),
+                m_run.get("input_tokens", 0),
+                m_run.get("output_tokens", 0),
+                m_run.get("latency_ms", 0),
+                m_run.get("structured_output_mode", "json_schema"),
+                m_run.get("validation_result", "VALID"),
+                m_reason_codes,
+                commit_status,
+            )
+            return row["id"] if row else None
+
+    async def update_model_run_status(self, model_run_id: int, commit_status: str):
+        """Update commit_status on an existing model_runs row."""
+        if not model_run_id:
+            return
+        query = "UPDATE model_runs SET commit_status = $1 WHERE id = $2"
+        await self.db.execute(query, commit_status, model_run_id)
+
     async def record_incident_transition(
         self,
         incident: Dict[str, Any],
@@ -435,7 +510,66 @@ class Repository:
         
         Enforces optimistic revision concurrency and job leasing fences.
         Revision number is allocated inside transaction from freshly read current_revision.
+        Model runs are recorded in an independent transaction with commit_status.
         """
+        model_run_id = None
+        if model_run:
+            target_rev = (expected_revision + 1) if (expected_revision is not None and expected_revision > 0) else incident.get("current_revision", 1)
+            try:
+                model_run_id = await self.record_model_run(
+                    incident_id=incident["id"],
+                    revision=target_rev,
+                    model_run=model_run,
+                    commit_status="PENDING",
+                )
+            except Exception as mr_err:
+                logger.warning("Failed to record pre-transition model_run: %s", mr_err)
+
+        try:
+            new_rev = await self._execute_incident_transition(
+                incident=incident,
+                revision=revision,
+                notification=notification,
+                job=job,
+                processed_event_ids=processed_event_ids,
+                expected_revision=expected_revision,
+                fence_job_id=fence_job_id,
+                fence_version_token=fence_version_token,
+            )
+        except RevisionConflict:
+            if model_run_id:
+                try:
+                    await self.update_model_run_status(model_run_id, "CONFLICT")
+                except Exception as update_err:
+                    logger.warning("Failed to update model_run status to CONFLICT: %s", update_err)
+            raise
+        except Exception:
+            if model_run_id:
+                try:
+                    await self.update_model_run_status(model_run_id, "FAILED")
+                except Exception as update_err:
+                    logger.warning("Failed to update model_run status to FAILED: %s", update_err)
+            raise
+
+        if model_run_id:
+            try:
+                await self.update_model_run_status(model_run_id, "COMMITTED")
+            except Exception as update_err:
+                logger.warning("Failed to update model_run status to COMMITTED: %s", update_err)
+
+        return new_rev
+
+    async def _execute_incident_transition(
+        self,
+        incident: Dict[str, Any],
+        revision: Optional[Dict[str, Any]] = None,
+        notification: Optional[Dict[str, Any]] = None,
+        job: Optional[Dict[str, Any]] = None,
+        processed_event_ids: Optional[List[str]] = None,
+        expected_revision: Optional[int] = None,
+        fence_job_id: Optional[str] = None,
+        fence_version_token: Optional[int] = None,
+    ) -> int:
         async with self.db.transaction() as tx:
             # 1. Fence check if completing a leased job
             if fence_job_id is not None and fence_version_token is not None:
@@ -478,7 +612,7 @@ class Repository:
 
             first_seen_dt = to_utc_datetime(incident["first_seen"])
             last_seen_dt = to_utc_datetime(incident["last_seen"])
-            last_urgent_at_dt = to_utc_datetime(incident.get("last_urgent_at"))
+            last_urgent_at_dt = to_utc_datetime(incident["last_urgent_at"]) if incident.get("last_urgent_at") is not None else None
             rule_ids = incident.get("deterministic_rule_ids", [])
             if isinstance(rule_ids, set):
                 rule_ids = list(rule_ids)
@@ -672,70 +806,6 @@ class Repository:
                         revision.get("reasoning_summary"),
                         rev_evidence_ids,
                         assessment_src,
-                    )
-
-            # 4b. Record model_runs audit row if provided
-            if model_run:
-                m_run = dict(model_run)
-                m_reason_codes = m_run.get("reason_codes", [])
-                if isinstance(m_reason_codes, set):
-                    m_reason_codes = list(m_reason_codes)
-
-                if self.db.is_sqlite:
-                    m_query = """
-                    INSERT INTO model_runs (
-                        incident_id, revision, model_id, server_reported_model,
-                        prompt_version, schema_version, rule_pack_version, catalog_version,
-                        action_map_version, input_hash, input_tokens, output_tokens,
-                        latency_ms, structured_output_mode, validation_result, reason_codes
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                    """
-                    await tx.execute(
-                        m_query,
-                        incident["id"],
-                        new_rev,
-                        m_run.get("model_id", "qwen3.8-27b"),
-                        m_run.get("server_reported_model"),
-                        m_run.get("prompt_version", "1.0.0"),
-                        m_run.get("schema_version", "1.0.0"),
-                        m_run.get("rule_pack_version", "1.0.0"),
-                        m_run.get("catalog_version", "1.0.0"),
-                        m_run.get("action_map_version", "1.0.0"),
-                        m_run.get("input_hash", ""),
-                        m_run.get("input_tokens", 0),
-                        m_run.get("output_tokens", 0),
-                        m_run.get("latency_ms", 0),
-                        m_run.get("structured_output_mode", "json_schema"),
-                        m_run.get("validation_result", "VALID"),
-                        json.dumps(m_reason_codes),
-                    )
-                else:
-                    m_query = """
-                    INSERT INTO model_runs (
-                        incident_id, revision, model_id, server_reported_model,
-                        prompt_version, schema_version, rule_pack_version, catalog_version,
-                        action_map_version, input_hash, input_tokens, output_tokens,
-                        latency_ms, structured_output_mode, validation_result, reason_codes
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-                    """
-                    await tx.execute(
-                        m_query,
-                        incident["id"],
-                        new_rev,
-                        m_run.get("model_id", "qwen3.8-27b"),
-                        m_run.get("server_reported_model"),
-                        m_run.get("prompt_version", "1.0.0"),
-                        m_run.get("schema_version", "1.0.0"),
-                        m_run.get("rule_pack_version", "1.0.0"),
-                        m_run.get("catalog_version", "1.0.0"),
-                        m_run.get("action_map_version", "1.0.0"),
-                        m_run.get("input_hash", ""),
-                        m_run.get("input_tokens", 0),
-                        m_run.get("output_tokens", 0),
-                        m_run.get("latency_ms", 0),
-                        m_run.get("structured_output_mode", "json_schema"),
-                        m_run.get("validation_result", "VALID"),
-                        m_reason_codes,
                     )
 
             # 5. Enqueue notification if provided
@@ -1082,7 +1152,7 @@ class Repository:
 
     # --- Episode Persistence (B6) ---
     async def save_episodes(self, episodes: List[Dict[str, Any]]):
-        """Persist or update episodes in the episodes table."""
+        """Persist or update episodes in the episodes table with enforcement counts and signatures."""
         if not episodes:
             return
         for ep in episodes:
@@ -1093,19 +1163,23 @@ class Repository:
             last_str = last_dt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(last_dt, datetime) else str(last_dt)
             ev_ids = [str(x) for x in ep.get("evidence_ids", [])]
             s_ids = [int(x) for x in ep.get("session_ids", [])]
+            enf_counts = ep.get("enforcement_counts", {})
+            sigs = list(ep.get("signatures", []))
 
             if self.db.is_sqlite:
                 query = """
                 INSERT INTO episodes (
                     id, vdom, direction, source_ip, target_ip, service,
                     incident_id, status, first_seen, last_seen, last_event_ts_ns,
-                    event_count, enforcement, evidence_ids, session_ids, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP)
+                    event_count, enforcement, enforcement_counts, signatures, evidence_ids, session_ids, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, CURRENT_TIMESTAMP)
                 ON CONFLICT(id) DO UPDATE SET
                     last_seen = excluded.last_seen,
                     last_event_ts_ns = excluded.last_event_ts_ns,
                     event_count = excluded.event_count,
                     enforcement = excluded.enforcement,
+                    enforcement_counts = excluded.enforcement_counts,
+                    signatures = excluded.signatures,
                     evidence_ids = excluded.evidence_ids,
                     session_ids = excluded.session_ids,
                     status = excluded.status,
@@ -1126,6 +1200,8 @@ class Repository:
                     ep.get("last_event_ts_ns", 0),
                     ep.get("event_count", 1),
                     ep.get("enforcement", "UNKNOWN"),
+                    json.dumps(enf_counts),
+                    json.dumps(sigs),
                     json.dumps(ev_ids),
                     json.dumps(s_ids),
                 )
@@ -1134,13 +1210,15 @@ class Repository:
                 INSERT INTO episodes (
                     id, vdom, direction, source_ip, target_ip, service,
                     incident_id, status, first_seen, last_seen, last_event_ts_ns,
-                    event_count, enforcement, evidence_ids, session_ids, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+                    event_count, enforcement, enforcement_counts, signatures, evidence_ids, session_ids, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, NOW())
                 ON CONFLICT (id) DO UPDATE SET
                     last_seen = EXCLUDED.last_seen,
                     last_event_ts_ns = EXCLUDED.last_event_ts_ns,
                     event_count = EXCLUDED.event_count,
                     enforcement = EXCLUDED.enforcement,
+                    enforcement_counts = EXCLUDED.enforcement_counts,
+                    signatures = EXCLUDED.signatures,
                     evidence_ids = EXCLUDED.evidence_ids,
                     session_ids = EXCLUDED.session_ids,
                     status = EXCLUDED.status,
@@ -1161,52 +1239,158 @@ class Repository:
                     ep.get("last_event_ts_ns", 0),
                     ep.get("event_count", 1),
                     ep.get("enforcement", "UNKNOWN"),
+                    json.dumps(enf_counts),
+                    sigs,
                     ev_ids,
                     s_ids,
                 )
 
-    async def load_open_episodes(self) -> List[Dict[str, Any]]:
-        """Fetch all currently open episodes from database to resume correlation state."""
-        query = "SELECT * FROM episodes WHERE status = 'OPEN'"
+    async def close_episodes(self, episode_ids: List[str]):
+        """Mark specified episodes as CLOSED in the database."""
+        if not episode_ids:
+            return
+        if self.db.is_sqlite:
+            for eid in episode_ids:
+                await self.db.execute(
+                    "UPDATE episodes SET status = 'CLOSED', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+                    eid,
+                )
+        else:
+            await self.db.execute(
+                "UPDATE episodes SET status = 'CLOSED', updated_at = NOW() WHERE id = ANY($1::varchar[])",
+                episode_ids,
+            )
+
+    async def load_open_episodes(self, idle_timeout_seconds: int = 120) -> List[Dict[str, Any]]:
+        """Fetch all currently open episodes within idle_timeout_seconds of the newest; closes older rows."""
+        query = "SELECT * FROM episodes WHERE status = 'OPEN' ORDER BY last_seen DESC"
         rows = await self.db.fetch_all(query)
-        res = []
+        if not rows:
+            return []
+
+        # Find newest last_seen
+        newest_row = rows[0]
+        newest_dt = newest_row.get("last_seen")
+        newest_ts = newest_dt.timestamp() if isinstance(newest_dt, datetime) else to_utc_datetime(newest_dt).timestamp()
+
+        stale_ids = []
+        active_episodes = []
+
         for r in rows:
             d = dict(r)
-            if self.db.is_sqlite:
-                if isinstance(d.get("evidence_ids"), str):
-                    d["evidence_ids"] = json.loads(d["evidence_ids"])
-                if isinstance(d.get("session_ids"), str):
-                    d["session_ids"] = json.loads(d["session_ids"])
-            res.append(d)
-        return res
+            r_dt = d.get("last_seen")
+            r_ts = r_dt.timestamp() if isinstance(r_dt, datetime) else to_utc_datetime(r_dt).timestamp()
+
+            if (newest_ts - r_ts) > idle_timeout_seconds:
+                stale_ids.append(d["id"])
+            else:
+                if self.db.is_sqlite:
+                    if isinstance(d.get("evidence_ids"), str):
+                        try:
+                            d["evidence_ids"] = json.loads(d["evidence_ids"])
+                        except Exception:
+                            d["evidence_ids"] = []
+                    if isinstance(d.get("session_ids"), str):
+                        try:
+                            d["session_ids"] = json.loads(d["session_ids"])
+                        except Exception:
+                            d["session_ids"] = []
+                    if isinstance(d.get("enforcement_counts"), str):
+                        try:
+                            d["enforcement_counts"] = json.loads(d["enforcement_counts"])
+                        except Exception:
+                            d["enforcement_counts"] = {}
+                    if isinstance(d.get("signatures"), str):
+                        try:
+                            d["signatures"] = json.loads(d["signatures"])
+                        except Exception:
+                            d["signatures"] = []
+                else:
+                    if isinstance(d.get("enforcement_counts"), str):
+                        try:
+                            d["enforcement_counts"] = json.loads(d["enforcement_counts"])
+                        except Exception:
+                            d["enforcement_counts"] = {}
+                active_episodes.append(d)
+
+        if stale_ids:
+            logger.info("Closing %s stale open episodes older than idle_timeout (%s s)", len(stale_ids), idle_timeout_seconds)
+            await self.close_episodes(stale_ids)
+
+        return active_episodes
 
     async def get_digest_summary(self, since_dt: datetime) -> Dict[str, Any]:
         """Aggregate DIGEST incidents into summary counts across sources, targets, and rules."""
-        if self.db.is_sqlite:
-            query = """
-            SELECT source_ip, target_ip, deterministic_rule_ids, deterministic_severity, event_count
-            FROM incidents
-            WHERE updated_at >= $1
-            """
-            rows = await self.db.fetch_all(query, since_dt.strftime("%Y-%m-%d %H:%M:%S"))
-        else:
-            query = """
-            SELECT source_ip, target_ip, deterministic_rule_ids, deterministic_severity, event_count
-            FROM incidents
-            WHERE updated_at >= $1
-            """
-            rows = await self.db.fetch_all(query, since_dt)
+        since_val = since_dt.strftime("%Y-%m-%d %H:%M:%S") if self.db.is_sqlite else since_dt
+
+        # Select incidents updated in window, excluding incidents with URGENT cards
+        query = """
+        SELECT i.id, i.source_ip, i.target_ip, i.event_count, i.deterministic_rule_ids,
+               i.deterministic_severity, i.current_revision
+        FROM incidents i
+        WHERE i.updated_at >= $1
+          AND (i.last_urgent_at IS NULL OR i.last_urgent_at < $1)
+          AND i.id NOT IN (
+              SELECT DISTINCT incident_id FROM notification_outbox
+              WHERE notification_type = 'URGENT' AND created_at >= $1
+          )
+        """
+        rows = await self.db.fetch_all(query, since_val)
+
+        digest_rows = []
+        for r in rows:
+            inc_id = r["id"]
+            rev_num = r.get("current_revision", 1)
+            rev_row = await self.db.fetch_one(
+                "SELECT assessment_json, rule_ids FROM incident_revisions WHERE incident_id = $1 AND revision = $2",
+                inc_id,
+                rev_num,
+            )
+            routing = None
+            if rev_row:
+                aj = rev_row.get("assessment_json")
+                if isinstance(aj, str):
+                    try:
+                        aj = json.loads(aj)
+                    except Exception:
+                        aj = {}
+                if isinstance(aj, dict):
+                    routing = aj.get("routing")
+
+            if not routing:
+                rules_raw = r.get("deterministic_rule_ids")
+                if isinstance(rules_raw, str):
+                    try:
+                        rules_list = json.loads(rules_raw)
+                    except Exception:
+                        rules_list = [rules_raw]
+                else:
+                    rules_list = rules_raw or []
+
+                routing = "DIGEST"
+                for r_id in rules_list:
+                    if r_id in ("RULE_NONBLOCKED_EXPLOIT_ATTEMPT", "RULE_ANTIVIRUS_DETECTION"):
+                        routing = "URGENT_ALERT_AND_INVESTIGATE"
+                        break
+                    elif r_id in ("RULE_UNKNOWN_ACTION_MAPPING", "RULE_HIGH_PARSER_ERROR_RATE", "RULE_LOG_SILENCE", "RULE_COVERAGE_GAP", "RULE_PROCESSING_BACKLOG"):
+                        routing = "RETAIN_WITH_VISIBILITY_GAP"
+
+            if routing == "DIGEST" or (routing and routing.startswith("RETAIN_")):
+                digest_rows.append(r)
 
         counts_by_source: Dict[str, int] = defaultdict(int)
         counts_by_target: Dict[str, int] = defaultdict(int)
         counts_by_rule: Dict[str, int] = defaultdict(int)
+        total_events = 0
 
-        for r in rows:
+        for r in digest_rows:
             src = r["source_ip"]
             dst = r["target_ip"]
-            counts_by_source[src] += r.get("event_count", 1)
-            counts_by_target[dst] += r.get("event_count", 1)
-            rules_raw = r["deterministic_rule_ids"]
+            ev_cnt = r.get("event_count", 1)
+            total_events += ev_cnt
+            counts_by_source[src] += ev_cnt
+            counts_by_target[dst] += ev_cnt
+            rules_raw = r.get("deterministic_rule_ids")
             if isinstance(rules_raw, str):
                 try:
                     rules_list = json.loads(rules_raw)
@@ -1219,7 +1403,8 @@ class Repository:
 
         return {
             "since": since_dt,
-            "total_incidents": len(rows),
+            "total_incidents": len(digest_rows),
+            "total_events": total_events,
             "counts_by_source": dict(counts_by_source),
             "counts_by_target": dict(counts_by_target),
             "counts_by_rule": dict(counts_by_rule),

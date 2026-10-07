@@ -4,7 +4,7 @@
 Accepted (6 October 2026; updated Phase B, 7 October 2026)
 
 ## Context
-We need automated investigation of security incidents derived from FortiGate 200G firewall logs. Raw firewall volume is too high for direct LLM ingestion, and arbitrary agent autonomy (unconstrained swarms, shell execution, database manipulation) poses security and reliability risks. The runtime investigation model is a local Qwen3.8-27B served via vLLM (`http://10.0.6.31:8000/v1`).
+We need automated investigation of security incidents derived from FortiGate 200G firewall logs. Raw firewall volume is too high for direct LLM ingestion, and arbitrary agent autonomy (unconstrained swarms, shell execution, database manipulation) poses security and reliability risks. The runtime investigation model is a local Qwen3.8-27B served via vLLM (`http://vllm.internal:8000/v1`).
 
 ## Decision
 1. Implement a bounded, single-pass investigation workflow:
@@ -16,7 +16,7 @@ We need automated investigation of security incidents derived from FortiGate 200
 6. Untrusted attacker text (URLs, headers, payloads) is delimited with `<<UNTRUSTED id=...>>` to contain prompt injection.
 
 ## Consequences
-- Bounded execution latency governed by strict network deadlines (90 s deadline) and single repair retry.
+- Bounded execution latency governed by strict network deadlines (60 s timeout per call with up to one repair attempt) and deterministic fallback.
 - All model runs are audited in the `model_runs` table with token counts, prompt versions, schema versions, and hashes.
 - External model outages degrade gracefully: deterministic severity floors deliver without interruption.
 - No external cloud dependencies or third-party telemetry leaks.

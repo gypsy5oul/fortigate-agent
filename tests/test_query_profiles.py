@@ -120,7 +120,7 @@ def test_normalize_event_admin_login_without_dstip():
     assert ev["log_type"] == "event"
     assert ev["subtype"] == "system"
     assert ev["srcip"] == "192.168.1.99"
-    assert ev["dstip"] == "127.0.0.1"
+    assert ev["dstip"] is None
     assert ev["action_normalized"] in ("ALLOWED_OR_DETECTED", "UNKNOWN")
 
 

@@ -52,9 +52,9 @@ docker compose start app
 ## 3. Checkpoint Management & Reprocessing
 
 ### 3.1 Checkpoint Semantics
-Log ingestion cursors are durably stored in the `query_checkpoints` table keyed by profile tags (`<stream_selector>#<profile>@v<version>`):
-- **Monotonic Forward Progress**: The poller queries Loki in finite time slices (`LOKI_TIME_SLICE_SECONDS`, default 15s) and only advances `last_seen_ts_ns` upon successful persistence of events in PostgreSQL.
-- **Bootstrapping**: If no checkpoint exists, the service bootstraps from `LOKI_BOOTSTRAP_LOOKBACK_SECONDS` (default 60s) before current time.
+Log ingestion cursors are durably stored in the `query_checkpoints` table keyed by profile stream keys (`<stream_selector>#<profile>@v<version>`):
+- **Monotonic Forward Progress**: The poller queries Loki in finite time slices (`LOKI_SLICE_SECONDS`, default 15s) and only advances `last_queried_ts_ns` upon successful persistence of events in PostgreSQL.
+- **Bootstrapping**: If no checkpoint exists, the service bootstraps looking back a default 600 seconds before current time (or seeds from an existing bare selector checkpoint).
 
 ### 3.2 Implications After Database Restore
 Restoring a backup from $T_{\text{backup}}$ will roll back the checkpoint cursor in `query_checkpoints` to $T_{\text{backup}}$:
@@ -68,8 +68,8 @@ If an operator needs to deliberately replay or reprocess logs from a specific hi
 ```sql
 -- Rewind checkpoint for a specific stream profile to 2 hours ago (nanoseconds)
 UPDATE query_checkpoints
-SET last_seen_ts_ns = EXTRACT(EPOCH FROM (NOW() - INTERVAL '2 hours'))::BIGINT * 1000000000
-WHERE stream_name LIKE '%threat_detection%';
+SET last_queried_ts_ns = EXTRACT(EPOCH FROM (NOW() - INTERVAL '2 hours'))::BIGINT * 1000000000
+WHERE stream_name LIKE '%utm_detections%';
 ```
 
 Restart the agent to begin historical ingestion:
@@ -84,7 +84,7 @@ docker compose restart app
 ### 4.1 Loki Outage or Poller Lag
 - **Symptom**: Metric `forti_loki_last_success_age_seconds` exceeds 3× `LOKI_POLL_INTERVAL_SECONDS`. `/health/ready` reports HTTP 503 (`poller_lagging`).
 - **Behavior**: The poller logs an error and backs off using exponential jitter. Ingestion cursor remains at last committed nanosecond; no events are skipped.
-- **Action**: Check Loki read gateway availability and network connectivity (`ping loki-readonly.6dcorp.internal`). Once Loki is reachable, the poller automatically drains the lag in bounded slices.
+- **Action**: Check Loki read gateway availability and network connectivity (`ping loki.internal`). Once Loki is reachable, the poller automatically drains the lag in bounded slices.
 
 ### 4.2 Local LLM Gateway Outage
 - **Symptom**: Metric `forti_model_last_success_age_seconds` grows. `MODEL_FAILURES_TOTAL` increments.
@@ -98,8 +98,8 @@ docker compose restart app
 ### 4.3 Google Chat Rate Limiting & Webhook Errors
 - **Symptom**: `OUTBOX_FAILURES_TOTAL` increments. Warnings logged by `outbox_worker`.
 - **Behavior**:
-  - **HTTP 429 (Rate Limit)**: Honors `Retry-After` header or falls back to exponential backoff with jitter. Outbox rows remain `PENDING`.
-  - **Transient 5xx Errors**: Retried with exponential backoff up to `max_attempts` (default 5).
+  - **HTTP 429 (Rate Limit) & HTTP 408 (Request Timeout)**: Honors `Retry-After` header (HTTP date or integer seconds) or falls back to exponential backoff with jitter. Outbox rows remain `PENDING`.
+  - **Transient 5xx / 408 Errors**: Retried with exponential backoff up to 10 attempts (dead-letters after 10 attempts).
   - **Permanent 4xx Errors (400, 401, 403, 404)**: Immediately transitioned to `DEAD_LETTER` to prevent blocking the outbox queue.
   - **Priority Ordering**: URGENT (priority 10) alerts are dispatched before INVESTIGATION_UPDATE (priority 20) and DIGEST (priority 50).
 - **Action**:

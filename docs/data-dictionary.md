@@ -14,19 +14,33 @@ Stores security-relevant events extracted from FortiGate syslog via Loki. Routin
 | `id` | `VARCHAR(64)` | No | - | Deterministic SHA256 hex digest of the normalized event tuple |
 | `loki_ts_ns` | `BIGINT` | No | - | Nanosecond timestamp assigned by Loki at stream ingestion |
 | `eventtime_ns` | `BIGINT` | Yes | - | High-precision FortiOS event timestamp if present in log line |
-| `log_type` | `VARCHAR(32)` | No | - | FortiOS primary log category (`utm`, `traffic`, `event`) |
-| `subtype` | `VARCHAR(32)` | Yes | - | FortiOS subsystem subtype (`ips`, `virus`, `waf`, `ssl`, `forward`) |
+| `devid` | `TEXT` | Yes | - | FortiGate device serial / identifier |
+| `vd` | `TEXT` | Yes | `'root'` | FortiOS Virtual Domain partition |
+| `direction` | `VARCHAR(16)` | Yes | `'UNKNOWN'` | Inferred traffic flow direction (`INBOUND`, `OUTBOUND`, `INTERNAL`, `UNKNOWN`) |
+| `srcintfrole` | `TEXT` | Yes | - | Source interface role (e.g. `wan`, `lan`, `dmz`) |
+| `dstintfrole` | `TEXT` | Yes | - | Destination interface role (e.g. `wan`, `lan`, `dmz`) |
+| `logid` | `TEXT` | Yes | - | FortiOS 10-digit log message ID |
+| `log_type` | `TEXT` | No | - | FortiOS primary log category (`utm`, `traffic`, `event`) |
+| `subtype` | `TEXT` | Yes | - | FortiOS subsystem subtype (`ips`, `virus`, `waf`, `ssl`, `forward`, `system`) |
+| `action_raw` | `TEXT` | Yes | - | Exact raw `action` string reported in FortiOS log |
+| `action_normalized` | `VARCHAR(32)` | No | - | Normalized enforcement category (`BLOCKED`, `ALLOWED_OR_DETECTED`, `UNKNOWN`) |
+| `utmaction` | `TEXT` | Yes | - | UTM action reported by security profile |
 | `srcip` | `VARCHAR(64)` | No | - | Source IP address (IPv4 or IPv6) |
 | `srcport` | `INT` | Yes | - | Source Layer 4 port number |
 | `dstip` | `VARCHAR(64)` | Yes | - | Destination IP address (nullable for pure system/auth events) |
 | `dstport` | `INT` | Yes | - | Destination Layer 4 port number |
 | `proto` | `INT` | Yes | - | IP protocol number (e.g. 6 = TCP, 17 = UDP, 1 = ICMP) |
-| `service` | `VARCHAR(64)` | Yes | - | Layer 7 service name identifier (e.g. `HTTPS`, `DNS`, `SSH`) |
-| `action_raw` | `VARCHAR(32)` | Yes | - | Exact raw `action` string reported in FortiOS log |
-| `action_normalized` | `VARCHAR(32)` | No | - | Normalized enforcement category (`BLOCKED`, `ALLOWED_OR_DETECTED`, `UNKNOWN`) |
-| `signature` | `VARCHAR(256)` | Yes | - | Threat signature name, attack identifier, or virus name |
+| `service` | `TEXT` | Yes | - | Layer 7 service name identifier (e.g. `HTTPS`, `DNS`, `SSH`) |
+| `policyid` | `INT` | Yes | - | Firewall policy rule ID |
+| `sessionid` | `BIGINT` | Yes | - | FortiOS firewall session identifier |
+| `signature` | `TEXT` | Yes | - | Threat signature name, attack identifier, or virus name |
+| `signature_truncated` | `BOOLEAN` | Yes | `FALSE` | Flag indicating if signature exceeded 256 characters and was truncated |
+| `url` | `TEXT` | Yes | - | Target URL path (cleaned of parameters) |
+| `http_method` | `VARCHAR(16)` | Yes | - | Sanitized and length-capped HTTP request method |
+| `severity_raw` | `TEXT` | Yes | - | Raw severity string reported in syslog line |
 | `raw_message` | `TEXT` | No | - | Untrusted original log message payload |
 | `processing_status` | `VARCHAR(16)` | No | `'PENDING'` | Ingest state (`PENDING`, `PROCESSED`, `FAILED`) |
+| `processed_at` | `TIMESTAMPTZ` | Yes | - | Timestamp when normalizer/correlator processed event |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Database record insertion timestamp |
 
 ---
@@ -36,13 +50,42 @@ Maintains monotonic log ingestion positions per query profile and Loki stream se
 
 | Column | Data Type | Nullable | Default | Description |
 |---|---|---|---|---|
-| `stream_name` | `VARCHAR(256)` | No | - | Primary key: compound selector tag (`<selector>#<profile>@v<version>`) |
-| `last_seen_ts_ns` | `BIGINT` | No | - | Monotonically advancing upper boundary nanosecond timestamp from Loki |
+| `id` | `SERIAL` | No | - | Primary key surrogate |
+| `stream_name` | `VARCHAR(256)` | No | - | Compound stream profile tag (`<selector>#<profile>@v<version>`) |
+| `last_queried_ts_ns` | `BIGINT` | No | - | Monotonically advancing upper boundary nanosecond timestamp from Loki |
+| `last_successful_run` | `TIMESTAMPTZ` | No | `NOW()` | Timestamp of last successful polling cycle |
 | `updated_at` | `TIMESTAMPTZ` | No | `NOW()` | Timestamp when the checkpoint was durably advanced |
 
 ---
 
-### 1.3 `episodes`
+### 1.3 `coverage_gaps`
+Tracks unpolled or skipped Loki timestamp intervals resulting from network partitions or errors.
+
+| Column | Data Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `SERIAL` | No | - | Primary key surrogate |
+| `start_ts_ns` | `BIGINT` | No | - | Gap start timestamp in nanoseconds |
+| `end_ts_ns` | `BIGINT` | No | - | Gap end timestamp in nanoseconds |
+| `stream_name` | `VARCHAR(128)` | No | - | Loki stream identifier |
+| `reason` | `TEXT` | No | - | Reason gap occurred (e.g. timeout, backoff abort) |
+| `resolved` | `BOOLEAN` | No | `FALSE` | Whether backfill worker has reprocessed the window |
+| `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Gap creation timestamp |
+
+---
+
+### 1.4 `rejected_events`
+Stores unparseable or constraint-violating log lines quarantined during normalization.
+
+| Column | Data Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `VARCHAR(64)` | No | - | Primary key digest |
+| `reason` | `TEXT` | No | - | Failure explanation (e.g. invalid syntax, missing required fields) |
+| `raw_sha256` | `VARCHAR(64)` | No | - | SHA256 hex digest of unparseable raw log payload |
+| `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Quarantine timestamp |
+
+---
+
+### 1.5 `episodes`
 Tracks active and closed attack episodes correlated over 30-minute campaign windows.
 
 | Column | Data Type | Nullable | Default | Description |
@@ -62,12 +105,14 @@ Tracks active and closed attack episodes correlated over 30-minute campaign wind
 | `enforcement` | `VARCHAR(32)` | No | - | Aggregate enforcement (`BLOCKED`, `ALLOWED_OR_DETECTED`, `MIXED`) |
 | `evidence_ids` | `TEXT[]` | Yes | `'{}'` | Array of up to 25 representative event IDs preserved as evidence |
 | `session_ids` | `BIGINT[]` | Yes | `'{}'` | Array of FortiOS firewall session IDs associated with episode |
+| `enforcement_counts` | `JSONB` | Yes | `'{}'` | Cached count of events per enforcement category (`BLOCKED`, `ALLOWED_OR_DETECTED`) |
+| `signatures` | `TEXT[]` | Yes | `'{}'` | Cached list of threat signatures matched in episode |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Record creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | No | `NOW()` | Record modification timestamp |
 
 ---
 
-### 1.4 `incidents`
+### 1.6 `incidents`
 Top-level security incident entities representing actionable operational threats.
 
 | Column | Data Type | Nullable | Default | Description |
@@ -75,9 +120,9 @@ Top-level security incident entities representing actionable operational threats
 | `id` | `VARCHAR(64)` | No | - | Primary key: deterministic incident identifier (`INC-<hash>`) |
 | `current_revision` | `INT` | No | `1` | Optimistic concurrency control revision counter |
 | `status` | `VARCHAR(32)` | No | `'ACTIVE'` | Incident lifecycle status (`ACTIVE`, `SUPPRESSED`, `CLOSED_TRUE_POSITIVE`, `CLOSED_FALSE_POSITIVE`) |
-| `severity` | `VARCHAR(16)` | No | - | Active severity floor (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFORMATIONAL`) |
+| `severity` | `VARCHAR(16)` | No | - | Active severity floor (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`) |
 | `enforcement` | `VARCHAR(32)` | No | - | Primary enforcement state (`ALLOWED_OR_DETECTED`, `BLOCKED`, `MIXED`) |
-| `exploitation_assessment` | `VARCHAR(32)` | No | `'INSUFFICIENT_EVIDENCE'` | Analyst/Model verdict (`ATTEMPT_OBSERVED`, `SUSPECTED_SUCCESS`, `BLOCKED`, `BENIGN_SCANNER`) |
+| `exploitation_assessment` | `VARCHAR(32)` | No | `'INSUFFICIENT_EVIDENCE'` | Analyst/Model verdict (`ATTEMPT_OBSERVED`, `SUSPICIOUS_SEQUENCE`, `INSUFFICIENT_EVIDENCE`) |
 | `vd` | `VARCHAR(64)` | Yes | `'root'` | FortiOS VDOM |
 | `direction` | `VARCHAR(16)` | Yes | `'INBOUND'` | Flow direction |
 | `source_ip` | `VARCHAR(64)` | No | - | Originating source IP |
@@ -98,7 +143,7 @@ Top-level security incident entities representing actionable operational threats
 
 ---
 
-### 1.5 `incident_revisions`
+### 1.7 `incident_revisions`
 Immutable audit history of all deterministic and model assessments per incident revision.
 
 | Column | Data Type | Nullable | Default | Description |
@@ -106,7 +151,7 @@ Immutable audit history of all deterministic and model assessments per incident 
 | `id` | `SERIAL` | No | - | Primary key surrogate |
 | `incident_id` | `VARCHAR(64)` | No | - | Foreign key referencing `incidents(id)` |
 | `revision` | `INT` | No | - | Revision number (1 for initial deterministic, 2+ for investigation) |
-| `assessment_source` | `VARCHAR(32)` | No | `'DETERMINISTIC'` | Source of revision (`DETERMINISTIC`, `MODEL_VALIDATED`, `MODEL_FALLBACK`) |
+| `assessment_source` | `VARCHAR(32)` | No | `'DETERMINISTIC'` | Source of revision (`DETERMINISTIC`, `MODEL_VALIDATED`, `MODEL_REPAIRED`, `MODEL_REJECTED_FALLBACK`) |
 | `rule_ids` | `TEXT[]` | No | `'{}'` | Rules triggering this assessment |
 | `severity` | `VARCHAR(16)` | No | - | Assessed severity floor |
 | `enforcement` | `VARCHAR(32)` | No | - | Assessed enforcement |
@@ -118,7 +163,7 @@ Immutable audit history of all deterministic and model assessments per incident 
 
 ---
 
-### 1.6 `jobs`
+### 1.8 `jobs`
 Asynchronous investigation work queue leased by worker loops.
 
 | Column | Data Type | Nullable | Default | Description |
@@ -139,8 +184,8 @@ Asynchronous investigation work queue leased by worker loops.
 
 ---
 
-### 1.7 `model_runs`
-Complete audit trail for every LLM interaction, token usage, and schema validation result.
+### 1.9 `model_runs`
+Complete audit trail for every LLM interaction, token usage, validation result, and transactional outcome.
 
 | Column | Data Type | Nullable | Default | Description |
 |---|---|---|---|---|
@@ -161,11 +206,12 @@ Complete audit trail for every LLM interaction, token usage, and schema validati
 | `structured_output_mode` | `VARCHAR(32)` | No | `'json_schema'` | Mode used (`json_schema` or `json_object`) |
 | `validation_result` | `VARCHAR(32)` | No | - | Schema check result (`VALID`, `REPAIRED`, `INVALID`, `FALLBACK`) |
 | `reason_codes` | `TEXT[]` | Yes | `'{}'` | Guardrail rule violations or validator downgrade reasons |
+| `commit_status` | `VARCHAR(32)` | No | `'COMMITTED'` | State of transaction (`PENDING`, `COMMITTED`, `CONFLICT`, `FAILED`) |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Audit record creation timestamp |
 
 ---
 
-### 1.8 `notification_outbox`
+### 1.10 `notification_outbox`
 Transactional outbox guaranteeing at-least-once, rate-limited Google Chat webhook delivery.
 
 | Column | Data Type | Nullable | Default | Description |
@@ -192,11 +238,26 @@ Transactional outbox guaranteeing at-least-once, rate-limited Google Chat webhoo
 - `HIGH`: Exploit attempt or mixed enforcement pattern requiring analyst investigation.
 - `MEDIUM`: Contained threat, blocked port scanner, or known blocked malware download.
 - `LOW`: Routine reconnaissance or unmapped log action visibility gap.
-- `INFORMATIONAL`: Normal service health or benign network activity.
 
-### 2.2 Enforcement Outcomes
+### 2.2 Exploitation Assessment
+- `ATTEMPT_OBSERVED`: Evidence definitively documents an adversary attack signature or exploit attempt.
+- `SUSPICIOUS_SEQUENCE`: Inbound pattern reflects anomalous probe progression or scanning behavior.
+- `INSUFFICIENT_EVIDENCE`: Firewall telemetry alone cannot prove successful compromise or exploitation.
+
+### 2.3 Assessment Sources
+- `DETERMINISTIC`: Revision created directly from deterministic signature / threshold rule evaluations.
+- `MODEL_VALIDATED`: Model investigation assessment validated on first pass against strict schema and guardrails.
+- `MODEL_REPAIRED`: Model investigation assessment required single-repair bounded pass before acceptance.
+- `MODEL_REJECTED_FALLBACK`: Model investigation rejected or failed; deterministic fallback values applied.
+
+### 2.4 Model Run Commit Status
+- `PENDING`: Model inference executed; awaiting database revision transaction.
+- `COMMITTED`: Model assessment revision successfully committed to `incidents` and `incident_revisions`.
+- `CONFLICT`: Revision optimistic concurrency check failed (e.g., incident advanced concurrently).
+- `FAILED`: Model execution or transaction aborted due to exception.
+
+### 2.5 Enforcement Outcomes
 - `BLOCKED`: Traffic or payload definitively dropped or reset by FortiOS.
 - `ALLOWED_OR_DETECTED`: Payload observed and permitted through to application backend.
 - `MIXED`: Inbound campaign exhibited both dropped probes and allowed sessions.
-- `SESSION_CLOSED`: Normal TCP/UDP session termination without policy enforcement.
 - `UNKNOWN`: Unrecognized FortiOS action value requiring configuration review.

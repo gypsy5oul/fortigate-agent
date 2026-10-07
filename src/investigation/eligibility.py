@@ -72,8 +72,8 @@ def is_action_eligible(
             return False, f"Invalid IP address format: {src_ip}"
 
         verified_build = action.get("verified_build")
-        if verified_build is None or (configured_build and verified_build != configured_build):
-            return False, f"Action template has not been verified for configured build '{configured_build}'"
+        if not configured_build or verified_build is None or verified_build != configured_build:
+            return False, f"Action template requires configured build '{verified_build}', but got '{configured_build}'"
 
         if is_ipv6 and "src4" in action.get("cli_template", ""):
             return False, f"CLI template does not support IPv6 address {src_ip}"

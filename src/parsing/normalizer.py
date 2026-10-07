@@ -192,9 +192,9 @@ def normalize_event(
         if not srcip and not dstip:
             # Event status banner with no IP
             return None
-        # In event logs (e.g. admin login, system alerts), one IP may be omitted
+        # In event logs (e.g. admin login, system alerts), dstip may be omitted
         srcip = srcip or "127.0.0.1"
-        dstip = dstip or "127.0.0.1"
+        dstip = dstip or None
     else:
         if not srcip or not dstip:
             # Security traffic and UTM events require valid IP pair

@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS model_runs (
     structured_output_mode TEXT NOT NULL DEFAULT 'json_schema',
     validation_result TEXT NOT NULL,
     reason_codes TEXT DEFAULT '[]',
+    commit_status TEXT NOT NULL DEFAULT 'COMMITTED',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -194,6 +195,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     last_event_ts_ns INTEGER NOT NULL,
     event_count INTEGER NOT NULL DEFAULT 1,
     enforcement TEXT NOT NULL,
+    enforcement_counts TEXT DEFAULT '{}',
+    signatures TEXT DEFAULT '[]',
     evidence_ids TEXT DEFAULT '[]',
     session_ids TEXT DEFAULT '[]',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -304,30 +307,25 @@ class Database:
             rows = await conn.fetch("SELECT version FROM schema_migrations")
             applied_versions = {r["version"] for r in rows}
 
-            # 2. Ordered migration execution from migrations/
-            migrations_dir = os.path.join(os.path.dirname(__file__), "..", "..", "migrations")
-            if os.path.exists(migrations_dir):
-                sql_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith(".sql")])
-                for fname in sql_files:
-                    version = os.path.splitext(fname)[0]
-                    if version not in applied_versions:
-                        file_path = os.path.join(migrations_dir, fname)
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            sql = f.read()
-                        async with conn.transaction():
-                            await conn.execute(sql)
-                            await conn.execute(
-                                "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, NOW())",
-                                version,
-                            )
-                        logger.info("Applied PostgreSQL migration: %s", version)
-            else:
-                schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
-                if os.path.exists(schema_path):
-                    with open(schema_path, "r", encoding="utf-8") as f:
-                        ddl = f.read()
-                    await conn.execute(ddl)
-                    logger.info("Applied PostgreSQL fallback DDL schema successfully.")
+            migrations_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "migrations"))
+            if not os.path.exists(migrations_dir):
+                logger.error("Database migrations directory not found at %s", migrations_dir)
+                raise RuntimeError(f"migrations directory not found: {migrations_dir}")
+
+            sql_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith(".sql")])
+            for fname in sql_files:
+                version = os.path.splitext(fname)[0]
+                if version not in applied_versions:
+                    file_path = os.path.join(migrations_dir, fname)
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        sql = f.read()
+                    async with conn.transaction():
+                        await conn.execute(sql)
+                        await conn.execute(
+                            "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, NOW())",
+                            version,
+                        )
+                    logger.info("Applied PostgreSQL migration: %s", version)
 
     async def close(self):
         if self._pg_pool:

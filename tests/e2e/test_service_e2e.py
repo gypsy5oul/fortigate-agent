@@ -144,7 +144,9 @@ async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean):
     repo = Repository(pg_clean)
 
     # 1. Monotonic Checkpoint Progress
-    latest_cp = await repo.get_checkpoint('{service_name="forticlient"}')
+    latest_cp = await repo.get_checkpoint('{service_name="forticlient"}#security_events@v1')
+    if latest_cp is None:
+        latest_cp = await repo.get_checkpoint('{service_name="forticlient"}')
     assert latest_cp is not None
     assert latest_cp > 0
 

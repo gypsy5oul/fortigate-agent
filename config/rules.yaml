@@ -47,16 +47,6 @@ rules:
       min_events: 3
     reason_template: "Source IP probed multiple distinct network services ({event_count} events across multiple ports)."
 
-  - id: "RULE_DISTRIBUTED_ATTACK"
-    name: "Distributed Attack Against Protected Target"
-    description: "Multiple sources targeting the same protected destination within correlation window."
-    priority: "INVESTIGATE"
-    min_severity: "HIGH"
-    condition:
-      direction: "INBOUND"
-      min_distinct_sources: 3
-    reason_template: "Distributed attack coordinated across multiple source IPs ({event_count} events)."
-
   - id: "RULE_SSL_INSPECTION_ANOMALY"
     name: "Deep Inspection SSL Evasion Attempt"
     description: "TLS handshake anomalies, unsupported cipher suites, or untrusted certs during inbound deep inspection."
@@ -103,44 +93,4 @@ rules:
       action_normalized: "UNKNOWN"
     reason_template: "Unmapped FortiOS action observed in log stream requiring configuration review."
 
-  - id: "RULE_HIGH_PARSER_ERROR_RATE"
-    name: "High Log Parser Error Burst"
-    description: "Parser failure rate exceeds operational threshold."
-    priority: "DIGEST"
-    min_severity: "LOW"
-    routing_outcome: "RETAIN_WITH_VISIBILITY_GAP"
-    condition:
-      health_metric: "parser_errors"
-      min_events: 5
-    reason_template: "Parser error burst observed indicating possible log format mismatch."
 
-  - id: "RULE_LOG_SILENCE"
-    name: "Loki Ingestion Silence Detected"
-    description: "No log events received within expected polling intervals."
-    priority: "DIGEST"
-    min_severity: "LOW"
-    routing_outcome: "RETAIN_WITH_VISIBILITY_GAP"
-    condition:
-      health_metric: "log_silence"
-    reason_template: "Log stream silence detected; poller observed zero events exceeding expected cadence."
-
-  - id: "RULE_COVERAGE_GAP"
-    name: "Loki Query Coverage Gap"
-    description: "Coverage gap recorded due to query saturation or rate limits."
-    priority: "DIGEST"
-    min_severity: "LOW"
-    routing_outcome: "RETAIN_WITH_VISIBILITY_GAP"
-    condition:
-      health_metric: "coverage_gap"
-    reason_template: "Coverage gap detected in Loki stream requiring operator review."
-
-  - id: "RULE_PROCESSING_BACKLOG"
-    name: "Event Processing Inbox Backlog"
-    description: "Pending events inbox backlog growing faster than processing capacity."
-    priority: "DIGEST"
-    min_severity: "LOW"
-    routing_outcome: "RETAIN_WITH_VISIBILITY_GAP"
-    condition:
-      health_metric: "processing_backlog"
-      min_events: 500
-    reason_template: "Event ingestion backlog observed in durable inbox."

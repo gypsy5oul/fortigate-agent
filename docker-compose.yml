@@ -59,6 +59,7 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./src:/app/src:ro
+      - ./migrations:/app/migrations:ro
       - ${CA_BUNDLE_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
     networks:
       - forti_net

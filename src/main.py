@@ -17,6 +17,7 @@ from src.storage.database import Database
 from src.storage.repository import Repository, RevisionConflict
 from src.storage.timeutil import to_utc_datetime
 from src.sources.loki_client import LokiClient
+from src.sources.query_profiles import get_query_profile
 from src.sources.checkpoints import PollerOrchestrator
 from src.correlator.session_aggregator import SessionAggregator
 from src.rules.engine import RuleEngine
@@ -33,6 +34,11 @@ from src.observability.metrics import (
     INCIDENTS_ACTIVE,
     MODEL_INFERENCE_DURATION,
     INVESTIGATIONS_RATE_LIMITED_TOTAL,
+    LOKI_LAST_SUCCESS_AGE_SECONDS,
+    MODEL_LAST_SUCCESS_AGE_SECONDS,
+    CHAT_LAST_SUCCESS_AGE_SECONDS,
+    BACKLOG_PENDING_EVENTS,
+    JOBS_OLDEST_PENDING_SECONDS,
 )
 
 # Quiet HTTP transport logging to prevent credential exposure in URLs
@@ -108,6 +114,7 @@ class IntelligenceService:
             slice_seconds=self.settings.loki_slice_seconds,
             limit=self.settings.loki_max_entries_per_query,
             max_slices_per_cycle=self.settings.loki_max_slices_per_cycle,
+            query_profile=get_query_profile(self.settings.loki_query_profile),
         )
 
         self.aggregator = SessionAggregator(
@@ -135,14 +142,32 @@ class IntelligenceService:
 
         self.service_state = {
             "last_poller_success": 0.0,
+            "last_model_success": 0.0,
             "poll_interval_seconds": self.settings.loki_poll_interval_seconds,
             "model_degraded": False,
         }
 
         self.running = False
+        self._stop: Optional[asyncio.Event] = None
+        self._consecutive_model_failures = 0
+
+    @property
+    def stop_event(self) -> asyncio.Event:
+        if self._stop is None:
+            self._stop = asyncio.Event()
+        return self._stop
+
+    async def _sleep(self, timeout: float) -> bool:
+        """Interruptible sleep returning immediately when _stop is signaled."""
+        try:
+            await asyncio.wait_for(self.stop_event.wait(), timeout=timeout)
+            return False
+        except asyncio.TimeoutError:
+            return True
 
     async def start(self):
         logger.info("Starting FortiGate Firewall Intelligence Service...")
+        self._stop = asyncio.Event()
         await self.db.connect()
         self.running = True
 
@@ -171,11 +196,12 @@ class IntelligenceService:
         investigation_task = asyncio.create_task(self._run_investigation_loop())
         outbox_task = asyncio.create_task(self._run_outbox_loop())
         digest_task = asyncio.create_task(self._run_digest_loop())
+        updater_task = asyncio.create_task(self._run_metrics_updater())
 
         logger.info("Service initialized. Running asynchronous supervision loops.")
 
         try:
-            await asyncio.gather(server_task, poller_task, investigation_task, outbox_task, digest_task)
+            await asyncio.gather(server_task, poller_task, investigation_task, outbox_task, digest_task, updater_task)
         except asyncio.CancelledError:
             logger.info("Service shutdown received.")
         finally:
@@ -183,6 +209,8 @@ class IntelligenceService:
 
     async def stop(self):
         self.running = False
+        if self._stop is not None:
+            self._stop.set()
         if hasattr(self, "_server") and self._server:
             self._server.should_exit = True
         await self.loki_client.close()
@@ -196,7 +224,7 @@ class IntelligenceService:
         """Continuously polls Loki, drains durable inbox, correlates events, and runs deterministic rules."""
         severity_ranks = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
-        while self.running:
+        while self.running and not self.stop_event.is_set():
             try:
                 t0 = time.time()
                 raw_count, saved_count = await self.poller.poll_once()
@@ -207,7 +235,7 @@ class IntelligenceService:
                 self.service_state["last_poller_success"] = time.time()
 
                 # Drain durable inbox (all pending events in stable ascending order)
-                while self.running:
+                while self.running and not self.stop_event.is_set():
                     pending_events = await self.repo.fetch_pending_events(limit=100)
                     if not pending_events:
                         break
@@ -218,6 +246,14 @@ class IntelligenceService:
                         await self.repo.save_episodes(episodes)
                     except Exception as ep_err:
                         logger.warning("Failed to persist episodes to database: %s", ep_err)
+
+                    closed_ids = self.aggregator.pop_closed_episode_ids()
+                    if closed_ids:
+                        try:
+                            await self.repo.close_episodes(closed_ids)
+                        except Exception as close_err:
+                            logger.warning("Failed to close episodes: %s", close_err)
+
                     pending_ids = [ev["id"] for ev in pending_events]
                     touched = {(ev.get("vd", "root"), ev.get("direction", "INBOUND"), ev["srcip"], ev["dstip"]) for ev in pending_events}
 
@@ -406,20 +442,25 @@ class IntelligenceService:
                     if pending_ids:
                         await self.repo.mark_events_processed(pending_ids)
 
-                self.aggregator.prune_stale_episodes()
+                stale_ids = self.aggregator.prune_stale_episodes()
+                if stale_ids:
+                    try:
+                        await self.repo.close_episodes(stale_ids)
+                    except Exception as close_err:
+                        logger.warning("Failed to close stale episodes: %s", close_err)
             except Exception as e:
                 logger.error("Error in poller loop: %s", e, exc_info=True)
 
-            await asyncio.sleep(self.settings.loki_poll_interval_seconds)
+            await self._sleep(self.settings.loki_poll_interval_seconds)
 
     async def _run_investigation_loop(self):
         """Processes queued incident investigation jobs using Google ADK and local Qwen."""
-        while self.running:
+        while self.running and not self.stop_event.is_set():
             job = None
             try:
                 job = await self.repo.lease_next_job("worker-supervisor", lease_duration_seconds=90)
                 if not job:
-                    await asyncio.sleep(3.0)
+                    await self._sleep(3.0)
                     continue
 
                 job_id = job["id"]
@@ -455,6 +496,16 @@ class IntelligenceService:
                 t0 = time.time()
                 assessment = await self.adk_workflow.investigate_packet(packet)
                 MODEL_INFERENCE_DURATION.observe(time.time() - t0)
+
+                # Track model degradation and success
+                if getattr(assessment, "assessment_source", "") != "MODEL_REJECTED_FALLBACK":
+                    self.service_state["last_model_success"] = time.time()
+                    self._consecutive_model_failures = 0
+                    self.service_state["model_degraded"] = False
+                else:
+                    self._consecutive_model_failures += 1
+                    if self._consecutive_model_failures >= 3:
+                        self.service_state["model_degraded"] = True
 
                 # Enforcement and exploitation on incident row remain deterministic
                 det_enforcement = ep["enforcement"]
@@ -525,22 +576,25 @@ class IntelligenceService:
 
             except Exception as e:
                 logger.error("Error in investigation worker loop: %s", e, exc_info=True)
+                self._consecutive_model_failures += 1
+                if self._consecutive_model_failures >= 3:
+                    self.service_state["model_degraded"] = True
                 if job:
                     try:
                         await self.repo.fail_job(job["id"], job["version_token"], str(e))
                     except Exception as fail_err:
                         logger.error("Failed to fail_job %s: %s", job["id"], fail_err)
-                await asyncio.sleep(2.0)
+                await self._sleep(2.0)
 
     async def _run_outbox_loop(self):
         """Processes outgoing notifications to Google Chat with rate-limiting."""
-        while self.running:
+        while self.running and not self.stop_event.is_set():
             try:
                 await self.outbox_worker.process_outbox_batch(limit=5)
             except Exception as e:
                 logger.error("Error in outbox loop: %s", e)
 
-            await asyncio.sleep(self.settings.gchat_rate_limit_delay_seconds)
+            await self._sleep(self.settings.gchat_rate_limit_delay_seconds)
 
     async def _run_digest_loop(self):
         """Periodically aggregates DIGEST-priority incidents into summary notifications (B6)."""
@@ -548,10 +602,9 @@ class IntelligenceService:
         interval_secs = max(5.0, self.settings.digest_interval_minutes * 60.0)
         last_digest_time = datetime.now(timezone.utc)
 
-        while self.running:
+        while self.running and not self.stop_event.is_set():
             try:
-                await asyncio.sleep(interval_secs)
-                if not self.running:
+                if not await self._sleep(interval_secs):
                     break
 
                 now_dt = datetime.now(timezone.utc)
@@ -573,17 +626,58 @@ class IntelligenceService:
                     last_digest_time = now_dt
             except Exception as e:
                 logger.error("Error in digest aggregation worker: %s", e, exc_info=True)
-                await asyncio.sleep(5.0)
+                await self._sleep(5.0)
+
+    async def _run_metrics_updater(self):
+        """Periodically refreshes operational lag and backlog gauges (M2)."""
+        logger.info("Starting operational metrics updater loop.")
+        while self.running and not self.stop_event.is_set():
+            try:
+                now = time.time()
+                last_loki = self.service_state.get("last_poller_success", 0.0)
+                if last_loki > 0:
+                    LOKI_LAST_SUCCESS_AGE_SECONDS.set(now - last_loki)
+
+                last_model = self.service_state.get("last_model_success", 0.0)
+                if last_model > 0:
+                    MODEL_LAST_SUCCESS_AGE_SECONDS.set(now - last_model)
+
+                last_chat = getattr(self.outbox_worker, "last_success_time", 0.0)
+                if last_chat > 0:
+                    CHAT_LAST_SUCCESS_AGE_SECONDS.set(now - last_chat)
+
+                backlog_row = await self.db.fetch_one("SELECT COUNT(*) as cnt FROM normalized_events WHERE NOT processed")
+                if backlog_row:
+                    BACKLOG_PENDING_EVENTS.set(backlog_row.get("cnt", 0))
+
+                if self.db.is_postgres:
+                    oldest_job = await self.db.fetch_one(
+                        "SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) as age_sec FROM investigation_jobs WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1"
+                    )
+                else:
+                    oldest_job = await self.db.fetch_one(
+                        "SELECT (strftime('%s', 'now') - strftime('%s', created_at)) as age_sec FROM investigation_jobs WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1"
+                    )
+                if oldest_job and oldest_job.get("age_sec") is not None:
+                    JOBS_OLDEST_PENDING_SECONDS.set(float(oldest_job["age_sec"]))
+                else:
+                    JOBS_OLDEST_PENDING_SECONDS.set(0.0)
+            except Exception as e:
+                logger.debug("Operational metrics updater cycle error: %s", e)
+
+            await self._sleep(5.0)
 
 
 def main():
-    service = IntelligenceService()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    service = IntelligenceService()
 
     def _sig_handler():
         logger.info("Received termination signal.")
         service.running = False
+        if service._stop is not None:
+            service._stop.set()
         server = getattr(service, "_server", None)
         if server is not None:
             server.should_exit = True

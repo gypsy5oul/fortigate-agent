@@ -57,7 +57,7 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 │   │   ├── prompts/                # Versioned prompt templates
 │   │   ├── validator.py            # Security guardrails & CVE claim validator
 │   │   ├── eligibility.py          # Perimeter action eligibility constraints
-│   │   └── adk_workflow.py         # Structured output LLM runner with repair loop
+│   │   └── single_call_workflow.py # Structured output LLM runner with repair loop
 │   ├── notifications/
 │   │   ├── gchat_cards.py          # Cards v2 builder with thread keys & digest cards
 │   │   └── outbox_worker.py        # Priority outbox worker with retry backoff
@@ -65,13 +65,14 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 │   │   └── metrics.py              # Prometheus metrics & /health/ready probes
 │   └── main.py                     # Asynchronous supervisor entrypoint
 ├── dashboards/
+│   ├── alerts.yml                  # Prometheus alert rules for operational health
 │   ├── firewall_threat_overview.json # Grafana Dashboard A: Threat Overview (logfmt)
 │   └── agent_operations.json         # Grafana Dashboard B: Agent Telemetry & Freshness
 ├── docs/
 │   ├── runbook.md                  # Backup/restore, reprocessing, and recovery runbook
 │   ├── data-dictionary.md          # Complete PostgreSQL schema and data dictionary
 │   └── adr/                        # Architectural Decision Records
-└── tests/                          # Comprehensive test suite (70 tests)
+└── tests/                          # Comprehensive test suite (116 tests)
 ```
 
 ---
@@ -80,8 +81,8 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 
 | Component | Target URL | Settings & Credentials |
 | :--- | :--- | :--- |
-| **Grafana Loki** | `https://loki-readonly.6dcorp.internal/loki/api/v1/query_range` | Selector: `{service_name="forticlient"}`<br>Basic Auth via `LOKI_USERNAME` / `LOKI_PASSWORD` |
-| **Local Qwen 27B** | `http://10.0.6.31:8000/v1` | vLLM OpenAI API, model `qwen3.8-27b` |
+| **Grafana Loki** | `https://loki.internal/loki/api/v1/query_range` | Selector: `{service_name="forticlient"}`<br>Profile: `security_events` (filters `type="utm"`, `type="event"`, and block/deny actions)<br>Basic Auth via `LOKI_USER` / `LOKI_PASSWORD` |
+| **Local Qwen 27B** | `http://vllm.internal:8000/v1` | vLLM OpenAI API, model `qwen3.8-27b` |
 | **PostgreSQL 16** | `postgres:5432` | DB: `forti_intelligence`, User: `forti_intel` |
 | **Google Chat** | Configured via `GCHAT_WEBHOOK_URL` | Set `GCHAT_DRY_RUN=true` to simulate deliveries |
 
@@ -121,7 +122,7 @@ The test suite covers unit tests, PostgreSQL 16 integration tests, and full chil
 
 ```bash
 # Run full test suite against local PostgreSQL 16
-TEST_DATABASE_URL="postgresql://forti_intel:password@172.18.0.2:5432/forti_test" pytest -v tests/
+TEST_DATABASE_URL="postgresql://forti_intel:<password>@<db-host>:5432/forti_test" pytest -v tests/
 ```
 
 Refer to [docs/runbook.md](file:///opt/firewall-log-analysis-agent/docs/runbook.md) for backup/restore, reprocessing, and troubleshooting procedures, and [docs/data-dictionary.md](file:///opt/firewall-log-analysis-agent/docs/data-dictionary.md) for schema definitions.

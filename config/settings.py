@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # Loki Ingestion Gateway
     loki_base_url: str = Field(
-        default="https://loki-readonly.6dcorp.internal/loki/api/v1/query_range",
+        default="https://loki.internal/loki/api/v1/query_range",
         description="Loki query_range URL",
     )
     loki_user: Optional[str] = Field(default=None, description="HTTP Basic auth user")
@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # Local Qwen Model
     llm_enabled: bool = Field(default=True, description="Enable local LLM investigation agent")
     llm_base_url: str = Field(
-        default="http://10.0.6.31:8000/v1",
+        default="http://localhost:8000/v1",
         description="Local vLLM / OpenAI-compatible endpoint",
     )
     llm_model: str = Field(default="qwen3.8-27b", description="Model identifier in serving runtime")
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     gchat_rate_limit_delay_seconds: float = Field(default=2.0, description="Delay between consecutive outbox deliveries")
     gchat_thread_by_incident: bool = Field(default=True, description="Group incident revisions under the same thread")
     digest_interval_minutes: int = Field(default=60, description="Interval in minutes for periodic DIGEST aggregation")
-    loki_query_profile: Optional[str] = Field(default=None, description="Optional named LogQL query profile")
+    loki_query_profile: Optional[str] = Field(default="security_events", description="Optional named LogQL query profile")
 
     # FortiOS Actions & Recommendations
     cli_recommendations_enabled: bool = Field(default=False, description="Enable FortiOS CLI command recommendations")
