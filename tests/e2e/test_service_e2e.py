@@ -1,4 +1,4 @@
-"""End-to-end integration tests driving the full IntelligenceService against PostgreSQL 16.
+"""End-to-end integration tests driving the real python -m src.main process against PostgreSQL 16.
 
 Uses fake external endpoints (FastAPI in isolated subprocess) for:
 - Grafana Loki query_range API
@@ -7,9 +7,12 @@ Uses fake external endpoints (FastAPI in isolated subprocess) for:
 """
 
 import os
+import sys
 import time
 import json
+import signal
 import asyncio
+import subprocess
 import httpx
 import pytest
 import pytest_asyncio
@@ -76,19 +79,21 @@ async def pg_clean():
 
 
 @pytest.mark.asyncio
-async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean, monkeypatch):
-    """Executes the full IntelligenceService against PostgreSQL 16 with fake external services.
+async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean):
+    """Executes the real python -m src.main process against PostgreSQL 16 with fake external services.
 
     Validates:
-    1. Checkpoint monotonicity and progress
-    2. Exact event counts stored in PostgreSQL
-    3. Scenario 1 (Benign): No urgent alerts
-    4. Scenario 2 (Non-blocked IPS): CRITICAL urgent alert + investigation
-    5. Scenario 3 (IPS-dropped exploit): BLOCKED enforcement, no urgent alert
-    6. Scenario 4 (Internal AV blocked): DIGEST routing, no urgent alert
-    7. Scenario 5 (Blocked scanner): MEDIUM DIGEST, no urgent alert
-    8. Secret redaction: No token/key leaked
-    9. HTML safety: Escaped cards
+    1. Real OS process lifecycle, startup validation, and signal termination
+    2. Checkpoint monotonicity and progress
+    3. Exact event counts stored in PostgreSQL
+    4. Scenario 1 (Benign): No urgent alerts
+    5. Scenario 2 (Non-blocked IPS): CRITICAL urgent alert + investigation completed (COMPLETED job, contiguous revisions [1, 2], INVESTIGATION_UPDATE outbox row)
+    6. Scenario 3 (IPS-dropped exploit): BLOCKED enforcement, no urgent alert
+    7. Scenario 4 (Internal AV blocked): DIGEST routing, no urgent alert
+    8. Scenario 5 (Blocked scanner): MEDIUM DIGEST, no urgent alert
+    9. Gating: No card payload contains ACT_QUARANTINE_SRC_IP
+    10. Secret redaction: No token/key leaked
+    11. HTML safety: Escaped cards
     """
     async with httpx.AsyncClient(timeout=5.0) as client:
         await client.post(f"{FAKE_BASE_URL}/reset")
@@ -107,39 +112,39 @@ async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean, monkey
         await client.post(f"{FAKE_BASE_URL}/stage_logs", json=all_staged)
         expected_event_count = len(all_staged)
 
-    # Configure environment for IntelligenceService
-    monkeypatch.setenv("DATABASE_URL", TEST_PG_URL)
-    monkeypatch.setenv("LOKI_BASE_URL", f"{FAKE_BASE_URL}/loki/api/v1/query_range")
-    monkeypatch.setenv("LOKI_TLS_VERIFY", "true")
-    monkeypatch.setenv("ALLOW_INSECURE_TLS", "true")
-    monkeypatch.setenv("LLM_BASE_URL", f"{FAKE_BASE_URL}/v1")
-    monkeypatch.setenv("LLM_ENABLED", "true")
-    monkeypatch.setenv("GCHAT_WEBHOOK_URL", f"{FAKE_BASE_URL}/chat")
-    monkeypatch.setenv("GCHAT_DRY_RUN", "false")
-    monkeypatch.setenv("LOKI_POLL_INTERVAL_SECONDS", "0.2")
-    monkeypatch.setenv("GCHAT_RATE_LIMIT_DELAY_SECONDS", "0.05")
-    monkeypatch.setenv("METRICS_PORT", "18881")
+    # Configure environment for real child process
+    env = os.environ.copy()
+    env["DATABASE_URL"] = TEST_PG_URL
+    env["LOKI_BASE_URL"] = f"{FAKE_BASE_URL}/loki/api/v1/query_range"
+    env["LOKI_TLS_VERIFY"] = "true"
+    env["ALLOW_INSECURE_TLS"] = "true"
+    env["LLM_BASE_URL"] = f"{FAKE_BASE_URL}/v1"
+    env["LLM_ENABLED"] = "true"
+    env["GCHAT_WEBHOOK_URL"] = f"{FAKE_BASE_URL}/chat"
+    env["GCHAT_DRY_RUN"] = "false"
+    env["LOKI_POLL_INTERVAL_SECONDS"] = "0.2"
+    env["GCHAT_RATE_LIMIT_DELAY_SECONDS"] = "0.05"
+    env["METRICS_PORT"] = "18881"
 
-    service = IntelligenceService()
-    await service.db.connect()
-    service.running = True
+    # Spawn real process python -m src.main
+    proc = subprocess.Popen([sys.executable, "-m", "src.main"], env=env)
 
-    poller_task = asyncio.create_task(service._run_poller_loop())
-    investigation_task = asyncio.create_task(service._run_investigation_loop())
-    outbox_task = asyncio.create_task(service._run_outbox_loop())
-
-    # Allow service to run cycles
-    await asyncio.sleep(4.0)
-
-    # Terminate loops
-    service.running = False
-    await asyncio.gather(poller_task, investigation_task, outbox_task, return_exceptions=True)
-    await service.stop()
+    try:
+        # Allow process to execute supervised loops and process the staged batch
+        await asyncio.sleep(8.0)
+    finally:
+        # Gracefully shut down via SIGTERM
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
 
     repo = Repository(pg_clean)
 
     # 1. Monotonic Checkpoint Progress
-    latest_cp = await repo.get_checkpoint(service.settings.loki_selector)
+    latest_cp = await repo.get_checkpoint('{service_name="forticlient"}')
     assert latest_cp is not None
     assert latest_cp > 0
 
@@ -159,6 +164,28 @@ async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean, monkey
     assert nb_inc is not None
     assert nb_inc["severity"] == "CRITICAL"
     assert nb_inc["enforcement"] in ("ALLOWED_OR_DETECTED", "MIXED")
+
+    # Verify investigation job completed
+    job_s2 = await pg_clean.fetch_one("SELECT * FROM jobs WHERE payload_json::text LIKE '%198.51.100.45%'")
+    assert job_s2 is not None
+    assert job_s2["status"] == "COMPLETED"
+
+    # Verify INVESTIGATION_UPDATE outbox row exists
+    nb_outbox = await pg_clean.fetch_all("SELECT * FROM notification_outbox WHERE incident_id = $1", nb_inc["id"])
+    notif_types = {row["notification_type"] for row in nb_outbox}
+    assert "URGENT" in notif_types
+    assert "INVESTIGATION_UPDATE" in notif_types
+
+    # Verify revisions are contiguous [1, 2]
+    nb_revs = await pg_clean.fetch_all(
+        "SELECT revision, assessment_source FROM incident_revisions WHERE incident_id = $1 ORDER BY revision ASC",
+        nb_inc["id"]
+    )
+    assert len(nb_revs) == 2
+    assert nb_revs[0]["revision"] == 1
+    assert nb_revs[0]["assessment_source"] == "DETERMINISTIC"
+    assert nb_revs[1]["revision"] == 2
+    assert nb_revs[1]["assessment_source"] == "MODEL_VALIDATED"
 
     # 5. Verify Scenario 3: IPS-dropped exploit (198.51.100.46 -> 10.0.14.120)
     # Expected: No urgent alert
@@ -198,7 +225,7 @@ async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean, monkey
         cap_resp = await client.get(f"{FAKE_BASE_URL}/capture")
         capture = cap_resp.json().get("captured_chats", [])
 
-    assert len(capture) >= 1  # At least the urgent alert for Scenario 2 was delivered
+    assert len(capture) >= 1
 
     for chat_card in capture:
         card_str = json.dumps(chat_card)
@@ -208,6 +235,8 @@ async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean, monkey
         assert "password=" not in card_str
         # Verify HTML escaping
         assert "<script>" not in card_str
+        # Verify ACT_QUARANTINE_SRC_IP is NOT recommended
+        assert "ACT_QUARANTINE_SRC_IP" not in card_str
 
 
 @pytest.mark.asyncio

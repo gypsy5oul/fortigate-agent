@@ -1,189 +1,213 @@
 version: "1.0.0"
-description: "FortiOS log action normalization mapping by log type and subtype"
+description: "FortiOS log action normalization mapping by log type and subtype with citations"
 
 mappings:
   traffic:
     default:
       accept:
         enforcement: "ALLOWED"
-        provenance: "FortiOS Log Reference - Traffic forward allow"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - Observed sample SAMPLE_ESCAPED_QUOTES"
         verified: true
       close:
         enforcement: "ALLOWED"
-        provenance: "FortiOS Log Reference - Session teardown close"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - Session teardown close (closure is not enforcement)"
         verified: true
       timeout:
         enforcement: "ALLOWED"
-        provenance: "FortiOS Log Reference - Session idle timeout"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - Idle session timeout"
         verified: true
       ip-conn:
         enforcement: "ALLOWED"
-        provenance: "FortiOS Log Reference - IP connection state"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - IP connection state"
         verified: true
       deny:
         enforcement: "BLOCKED"
-        provenance: "FortiOS Log Reference - Policy deny"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - Observed sample SAMPLE_TRAFFIC_DENY"
         verified: true
       client-rst:
         enforcement: "SESSION_CLOSED"
-        provenance: "FortiOS Log Reference - TCP RST from client"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - TCP RST from client endpoint"
         verified: true
       server-rst:
         enforcement: "SESSION_CLOSED"
-        provenance: "FortiOS Log Reference - TCP RST from server"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - TCP RST from server endpoint"
         verified: true
       drop:
         enforcement: "BLOCKED"
-        provenance: "FortiOS Log Reference - Traffic drop"
-        verified: true
+        provenance: "Uncited fallback alias - Traffic drop"
+        verified: false
       blocked:
         enforcement: "BLOCKED"
-        provenance: "FortiOS Log Reference - Traffic blocked"
-        verified: true
+        provenance: "Uncited fallback alias - Traffic blocked"
+        verified: false
       block:
         enforcement: "BLOCKED"
-        provenance: "FortiOS Log Reference - Traffic block"
-        verified: true
+        provenance: "Uncited fallback alias - Traffic block"
+        verified: false
 
   utm:
     ips:
       detected:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS IPS Engine Guide - Signature detected without drop"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Observed sample SAMPLE_IPS_NONBLOCKED_EXPLOIT"
         verified: true
       pass_session:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS IPS Engine Guide - Pass session monitor mode"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Monitor mode pass_session"
         verified: true
       passthrough:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS IPS Engine Guide - Passthrough action"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Passthrough action"
         verified: true
       dropped:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Packet/session dropped"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Packet dropped by IPS signature rule"
         verified: true
       drop_session:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Drop session action"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Session dropped by IPS policy"
         verified: true
       reset:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Session reset"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Reset connection action"
         verified: true
       reset_client:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Reset client connection"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Reset client connection action"
         verified: true
       reset_server:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Reset server connection"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Reset server connection action"
         verified: true
       clear_session:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Clear session action"
+        provenance: "FortiOS Log Reference 7.4 §UTM/IPS - Clear session action"
         verified: true
       block:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Block action"
-        verified: true
+        provenance: "Uncited fallback alias - IPS block"
+        verified: false
       blocked:
         enforcement: "BLOCKED"
-        provenance: "FortiOS IPS Engine Guide - Blocked action"
-        verified: true
+        provenance: "Uncited fallback alias - IPS blocked"
+        verified: false
 
     virus:
       blocked:
         enforcement: "BLOCKED"
-        provenance: "FortiOS Antivirus Guide - File payload blocked"
-        verified: true
-      block:
-        enforcement: "BLOCKED"
-        provenance: "FortiOS Antivirus Guide - File payload block"
-        verified: true
-      dropped:
-        enforcement: "BLOCKED"
-        provenance: "FortiOS Antivirus Guide - Stream dropped"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Antivirus - File transfer blocked by AV profile"
         verified: true
       monitored:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS Antivirus Guide - Monitored virus detection"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Antivirus - Monitor mode antivirus detection"
         verified: true
       passthrough:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS Antivirus Guide - Passthrough virus detection"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Antivirus - Passthrough antivirus detection"
         verified: true
+      block:
+        enforcement: "BLOCKED"
+        provenance: "Uncited fallback alias - AV block"
+        verified: false
+      dropped:
+        enforcement: "BLOCKED"
+        provenance: "Uncited fallback alias - AV dropped"
+        verified: false
       detected:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS Antivirus Guide - Detected virus"
-        verified: true
+        provenance: "Uncited fallback alias - AV detected"
+        verified: false
 
     webfilter:
       blocked:
         enforcement: "BLOCKED"
-        provenance: "FortiOS Web Filter Guide - URL category blocked"
-        verified: true
-      block:
-        enforcement: "BLOCKED"
-        provenance: "FortiOS Web Filter Guide - URL category block"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Webfilter - Observed sample SAMPLE_WEBFILTER_BLOCKED"
         verified: true
       passthrough:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS Web Filter Guide - URL passthrough"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Webfilter - Monitor mode passthrough"
         verified: true
       exempt:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS Web Filter Guide - URL exempt allow"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Webfilter - URL exemption category"
         verified: true
+      block:
+        enforcement: "BLOCKED"
+        provenance: "Uncited fallback alias - Webfilter block"
+        verified: false
       monitored:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS Web Filter Guide - URL monitored"
+        provenance: "Uncited fallback alias - Webfilter monitored"
+        verified: false
+
+    waf:
+      passthrough:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Log Reference 7.4 §UTM/WAF - Observed sample SAMPLE_WAF_SQLI_PASSTHROUGH"
+        verified: true
+      blocked:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Log Reference 7.4 §UTM/WAF - SQLi/XSS blocked by WAF policy"
+        verified: true
+      block:
+        enforcement: "BLOCKED"
+        provenance: "Uncited fallback alias - WAF block"
+        verified: false
+
+    ssl:
+      fail:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Log Reference 7.4 §UTM/SSL - Observed sample SAMPLE_SSL_DPI_ANOMALY"
+        verified: true
+      success:
+        enforcement: "ALLOWED"
+        provenance: "FortiOS Log Reference 7.4 §UTM/SSL - Deep inspection handshake success"
         verified: true
 
     anomaly:
       clear_session:
         enforcement: "BLOCKED"
-        provenance: "FortiOS DoS Anomaly - Clear session defense"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Anomaly - DoS sensor clear session"
         verified: true
       drop:
         enforcement: "BLOCKED"
-        provenance: "FortiOS DoS Anomaly - Drop packet defense"
-        verified: true
-      dropped:
-        enforcement: "BLOCKED"
-        provenance: "FortiOS DoS Anomaly - Dropped packet defense"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Anomaly - DoS sensor drop packet"
         verified: true
       detected:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS DoS Anomaly - Anomaly detected monitor"
+        provenance: "FortiOS Log Reference 7.4 §UTM/Anomaly - DoS sensor anomaly detected"
         verified: true
+      dropped:
+        enforcement: "BLOCKED"
+        provenance: "Uncited fallback alias - Anomaly dropped"
+        verified: false
 
     default:
       deny:
         enforcement: "BLOCKED"
-        provenance: "FortiOS UTM default - Deny"
+        provenance: "Uncited fallback - Default UTM deny"
         verified: false
       drop:
         enforcement: "BLOCKED"
-        provenance: "FortiOS UTM default - Drop"
+        provenance: "Uncited fallback - Default UTM drop"
         verified: false
       blocked:
         enforcement: "BLOCKED"
-        provenance: "FortiOS UTM default - Blocked"
+        provenance: "Uncited fallback - Default UTM blocked"
         verified: false
       block:
         enforcement: "BLOCKED"
-        provenance: "FortiOS UTM default - Block"
+        provenance: "Uncited fallback - Default UTM block"
         verified: false
       accept:
         enforcement: "ALLOWED"
-        provenance: "FortiOS UTM default - Accept"
+        provenance: "Uncited fallback - Default UTM accept"
         verified: false
       pass:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS UTM default - Pass"
+        provenance: "Uncited fallback - Default UTM pass"
         verified: false
       detected:
         enforcement: "ALLOWED_OR_DETECTED"
-        provenance: "FortiOS UTM default - Detected"
+        provenance: "Uncited fallback - Default UTM detected"
         verified: false

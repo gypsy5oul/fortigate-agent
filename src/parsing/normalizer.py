@@ -74,8 +74,8 @@ def normalize_action(
         if not entry and "default" in type_cfg:
             entry = type_cfg["default"].get(act)
 
-    # Check top-level or other namespaces if not matched or no log_type supplied
-    if not entry:
+    # Check other namespaces only if no log_type was supplied
+    if not entry and not norm_type:
         for t_name, t_cfg in action_map.items():
             if isinstance(t_cfg, dict):
                 if norm_subtype and norm_subtype in t_cfg and act in t_cfg[norm_subtype]:

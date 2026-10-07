@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="EMPTY", description="API key (EMPTY for local vLLM)")
     llm_timeout_seconds: float = Field(default=60.0, description="Max timeout per LLM inference call")
     llm_max_input_tokens: int = Field(default=12000, description="Max input prompt token budget")
-    llm_max_output_tokens: int = Field(default=1500, description="Max completion token budget")
+    llm_max_output_tokens: int = Field(default=3500, description="Max completion token budget")
     urgent_cooldown_seconds: int = Field(default=900, description="Cooldown in seconds before sending another URGENT card for the same incident")
     investigation_rate_limit_per_source_hour: int = Field(default=3, description="Max investigation jobs per hour per source IP")
     investigation_rate_limit_per_target_hour: int = Field(default=10, description="Max investigation jobs per hour per target IP")

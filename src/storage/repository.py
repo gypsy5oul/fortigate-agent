@@ -456,7 +456,9 @@ class Repository:
                     raise RevisionConflict(
                         f"Incident {incident['id']} current revision is {current_rev}, expected {expected_revision}"
                     )
-                new_rev = current_rev + 1
+                # Allocate a new revision only when a revision row is being written;
+                # a counts-only update must not advance current_revision.
+                new_rev = current_rev + 1 if revision is not None else current_rev
             else:
                 if expected_revision is not None and expected_revision > 0:
                     raise RevisionConflict(

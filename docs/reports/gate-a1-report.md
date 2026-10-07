@@ -18,7 +18,7 @@
 | `docker-compose.yml` | Hardened compose service removing default password fallbacks. |
 | `.env.example` | Sanitized configuration template replacing credentials with `<set-me>`. |
 | `migrations/001_initial_schema.sql` | Initial SQL schema with `schema_migrations` tracking table. |
-| `migrations/002_a1_remediation.sql` | Schema migration adding `utmaction`, `signature_truncated`, and `rejected_events`. |
+| `migrations/002_text_columns.sql` | Schema migration expanding text columns, adding `utmaction`, `signature_truncated`, and `rejected_events`. |
 | `src/correlator/session_aggregator.py` | Episode aggregator tracking blocked session IDs to prevent treating allowed traffic as unblocked exploits. |
 | `src/investigation/adk_workflow.py` | ADK workflow enforcing deterministic enforcement pinning, static fallback with reason codes, and stripping ungrounded CVEs. |
 | `src/investigation/schemas.py` | Pydantic schemas enforcing `extra="forbid"` and typed schema validation. |
@@ -46,7 +46,7 @@
 
 ## 2. Acceptance Test Results
 
-All 50 tests were executed in this session against real PostgreSQL 16.14.
+All 51 tests were executed in this session against real PostgreSQL 16.14.
 
 **Test Command:**
 ```bash
@@ -62,14 +62,15 @@ rootdir: /opt/firewall-log-analysis-agent
 configfile: pytest.ini
 plugins: anyio-4.12.1, asyncio-1.2.0
 asyncio: mode=auto, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
-collected 50 items
+collected 51 items
 
-tests/e2e/test_service_e2e.py::test_e2e_scenarios_and_service_lifecycle PASSED [  2%]
-tests/e2e/test_service_e2e.py::test_e2e_model_outage_fallback PASSED     [  4%]
-tests/integration/test_investigation_loop_pg.py::test_pg_concurrent_incident_transitions_optimistic_locking PASSED [  6%]
-tests/integration/test_investigation_loop_pg.py::test_pg_stale_job_lease_fencing PASSED [  8%]
-tests/integration/test_investigation_loop_pg.py::test_pg_job_backoff_and_max_attempts_failure PASSED [ 10%]
-tests/integration/test_outbox_loop_pg.py::test_pg_outbox_dry_run_marks_simulated PASSED [ 12%]
+tests/e2e/test_service_e2e.py::test_e2e_scenarios_and_service_lifecycle PASSED [  1%]
+tests/e2e/test_service_e2e.py::test_e2e_model_outage_fallback PASSED     [  3%]
+tests/integration/test_investigation_loop_pg.py::test_pg_concurrent_incident_transitions_optimistic_locking PASSED [  5%]
+tests/integration/test_investigation_loop_pg.py::test_pg_stale_job_lease_fencing PASSED [  7%]
+tests/integration/test_investigation_loop_pg.py::test_pg_job_backoff_and_max_attempts_failure PASSED [  9%]
+tests/integration/test_investigation_loop_pg.py::test_pg_unchanged_episode_poller_and_investigation_completion PASSED [ 11%]
+tests/integration/test_outbox_loop_pg.py::test_pg_outbox_dry_run_marks_simulated PASSED [ 13%]
 tests/integration/test_outbox_loop_pg.py::test_pg_outbox_failure_redacts_webhook_url PASSED [ 14%]
 tests/integration/test_outbox_loop_pg.py::test_pg_outbox_successful_delivery_marks_sent PASSED [ 16%]
 tests/integration/test_poller_loop_pg.py::test_pg_long_msg_and_text_columns PASSED [ 18%]
@@ -115,7 +116,7 @@ tests/test_storage.py::test_event_deduplication PASSED                   [ 96%]
 tests/test_storage.py::test_leased_job_queue PASSED                      [ 98%]
 tests/test_storage.py::test_notification_outbox PASSED                   [100%]
 
-======================== 50 passed in 60.64s (0:01:00) =========================
+======================== 51 passed in 63.29s (0:01:03) =========================
 ```
 
 **Deterministic Replay Harness Verification:**
@@ -141,11 +142,11 @@ As verified by `tests/e2e/test_service_e2e.py` executed against PostgreSQL 16:
 | Scenario | Expected Outcome | Observed in Gate A.1 | Database Records & Outbox Verification |
 |---|---|---|---|
 | **1. Benign internal host** (DNS + HTTPS, sessions closed normally) | No alert | No alert ✔ | 2 events in `selected_events`. 0 urgent incidents, 0 outbox rows. |
-| **2. Non-blocked IPS detection against VIP** (`action=detected`) | CRITICAL urgent | CRITICAL urgent ✔ | 1 event in `selected_events`. Incident created with `severity=CRITICAL`, `enforcement=ALLOWED_OR_DETECTED`. Outbox contains 1 URGENT card delivered. Investigation job created and completed with `INVESTIGATION_UPDATE` revision. |
+| **2. Non-blocked IPS detection against VIP** (`action=detected`) | CRITICAL urgent | CRITICAL urgent ✔ | 1 event in `selected_events`. Incident created with `severity=CRITICAL`, `enforcement=ALLOWED_OR_DETECTED`. Outbox contains 1 URGENT card delivered and 1 INVESTIGATION_UPDATE card. Investigation job created and completed on attempt 1 with `INVESTIGATION_UPDATE` revision. Contiguous revisions `[1, 2]`. Deterministic cards contain no dangerous `ACT_QUARANTINE_SRC_IP` recommendation. |
 | **3. IPS-dropped exploit** (`action=dropped`) + accepted traffic log of same session | No urgent alert | No urgent alert ✔ | 2 events in `selected_events`. Blocked session ID tracked; accepted traffic not treated as bypass. 0 URGENT outbox rows created or dispatched. |
 | **4. Internal host, antivirus blocked a download** | No urgent alert | No urgent alert ✔ | 1 event in `selected_events`. `RULE_ANTIVIRUS_DETECTION` maps blocked AV to `severity=MEDIUM`, `routing=DIGEST`. 0 URGENT outbox rows. |
 | **5. Blocked scanner** (12 denies) | Digest | Digest ✔ | 12 events in `selected_events`. `RULE_HIGH_FREQUENCY_SCANNER` matched with `severity=MEDIUM`, `routing=DIGEST`. 0 URGENT outbox rows. |
-| **Model investigation updates** | One per urgent incident | One per urgent incident ✔ | Worker leases job with atomic version fencing. Model revision recorded, incident updated to revision 2 without crashing. |
+| **Model investigation updates** | One per urgent incident | One per urgent incident ✔ | Worker leases job with atomic version fencing. Model revision recorded, incident updated to contiguous revision 2 without crashing or CAS conflict. |
 | **Loki coverage progress** | Continuous, strictly non-decreasing | Continuous ✔ | Checkpoint advances monotonically. 1-hour catch-up executes in bounded slices. Zero backward regressions. |
 
 ---
@@ -176,6 +177,8 @@ In accordance with Rule 4 ("No live systems"):
    - Outbox error messages scrub all URLs containing query tokens (`[URL_REDACTED]`).
    - Logging filter (`SensitiveDataFilter`) active across root loggers.
    - All interpolated card text escaped via `html.escape` and external URLs defanged (`hxxp://`).
+4. **Rate Limit Persistence Migration**:
+   - Sliding window rate limiters (e.g., global urgent alert rate caps) operate via in-memory sliding windows in `src/main.py`. In Phase B, these will be migrated to persistent PostgreSQL rate-limit / state tables to guarantee distributed consistency across process restarts and replicas.
 
 ---
 
@@ -192,7 +195,8 @@ In accordance with Rule 4 ("No live systems"):
 
 ## 7. Runtime & Dependency Environment
 
-- **Python Version:** `3.9.16`
+- **Host Python Version:** `3.9.16` (development & test execution virtualenv)
+- **Container Target Version:** `python:3.12-slim` (compatible with standard Python 3.9+ type constructs and syntax)
 - **PostgreSQL Version:** `PostgreSQL 16.14 on x86_64-pc-linux-musl (Alpine Linux)`
 - **Key Pinned Dependencies:**
   - `fastapi==0.128.8`

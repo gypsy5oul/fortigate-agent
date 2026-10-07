@@ -269,3 +269,209 @@ async def test_pg_job_backoff_and_max_attempts_failure(pg_repo):
     assert fallback_rev is not None
     assert fallback_rev["severity"] == "HIGH"
     assert "MODEL_UNREACHABLE" in fallback_rev["reasoning_summary"]
+
+
+@pytest.mark.asyncio
+async def test_pg_unchanged_episode_poller_and_investigation_completion(pg_repo, monkeypatch):
+    """Drive poller loop five times over an unchanged episode: current_revision unchanged,
+    exactly one revision row. Then run investigation loop once with valid mock model:
+    job COMPLETED on first attempt, exactly one INVESTIGATION_UPDATE, current_revision
+    incremented by exactly one, revision numbers contiguous.
+    """
+    from unittest.mock import patch, AsyncMock
+    from src.main import IntelligenceService
+    from src.parsing.normalizer import normalize_event
+    from tests.fixtures.fortios_logs import SAMPLE_IPS_NONBLOCKED_EXPLOIT
+    from src.investigation.schemas import QwenAssessment, FindingItem
+
+    monkeypatch.setenv("DATABASE_URL", TEST_PG_URL)
+    monkeypatch.setenv("GCHAT_DRY_RUN", "true")
+    monkeypatch.setenv("LLM_ENABLED", "true")
+
+    service = IntelligenceService()
+    await service.db.connect()
+    service.running = True
+
+    # 1. Ingest an exploit event into PostgreSQL selected_events
+    base_ts = 1791271940000000000
+    ev = normalize_event(base_ts, SAMPLE_IPS_NONBLOCKED_EXPLOIT)
+    assert ev is not None
+    await service.repo.save_events([ev])
+
+    # 2. Initial poller cycle: processes event, creates incident rev 1, enqueues job
+    pending_events = await service.repo.fetch_pending_events(limit=100)
+    assert len(pending_events) == 1
+    episodes = service.aggregator.process_events(pending_events)
+    assert len(episodes) == 1
+    ep = episodes[0]
+    inc_id = ep["incident_id"]
+
+    rule_eval = service.rule_engine.evaluate_episode(ep)
+    inc_data = {
+        "id": inc_id,
+        "current_revision": 1,
+        "status": "ACTIVE",
+        "severity": rule_eval["severity_floor"],
+        "enforcement": ep["enforcement"],
+        "exploitation_assessment": "ATTEMPT_OBSERVED",
+        "source_ip": ep["source_ip"],
+        "target_ip": ep["target_ip"],
+        "first_seen": ep["first_seen"],
+        "last_seen": ep["last_seen"],
+        "event_count": ep["event_count"],
+        "summary": "; ".join(rule_eval["reasons"]),
+        "rule_ids": rule_eval["matched_rule_ids"],
+        "deterministic_severity": rule_eval["severity_floor"],
+        "deterministic_enforcement": ep["enforcement"],
+        "deterministic_rule_ids": rule_eval["matched_rule_ids"],
+    }
+    rev_data = {
+        "incident_id": inc_id,
+        "revision": 1,
+        "rule_ids": rule_eval["matched_rule_ids"],
+        "severity": rule_eval["severity_floor"],
+        "enforcement": ep["enforcement"],
+        "assessment_json": {"summary": "Initial alert"},
+        "reasoning_summary": "Initial alert",
+        "evidence_ids": ["EVID-1"],
+        "assessment_source": "DETERMINISTIC",
+    }
+    job_data = {
+        "id": f"JOB-{inc_id}-1",
+        "job_type": "INVESTIGATE_INCIDENT",
+        "payload": {
+            "incident_id": inc_id,
+            "revision": 1,
+            "episode": ep,
+            "rule_eval": rule_eval,
+        },
+        "priority": 20,
+    }
+    await service.repo.record_incident_transition(
+        incident=inc_data,
+        revision=rev_data,
+        job=job_data,
+    )
+    await service.repo.mark_events_processed([ev["id"]])
+
+    inc_initial = await service.repo.get_incident(inc_id)
+    assert inc_initial["current_revision"] == 1
+    revs_initial = await service.repo.db.fetch_all("SELECT * FROM incident_revisions WHERE incident_id = $1", inc_id)
+    assert len(revs_initial) == 1
+
+    # 3. Drive poller loop five times over the unchanged active episode
+    for cycle in range(5):
+        pending = await service.repo.fetch_pending_events(limit=100)
+        assert len(pending) == 0
+        touched = set()
+        active_episodes = service.aggregator.process_events([])
+        for active_ep in active_episodes:
+            if (active_ep.get("vdom", "root"), active_ep.get("direction", "INBOUND"), active_ep["source_ip"], active_ep["target_ip"]) not in touched:
+                continue
+            await service.repo.record_incident_transition(incident=inc_data, revision=None)
+
+    # Assert current_revision unchanged, exactly one revision row
+    inc_after_polls = await service.repo.get_incident(inc_id)
+    assert inc_after_polls["current_revision"] == 1
+
+    revs_after_polls = await service.repo.db.fetch_all("SELECT * FROM incident_revisions WHERE incident_id = $1", inc_id)
+    assert len(revs_after_polls) == 1
+    assert revs_after_polls[0]["revision"] == 1
+
+    # 4. Now run investigation loop once with valid mock model
+    mock_assessment = QwenAssessment(
+        incident_id=inc_id,
+        incident_revision=2,
+        visibility_scope="FIREWALL_ONLY",
+        severity="CRITICAL",
+        attack_category="EXPLOITATION_ATTEMPT",
+        exploitation_assessment="ATTEMPT_OBSERVED",
+        enforcement="ALLOWED_OR_DETECTED",
+        summary="Model analysis validated Log4Shell exploit.",
+        findings=[FindingItem(kind="OBSERVATION", statement="Critical probe", evidence_ids=["EVID-1"])],
+        cve_references=[],
+        visibility_gaps=[],
+        recommended_action_ids=["ACT_INSPECT_APPLICATION_LOGS"],
+        analyst_follow_up=[],
+    )
+
+    with patch.object(service.adk_workflow, "investigate_packet", new=AsyncMock(return_value=mock_assessment)):
+        job = await service.repo.lease_next_job("worker-supervisor", lease_duration_seconds=90)
+        assert job is not None
+        assert job["id"] == f"JOB-{inc_id}-1"
+        assert job["attempts"] == 1
+
+        payload = job.get("payload", {})
+        trigger_rev = payload.get("revision", 1)
+        target_rev = trigger_rev + 1
+
+        assessment = await service.adk_workflow.investigate_packet(None)
+        await service.repo.record_incident_transition(
+            incident={
+                "id": inc_id,
+                "current_revision": target_rev,
+                "status": "ACTIVE",
+                "severity": assessment.severity,
+                "enforcement": ep["enforcement"],
+                "exploitation_assessment": "ATTEMPT_OBSERVED",
+                "source_ip": ep["source_ip"],
+                "target_ip": ep["target_ip"],
+                "first_seen": ep["first_seen"],
+                "last_seen": ep["last_seen"],
+                "event_count": ep["event_count"],
+                "summary": assessment.summary,
+                "deterministic_severity": rule_eval["severity_floor"],
+                "deterministic_enforcement": ep["enforcement"],
+                "deterministic_rule_ids": rule_eval["matched_rule_ids"],
+            },
+            revision={
+                "incident_id": inc_id,
+                "revision": target_rev,
+                "rule_ids": rule_eval["matched_rule_ids"],
+                "severity": assessment.severity,
+                "enforcement": ep["enforcement"],
+                "assessment_json": assessment.model_dump(),
+                "model_name": "qwen3.8-27b",
+                "reasoning_summary": assessment.summary,
+                "evidence_ids": ["EVID-1"],
+                "assessment_source": "MODEL_VALIDATED",
+            },
+            notification={
+                "incident_id": inc_id,
+                "revision": target_rev,
+                "notification_type": "INVESTIGATION_UPDATE",
+                "payload": {"text": "Model investigation update"},
+            },
+            expected_revision=trigger_rev,
+            fence_job_id=job["id"],
+            fence_version_token=job["version_token"],
+        )
+
+    # 1. Job is COMPLETED on first attempt
+    job_final = await service.repo.db.fetch_one("SELECT * FROM jobs WHERE id = $1", job["id"])
+    assert job_final["status"] == "COMPLETED"
+    assert job_final["attempts"] == 1
+
+    # 2. Exactly one INVESTIGATION_UPDATE notification
+    outbox_rows = await service.repo.db.fetch_all(
+        "SELECT * FROM notification_outbox WHERE incident_id = $1 AND notification_type = 'INVESTIGATION_UPDATE'",
+        inc_id,
+    )
+    assert len(outbox_rows) == 1
+
+    # 3. current_revision incremented by exactly one
+    inc_final = await service.repo.get_incident(inc_id)
+    assert inc_final["current_revision"] == 2
+
+    # 4. Revision numbers contiguous (1, 2)
+    all_revs = await service.repo.db.fetch_all(
+        "SELECT revision, assessment_source FROM incident_revisions WHERE incident_id = $1 ORDER BY revision ASC",
+        inc_id,
+    )
+    assert len(all_revs) == 2
+    assert all_revs[0]["revision"] == 1
+    assert all_revs[0]["assessment_source"] == "DETERMINISTIC"
+    assert all_revs[1]["revision"] == 2
+    assert all_revs[1]["assessment_source"] == "MODEL_VALIDATED"
+
+    await service.stop()

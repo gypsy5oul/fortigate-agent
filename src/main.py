@@ -148,6 +148,7 @@ class IntelligenceService:
             log_level="warning",
         )
         server = uvicorn.Server(server_config)
+        self._server = server
         server_task = asyncio.create_task(server.serve())
 
         # Start supervisor worker loops
@@ -166,6 +167,8 @@ class IntelligenceService:
 
     async def stop(self):
         self.running = False
+        if hasattr(self, "_server") and self._server:
+            self._server.should_exit = True
         await self.loki_client.close()
         await self.adk_workflow.close()
         await self.outbox_worker.close()
@@ -195,8 +198,12 @@ class IntelligenceService:
                     episodes = self.aggregator.process_events(pending_events)
                     INCIDENTS_ACTIVE.set(len(episodes))
                     pending_ids = [ev["id"] for ev in pending_events]
+                    touched = {(ev.get("vd", "root"), ev.get("direction", "INBOUND"), ev["srcip"], ev["dstip"]) for ev in pending_events}
 
                     for ep in episodes:
+                        # Only episodes that received events in this batch can change
+                        if (ep.get("vdom", "root"), ep.get("direction", "INBOUND"), ep["source_ip"], ep["target_ip"]) not in touched:
+                            continue
                         rule_eval = self.rule_engine.evaluate_episode(ep)
                         matched_rules = rule_eval["matched_rule_ids"]
                         if not matched_rules:
@@ -260,6 +267,7 @@ class IntelligenceService:
                             "last_seen": ep["last_seen"],
                             "event_count": ep["event_count"],
                             "summary": "; ".join(rule_eval["reasons"]),
+                            "rule_ids": matched_rules,
                             "deterministic_severity": sev_floor,
                             "deterministic_enforcement": ep["enforcement"],
                             "deterministic_rule_ids": matched_rules,
@@ -281,7 +289,7 @@ class IntelligenceService:
                                     "severity": sev_floor,
                                     "enforcement": ep["enforcement"],
                                     "summary": f"[DETERMINISTIC PERIMETER ALERT - REV {next_rev}] {'; '.join(rule_eval['reasons'])}",
-                                    "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS", "ACT_QUARANTINE_SRC_IP"] if sev_floor in ("CRITICAL", "HIGH") else ["ACT_MONITOR_AND_DIGEST"],
+                                    "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS"] if sev_floor in ("CRITICAL", "HIGH") else ["ACT_MONITOR_AND_DIGEST"],
                                 },
                                 "model_name": None,
                                 "reasoning_summary": "; ".join(rule_eval["reasons"]),
@@ -506,9 +514,7 @@ class IntelligenceService:
         """Processes outgoing notifications to Google Chat with rate-limiting."""
         while self.running:
             try:
-                sent = await self.outbox_worker.process_outbox_batch(limit=5)
-                if sent > 0:
-                    OUTBOX_DELIVERED_TOTAL.inc(sent)
+                await self.outbox_worker.process_outbox_batch(limit=5)
             except Exception as e:
                 logger.error("Error in outbox loop: %s", e)
 
