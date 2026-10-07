@@ -6,7 +6,7 @@ mappings:
     default:
       accept:
         enforcement: "ALLOWED"
-        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - Observed sample SAMPLE_ESCAPED_QUOTES"
+        provenance: "FortiOS Log Reference 7.4 §Traffic/Forward - Observed sample SAMPLE_TRAFFIC_ACCEPT (also fake_endpoints scenario_3)"
         verified: true
       close:
         enforcement: "ALLOWED"

@@ -54,3 +54,10 @@ SAMPLE_IPV6_LOG = (
     'subtype="forward" srcip=2001:db8:85a3::8a2e:370:7334 srcport=44122 '
     'dstip=2001:db8:85a3::1 dstport=443 proto=6 action="deny"'
 )
+
+SAMPLE_TRAFFIC_ACCEPT = (
+    'eventtime=1791271941200000000 tz="+0530" logid="0000000013" type="traffic" '
+    'subtype="forward" level="notice" vd="root" sessionid=200004 srcip=198.51.100.46 '
+    'srcport=44813 dstip=10.0.14.120 dstport=443 proto=6 service="HTTPS" action="accept" '
+    'policyid=10 sentbyte=1200 rcvdbyte=4500'
+)

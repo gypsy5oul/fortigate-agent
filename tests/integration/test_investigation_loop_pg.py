@@ -359,16 +359,18 @@ async def test_pg_unchanged_episode_poller_and_investigation_completion(pg_repo,
     revs_initial = await service.repo.db.fetch_all("SELECT * FROM incident_revisions WHERE incident_id = $1", inc_id)
     assert len(revs_initial) == 1
 
-    # 3. Drive poller loop five times over the unchanged active episode
+    # 3. Five counts-only poller transitions over the unchanged active episode.
+    # This is the exact call main.py makes on the "no material change" path
+    # (revision=None, expected_revision=<revision it just read>); it must not
+    # advance current_revision or write a revision row.
     for cycle in range(5):
         pending = await service.repo.fetch_pending_events(limit=100)
         assert len(pending) == 0
-        touched = set()
-        active_episodes = service.aggregator.process_events([])
-        for active_ep in active_episodes:
-            if (active_ep.get("vdom", "root"), active_ep.get("direction", "INBOUND"), active_ep["source_ip"], active_ep["target_ip"]) not in touched:
-                continue
-            await service.repo.record_incident_transition(incident=inc_data, revision=None)
+        current = (await service.repo.get_incident(inc_id))["current_revision"]
+        counts_only = dict(inc_data, current_revision=current, event_count=inc_data["event_count"])
+        await service.repo.record_incident_transition(
+            incident=counts_only, revision=None, expected_revision=current
+        )
 
     # Assert current_revision unchanged, exactly one revision row
     inc_after_polls = await service.repo.get_incident(inc_id)

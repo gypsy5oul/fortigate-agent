@@ -31,7 +31,6 @@ from src.observability.metrics import (
     NORMALIZED_EVENTS_TOTAL,
     INCIDENTS_ACTIVE,
     MODEL_INFERENCE_DURATION,
-    OUTBOX_DELIVERED_TOTAL,
     INVESTIGATIONS_RATE_LIMITED_TOTAL,
 )
 
@@ -528,8 +527,10 @@ def main():
 
     def _sig_handler():
         logger.info("Received termination signal.")
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
+        service.running = False
+        server = getattr(service, "_server", None)
+        if server is not None:
+            server.should_exit = True
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _sig_handler)

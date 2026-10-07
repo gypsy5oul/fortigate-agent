@@ -50,7 +50,7 @@ All 51 tests were executed in this session against real PostgreSQL 16.14.
 
 **Test Command:**
 ```bash
-TEST_DATABASE_URL="postgresql://forti_intel:forti_secret_pw_2026@172.18.0.2:5432/forti_test" .venv/bin/pytest -v
+TEST_DATABASE_URL="postgresql://forti_intel:<redacted>@172.18.0.2:5432/forti_test" .venv/bin/pytest -v
 ```
 
 **Output:**
@@ -198,7 +198,7 @@ In accordance with Rule 4 ("No live systems"):
 - **Host Python Version:** `3.9.16` (development & test execution virtualenv)
 - **Container Target Version:** `python:3.12-slim` (compatible with standard Python 3.9+ type constructs and syntax)
 - **PostgreSQL Version:** `PostgreSQL 16.14 on x86_64-pc-linux-musl (Alpine Linux)`
-- **Key Pinned Dependencies:**
+- **Installed Dependency Versions:** (host .venv; `requirements.txt` specifies compatible version ranges)
   - `fastapi==0.128.8`
   - `uvicorn==0.39.0`
   - `httpx==0.28.1`
