@@ -45,6 +45,8 @@ class QwenAssessment(BaseModel):
     visibility_gaps: List[str] = Field(default_factory=list, max_length=10)
     recommended_action_ids: List[str] = Field(default_factory=list, max_length=6)
     analyst_follow_up: List[str] = Field(default_factory=list, max_length=5)
+    model_reported_enforcement: Optional[str] = Field(default=None)
+    assessment_source: Optional[str] = Field(default="DETERMINISTIC")
 
 
 class IncidentPacket(BaseModel):

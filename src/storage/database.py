@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS selected_events (
     raw_message TEXT NOT NULL,
     processing_status TEXT NOT NULL DEFAULT 'PENDING',
     processed_at TIMESTAMP,
+    utmaction TEXT,
+    signature_truncated INTEGER DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -67,6 +69,13 @@ CREATE INDEX IF NOT EXISTS idx_events_pending ON selected_events(processing_stat
 CREATE INDEX IF NOT EXISTS idx_events_srcip_ts ON selected_events(srcip, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_dstip_ts ON selected_events(dstip, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_loki_ts ON selected_events(loki_ts_ns);
+
+CREATE TABLE IF NOT EXISTS rejected_events (
+    id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    raw_sha256 TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
 CREATE TABLE IF NOT EXISTS incidents (
     id TEXT PRIMARY KEY,
@@ -86,6 +95,10 @@ CREATE TABLE IF NOT EXISTS incidents (
     last_seen TIMESTAMP NOT NULL,
     event_count INTEGER NOT NULL DEFAULT 1,
     summary TEXT,
+    deterministic_severity TEXT,
+    deterministic_enforcement TEXT,
+    deterministic_rule_ids TEXT DEFAULT '[]',
+    last_urgent_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -103,6 +116,7 @@ CREATE TABLE IF NOT EXISTS incident_revisions (
     model_name TEXT,
     reasoning_summary TEXT,
     evidence_ids TEXT NOT NULL DEFAULT '[]',
+    assessment_source TEXT DEFAULT 'DETERMINISTIC',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(incident_id, revision)
 );
@@ -157,9 +171,9 @@ class SQLiteTransaction:
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn
 
-    async def execute(self, query: str, *args) -> None:
+    async def execute(self, query: str, *args) -> Any:
         q = _to_sqlite_query(query)
-        await self.conn.execute(q, args)
+        return await self.conn.execute(q, args)
 
     async def execute_many(self, query: str, args_list: list) -> None:
         if not args_list:
@@ -179,13 +193,16 @@ class SQLiteTransaction:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def fetch(self, query: str, *args) -> List[Dict[str, Any]]:
+        return await self.fetch_all(query, *args)
+
 
 class PostgresTransaction:
     def __init__(self, conn: asyncpg.Connection):
         self.conn = conn
 
-    async def execute(self, query: str, *args) -> None:
-        await self.conn.execute(query, *args)
+    async def execute(self, query: str, *args) -> Any:
+        return await self.conn.execute(query, *args)
 
     async def execute_many(self, query: str, args_list: list) -> None:
         if not args_list:
@@ -199,6 +216,9 @@ class PostgresTransaction:
     async def fetch_all(self, query: str, *args) -> List[Dict[str, Any]]:
         rows = await self.conn.fetch(query, *args)
         return [dict(r) for r in rows]
+
+    async def fetch(self, query: str, *args) -> list:
+        return await self.conn.fetch(query, *args)
 
 
 class Database:
@@ -224,13 +244,43 @@ class Database:
             await self.apply_postgres_migrations()
 
     async def apply_postgres_migrations(self):
-        schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
-        if os.path.exists(schema_path):
-            with open(schema_path, "r", encoding="utf-8") as f:
-                ddl = f.read()
-            async with self._pg_pool.acquire() as conn:
-                await conn.execute(ddl)
-            logger.info("Applied PostgreSQL DDL schema successfully.")
+        """Apply ordered migrations tracked by schema_migrations table."""
+        async with self._pg_pool.acquire() as conn:
+            # 1. Ensure schema_migrations table exists
+            await conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version VARCHAR(64) PRIMARY KEY,
+                applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            );
+            """)
+
+            rows = await conn.fetch("SELECT version FROM schema_migrations")
+            applied_versions = {r["version"] for r in rows}
+
+            # 2. Ordered migration execution from migrations/
+            migrations_dir = os.path.join(os.path.dirname(__file__), "..", "..", "migrations")
+            if os.path.exists(migrations_dir):
+                sql_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith(".sql")])
+                for fname in sql_files:
+                    version = os.path.splitext(fname)[0]
+                    if version not in applied_versions:
+                        file_path = os.path.join(migrations_dir, fname)
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            sql = f.read()
+                        async with conn.transaction():
+                            await conn.execute(sql)
+                            await conn.execute(
+                                "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, NOW())",
+                                version,
+                            )
+                        logger.info("Applied PostgreSQL migration: %s", version)
+            else:
+                schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+                if os.path.exists(schema_path):
+                    with open(schema_path, "r", encoding="utf-8") as f:
+                        ddl = f.read()
+                    await conn.execute(ddl)
+                    logger.info("Applied PostgreSQL fallback DDL schema successfully.")
 
     async def close(self):
         if self._pg_pool:

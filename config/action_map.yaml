@@ -1,0 +1,189 @@
+version: "1.0.0"
+description: "FortiOS log action normalization mapping by log type and subtype"
+
+mappings:
+  traffic:
+    default:
+      accept:
+        enforcement: "ALLOWED"
+        provenance: "FortiOS Log Reference - Traffic forward allow"
+        verified: true
+      close:
+        enforcement: "ALLOWED"
+        provenance: "FortiOS Log Reference - Session teardown close"
+        verified: true
+      timeout:
+        enforcement: "ALLOWED"
+        provenance: "FortiOS Log Reference - Session idle timeout"
+        verified: true
+      ip-conn:
+        enforcement: "ALLOWED"
+        provenance: "FortiOS Log Reference - IP connection state"
+        verified: true
+      deny:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Log Reference - Policy deny"
+        verified: true
+      client-rst:
+        enforcement: "SESSION_CLOSED"
+        provenance: "FortiOS Log Reference - TCP RST from client"
+        verified: true
+      server-rst:
+        enforcement: "SESSION_CLOSED"
+        provenance: "FortiOS Log Reference - TCP RST from server"
+        verified: true
+      drop:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Log Reference - Traffic drop"
+        verified: true
+      blocked:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Log Reference - Traffic blocked"
+        verified: true
+      block:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Log Reference - Traffic block"
+        verified: true
+
+  utm:
+    ips:
+      detected:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS IPS Engine Guide - Signature detected without drop"
+        verified: true
+      pass_session:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS IPS Engine Guide - Pass session monitor mode"
+        verified: true
+      passthrough:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS IPS Engine Guide - Passthrough action"
+        verified: true
+      dropped:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Packet/session dropped"
+        verified: true
+      drop_session:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Drop session action"
+        verified: true
+      reset:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Session reset"
+        verified: true
+      reset_client:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Reset client connection"
+        verified: true
+      reset_server:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Reset server connection"
+        verified: true
+      clear_session:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Clear session action"
+        verified: true
+      block:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Block action"
+        verified: true
+      blocked:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS IPS Engine Guide - Blocked action"
+        verified: true
+
+    virus:
+      blocked:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Antivirus Guide - File payload blocked"
+        verified: true
+      block:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Antivirus Guide - File payload block"
+        verified: true
+      dropped:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Antivirus Guide - Stream dropped"
+        verified: true
+      monitored:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Antivirus Guide - Monitored virus detection"
+        verified: true
+      passthrough:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Antivirus Guide - Passthrough virus detection"
+        verified: true
+      detected:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Antivirus Guide - Detected virus"
+        verified: true
+
+    webfilter:
+      blocked:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Web Filter Guide - URL category blocked"
+        verified: true
+      block:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS Web Filter Guide - URL category block"
+        verified: true
+      passthrough:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Web Filter Guide - URL passthrough"
+        verified: true
+      exempt:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Web Filter Guide - URL exempt allow"
+        verified: true
+      monitored:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS Web Filter Guide - URL monitored"
+        verified: true
+
+    anomaly:
+      clear_session:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS DoS Anomaly - Clear session defense"
+        verified: true
+      drop:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS DoS Anomaly - Drop packet defense"
+        verified: true
+      dropped:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS DoS Anomaly - Dropped packet defense"
+        verified: true
+      detected:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS DoS Anomaly - Anomaly detected monitor"
+        verified: true
+
+    default:
+      deny:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS UTM default - Deny"
+        verified: false
+      drop:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS UTM default - Drop"
+        verified: false
+      blocked:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS UTM default - Blocked"
+        verified: false
+      block:
+        enforcement: "BLOCKED"
+        provenance: "FortiOS UTM default - Block"
+        verified: false
+      accept:
+        enforcement: "ALLOWED"
+        provenance: "FortiOS UTM default - Accept"
+        verified: false
+      pass:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS UTM default - Pass"
+        verified: false
+      detected:
+        enforcement: "ALLOWED_OR_DETECTED"
+        provenance: "FortiOS UTM default - Detected"
+        verified: false

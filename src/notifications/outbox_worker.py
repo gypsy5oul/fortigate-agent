@@ -1,10 +1,12 @@
 """Durable outbox dispatcher for Google Chat with rate-limiting and dry-run safety."""
 
+import re
 import asyncio
 import logging
 from typing import Optional
 import httpx
 from src.storage.repository import Repository
+from src.observability.metrics import OUTBOX_DELIVERED_TOTAL, OUTBOX_FAILURES_TOTAL
 
 logger = logging.getLogger(__name__)
 
@@ -56,15 +58,20 @@ class OutboxWorker:
                 resp.raise_for_status()
                 await self.repo.mark_notification_sent(outbox_id)
                 logger.info("Successfully delivered Google Chat alert for Incident %s (Rev %s)", incident_id, rev)
+                OUTBOX_DELIVERED_TOTAL.inc()
                 dispatched += 1
             except httpx.HTTPStatusError as e:
-                err_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+                body_clean = re.sub(r'https?://\S+', '[URL_REDACTED]', e.response.text)[:200]
+                err_msg = f"HTTP {e.response.status_code}: {body_clean}"
                 logger.error("Failed to send Google Chat message for Incident %s: %s", incident_id, err_msg)
                 await self.repo.mark_notification_failed(outbox_id, err_msg)
+                OUTBOX_FAILURES_TOTAL.inc()
             except Exception as e:
-                err_msg = str(e)
+                err_clean = re.sub(r'https?://\S+', '[URL_REDACTED]', str(e))[:200]
+                err_msg = f"Network error: {err_clean}"
                 logger.error("Network error sending Google Chat message for Incident %s: %s", incident_id, err_msg)
                 await self.repo.mark_notification_failed(outbox_id, err_msg)
+                OUTBOX_FAILURES_TOTAL.inc()
 
             # Honor per-space rate limiter
             await asyncio.sleep(self.delay)

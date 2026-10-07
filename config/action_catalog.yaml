@@ -6,6 +6,7 @@ actions:
     description: "Temporarily ban malicious source IP using FortiOS banned-ip diagnostic table."
     risk_level: "MEDIUM"
     requires_approval: true
+    verified_build: null
     cli_template: "diagnose user banned-ip add src4 {source_ip} {expiry_seconds} \"Automated SOC Quarantine Incident {incident_id}\""
     rollback_template: "diagnose user banned-ip delete src4 {source_ip}"
     default_expiry_seconds: 3600
@@ -16,6 +17,7 @@ actions:
     description: "Add malicious IP to FortiOS address group referenced in perimeter deny policy."
     risk_level: "HIGH"
     requires_approval: true
+    verified_build: null
     cli_template: |
       config firewall address
           edit "AUTO_BLOCK_{sanitized_ip}"

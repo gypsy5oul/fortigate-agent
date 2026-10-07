@@ -90,17 +90,24 @@ class ADKInvestigationWorkflow:
         assessment.incident_id = packet.incident_id
         assessment.incident_revision = packet.incident_revision
 
+        # 0. Enforcement is ALWAYS deterministic from packet
+        assessment.model_reported_enforcement = assessment.enforcement
+        assessment.enforcement = packet.enforcement
+        assessment.assessment_source = "MODEL_VALIDATED"
+
         # 1. Enforce deterministic severity floor
         floor_rank = SEVERITY_RANKS.get(packet.deterministic_severity_floor, 1)
         model_rank = SEVERITY_RANKS.get(assessment.severity, 1)
         effective_rank = max(floor_rank, model_rank)
         assessment.severity = RANK_TO_SEVERITY.get(effective_rank, packet.deterministic_severity_floor)
 
-        # 2. Strict allowlist check on recommended action IDs
+        # 2. Strict allowlist check on recommended action IDs (quarantine removed automatically if not valid)
         assessment.recommended_action_ids = [
             act_id for act_id in assessment.recommended_action_ids
-            if act_id in self.valid_action_ids
+            if act_id in self.valid_action_ids and act_id != "ACT_QUARANTINE_SRC_IP"
         ]
+        if not assessment.recommended_action_ids:
+            assessment.recommended_action_ids = ["ACT_INSPECT_APPLICATION_LOGS"]
 
         # 3. Grounded CVE validation: strip hallucinated CVEs not grounded in packet evidence
         import re
@@ -142,9 +149,15 @@ class ADKInvestigationWorkflow:
             evidence_ids=evidence_ids or ["FALLBACK"],
         )
 
-        actions = ["ACT_INSPECT_APPLICATION_LOGS"]
-        if packet.deterministic_severity_floor in ("CRITICAL", "HIGH"):
-            actions.append("ACT_QUARANTINE_SRC_IP")
+        actions = ["ACT_INSPECT_APPLICATION_LOGS"] if packet.deterministic_severity_floor in ("CRITICAL", "HIGH") else ["ACT_MONITOR_AND_DIGEST"]
+
+        err_lower = error_reason.lower()
+        if "timeout" in err_lower:
+            reason_code = "MODEL_TIMEOUT"
+        elif "json" in err_lower or "validation" in err_lower or "format" in err_lower:
+            reason_code = "MODEL_INVALID_OUTPUT"
+        else:
+            reason_code = "MODEL_UNREACHABLE"
 
         return QwenAssessment(
             incident_id=packet.incident_id,
@@ -154,9 +167,11 @@ class ADKInvestigationWorkflow:
             attack_category="EXPLOITATION_ATTEMPT" if packet.deterministic_severity_floor in ("CRITICAL", "HIGH") else "ANOMALOUS_TRAFFIC",
             exploitation_assessment="ATTEMPT_OBSERVED" if packet.enforcement in ("ALLOWED_OR_DETECTED", "MIXED") else "INSUFFICIENT_EVIDENCE",
             enforcement=packet.enforcement,
-            summary=f"Deterministic SOC evaluation triggered by rules: {', '.join(packet.deterministic_rule_ids)}. Local Qwen inference offline ({error_reason[:100]}).",
+            summary=f"Deterministic assessment only. Model analysis unavailable (reason code: {reason_code}).",
             findings=[default_finding],
             visibility_gaps=["Local LLM inference unavailable; evaluated using deterministic firewall rules."],
             recommended_action_ids=actions,
             analyst_follow_up=["Review backend web server access logs for anomalous response sizes or HTTP 200/500 codes."],
+            model_reported_enforcement=None,
+            assessment_source="MODEL_REJECTED_FALLBACK",
         )

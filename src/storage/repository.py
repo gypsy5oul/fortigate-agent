@@ -2,11 +2,25 @@
 
 import json
 import logging
+import hashlib
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from src.storage.database import Database
+from src.storage.timeutil import to_utc_datetime
+from src.observability.metrics import PARSER_ERRORS_TOTAL, MODEL_FAILURES_TOTAL
 
 logger = logging.getLogger(__name__)
+
+
+class RevisionConflict(Exception):
+    """Raised when an incident transition update fails due to revision mismatch."""
+    pass
+
+
+class StaleJobLeaseError(Exception):
+    """Raised when a job write attempts to commit with a stale version token or expired lease."""
+    pass
 
 
 class Repository:
@@ -22,12 +36,16 @@ class Repository:
         return None
 
     async def save_checkpoint(self, stream_name: str, ts_ns: int):
+        existing = await self.get_checkpoint(stream_name)
+        if existing is not None:
+            assert ts_ns >= existing, f"Checkpoint regression: existing {existing} > new {ts_ns}"
+
         if self.db.is_sqlite:
             query = """
             INSERT INTO query_checkpoints (stream_name, last_queried_ts_ns, updated_at)
             VALUES ($1, $2, CURRENT_TIMESTAMP)
             ON CONFLICT(stream_name) DO UPDATE SET
-                last_queried_ts_ns = excluded.last_queried_ts_ns,
+                last_queried_ts_ns = MAX(query_checkpoints.last_queried_ts_ns, excluded.last_queried_ts_ns),
                 updated_at = CURRENT_TIMESTAMP
             """
         else:
@@ -35,7 +53,7 @@ class Repository:
             INSERT INTO query_checkpoints (stream_name, last_queried_ts_ns, updated_at)
             VALUES ($1, $2, NOW())
             ON CONFLICT (stream_name) DO UPDATE SET
-                last_queried_ts_ns = EXCLUDED.last_queried_ts_ns,
+                last_queried_ts_ns = GREATEST(query_checkpoints.last_queried_ts_ns, EXCLUDED.last_queried_ts_ns),
                 updated_at = NOW()
             """
         await self.db.execute(query, stream_name, ts_ns)
@@ -48,9 +66,17 @@ class Repository:
         await self.db.execute(query, stream_name, start_ns, end_ns, reason)
         logger.warning("Recorded coverage gap on stream %s from %s to %s: %s", stream_name, start_ns, end_ns, reason)
 
+    async def get_coverage_gaps(self, stream_name: str) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM coverage_gaps WHERE stream_name = $1 ORDER BY start_ts_ns ASC"
+        return await self.db.fetch_all(query, stream_name)
+
     # --- Selected Events (Deduplicated with Accurate Counts) ---
     async def save_events(self, events: List[Dict[str, Any]]) -> int:
-        """Insert events idempotently and return the count of newly inserted rows."""
+        """Insert events idempotently and return the count of newly inserted rows.
+        
+        If a batch insert fails, retries row-by-row, logging failed rows to rejected_events,
+        incrementing PARSER_ERRORS_TOTAL, and allowing the checkpoint to advance.
+        """
         if not events:
             return 0
 
@@ -83,27 +109,52 @@ class Repository:
                 ev.get("severity_raw"),
                 ev["raw_message"],
                 ev.get("processing_status", "PENDING"),
+                ev.get("utmaction"),
+                bool(ev.get("signature_truncated", False)),
             )
             for ev in events
         ]
 
         if self.db.is_sqlite:
-            initial_changes = self.db._sqlite_conn.total_changes
+            inserted_count = 0
             query = """
             INSERT INTO selected_events (
                 id, loki_ts_ns, eventtime_ns, devid, vd, direction, srcintfrole, dstintfrole,
                 logid, log_type, subtype, action_raw, action_normalized, srcip, srcport,
                 dstip, dstport, proto, service, policyid, sessionid, signature, url,
-                http_method, severity_raw, raw_message, processing_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                http_method, severity_raw, raw_message, processing_status, utmaction, signature_truncated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (id) DO NOTHING
             """
             chunk_size = 500
             for i in range(0, len(rows), chunk_size):
                 chunk = rows[i : i + chunk_size]
-                await self.db._sqlite_conn.executemany(query, chunk)
-                await self.db._sqlite_conn.commit()
-            return self.db._sqlite_conn.total_changes - initial_changes
+                chunk_events = events[i : i + chunk_size]
+                try:
+                    ch_before = self.db._sqlite_conn.total_changes
+                    await self.db._sqlite_conn.executemany(query, chunk)
+                    await self.db._sqlite_conn.commit()
+                    inserted_count += (self.db._sqlite_conn.total_changes - ch_before)
+                except Exception as batch_err:
+                    await self.db._sqlite_conn.rollback()
+                    logger.warning("SQLite batch insert failed (%s), falling back to row-by-row insert", batch_err)
+                    for row_tuple, ev in zip(chunk, chunk_events):
+                        try:
+                            ch_before = self.db._sqlite_conn.total_changes
+                            await self.db._sqlite_conn.execute(query, row_tuple)
+                            await self.db._sqlite_conn.commit()
+                            inserted_count += (self.db._sqlite_conn.total_changes - ch_before)
+                        except Exception as row_err:
+                            await self.db._sqlite_conn.rollback()
+                            PARSER_ERRORS_TOTAL.inc()
+                            raw_sha256 = hashlib.sha256((ev.get("raw_message") or "").encode("utf-8")).hexdigest()
+                            logger.error("Row insert rejected for event %s: %s", ev.get("id"), row_err)
+                            await self.db._sqlite_conn.execute(
+                                "INSERT INTO rejected_events (id, reason, raw_sha256) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                                (ev.get("id", str(uuid.uuid4())), str(row_err)[:1000], raw_sha256),
+                            )
+                            await self.db._sqlite_conn.commit()
+            return inserted_count
 
         # PostgreSQL: multi-row insert with RETURNING id
         chunk_size = 200
@@ -111,11 +162,12 @@ class Repository:
         async with self.db._pg_pool.acquire() as conn:
             for i in range(0, len(rows), chunk_size):
                 chunk = rows[i : i + chunk_size]
+                chunk_events = events[i : i + chunk_size]
                 values_clauses = []
                 flat_args = []
                 for r_idx, row in enumerate(chunk):
-                    param_start = r_idx * 27 + 1
-                    placeholders = ", ".join(f"${param_start + k}" for k in range(27))
+                    param_start = r_idx * 29 + 1
+                    placeholders = ", ".join(f"${param_start + k}" for k in range(29))
                     values_clauses.append(f"({placeholders})")
                     flat_args.extend(row)
 
@@ -124,13 +176,40 @@ class Repository:
                     id, loki_ts_ns, eventtime_ns, devid, vd, direction, srcintfrole, dstintfrole,
                     logid, log_type, subtype, action_raw, action_normalized, srcip, srcport,
                     dstip, dstport, proto, service, policyid, sessionid, signature, url,
-                    http_method, severity_raw, raw_message, processing_status
+                    http_method, severity_raw, raw_message, processing_status, utmaction, signature_truncated
                 ) VALUES {', '.join(values_clauses)}
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id;
                 """
-                inserted_rows = await conn.fetch(insert_sql, *flat_args)
-                total_inserted += len(inserted_rows)
+                try:
+                    inserted_rows = await conn.fetch(insert_sql, *flat_args)
+                    total_inserted += len(inserted_rows)
+                except Exception as batch_err:
+                    logger.warning("Postgres batch insert failed (%s), falling back to row-by-row insert", batch_err)
+                    single_sql = f"""
+                    INSERT INTO selected_events (
+                        id, loki_ts_ns, eventtime_ns, devid, vd, direction, srcintfrole, dstintfrole,
+                        logid, log_type, subtype, action_raw, action_normalized, srcip, srcport,
+                        dstip, dstport, proto, service, policyid, sessionid, signature, url,
+                        http_method, severity_raw, raw_message, processing_status, utmaction, signature_truncated
+                    ) VALUES ({', '.join(f'${k+1}' for k in range(29))})
+                    ON CONFLICT (id) DO NOTHING
+                    RETURNING id;
+                    """
+                    for row_tuple, ev in zip(chunk, chunk_events):
+                        try:
+                            res = await conn.fetch(single_sql, *row_tuple)
+                            total_inserted += len(res)
+                        except Exception as row_err:
+                            PARSER_ERRORS_TOTAL.inc()
+                            raw_sha256 = hashlib.sha256((ev.get("raw_message") or "").encode("utf-8")).hexdigest()
+                            logger.error("Row insert rejected for event %s: %s", ev.get("id"), row_err)
+                            await conn.execute(
+                                "INSERT INTO rejected_events (id, reason, raw_sha256) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+                                ev.get("id", str(uuid.uuid4())),
+                                str(row_err)[:1000],
+                                raw_sha256,
+                            )
         return total_inserted
 
     async def fetch_pending_events(self, limit: int = 100) -> List[Dict[str, Any]]:
@@ -161,17 +240,32 @@ class Repository:
     # --- Incidents & Revisions ---
     async def get_incident(self, incident_id: str) -> Optional[Dict[str, Any]]:
         query = "SELECT * FROM incidents WHERE id = $1"
-        return await self.db.fetch_one(query, incident_id)
+        row = await self.db.fetch_one(query, incident_id)
+        if row and self.db.is_sqlite and isinstance(row.get("deterministic_rule_ids"), str):
+            try:
+                row["deterministic_rule_ids"] = json.loads(row["deterministic_rule_ids"])
+            except Exception:
+                row["deterministic_rule_ids"] = []
+        return row
 
     async def upsert_incident(self, incident: Dict[str, Any]):
+        first_seen_dt = to_utc_datetime(incident["first_seen"])
+        last_seen_dt = to_utc_datetime(incident["last_seen"])
+        last_urgent_at_dt = to_utc_datetime(incident.get("last_urgent_at"))
+        rule_ids = incident.get("deterministic_rule_ids", [])
+        if isinstance(rule_ids, set):
+            rule_ids = list(rule_ids)
+
         if self.db.is_sqlite:
             query = """
             INSERT INTO incidents (
                 id, current_revision, status, severity, enforcement,
                 exploitation_assessment, vd, direction, source_ip, target_ip,
                 target_port, target_service, target_app,
-                first_seen, last_seen, event_count, summary, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, CURRENT_TIMESTAMP)
+                first_seen, last_seen, event_count, summary,
+                deterministic_severity, deterministic_enforcement, deterministic_rule_ids,
+                last_urgent_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, CURRENT_TIMESTAMP)
             ON CONFLICT(id) DO UPDATE SET
                 current_revision = excluded.current_revision,
                 status = excluded.status,
@@ -183,151 +277,14 @@ class Repository:
                 last_seen = excluded.last_seen,
                 event_count = excluded.event_count,
                 summary = excluded.summary,
+                deterministic_severity = excluded.deterministic_severity,
+                deterministic_enforcement = excluded.deterministic_enforcement,
+                deterministic_rule_ids = excluded.deterministic_rule_ids,
+                last_urgent_at = excluded.last_urgent_at,
                 updated_at = CURRENT_TIMESTAMP
             """
-        else:
-            query = """
-            INSERT INTO incidents (
-                id, current_revision, status, severity, enforcement,
-                exploitation_assessment, vd, direction, source_ip, target_ip,
-                target_port, target_service, target_app,
-                first_seen, last_seen, event_count, summary, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
-            ON CONFLICT (id) DO UPDATE SET
-                current_revision = EXCLUDED.current_revision,
-                status = EXCLUDED.status,
-                severity = EXCLUDED.severity,
-                enforcement = EXCLUDED.enforcement,
-                exploitation_assessment = EXCLUDED.exploitation_assessment,
-                target_port = EXCLUDED.target_port,
-                target_service = EXCLUDED.target_service,
-                last_seen = EXCLUDED.last_seen,
-                event_count = EXCLUDED.event_count,
-                summary = EXCLUDED.summary,
-                updated_at = NOW()
-            """
-        await self.db.execute(
-            query,
-            incident["id"],
-            incident.get("current_revision", 1),
-            incident.get("status", "ACTIVE"),
-            incident["severity"],
-            incident["enforcement"],
-            incident.get("exploitation_assessment", "INSUFFICIENT_EVIDENCE"),
-            incident.get("vd", "root"),
-            incident.get("direction", "INBOUND"),
-            incident["source_ip"],
-            incident["target_ip"],
-            incident.get("target_port"),
-            incident.get("target_service"),
-            incident.get("target_app"),
-            incident["first_seen"],
-            incident["last_seen"],
-            incident.get("event_count", 1),
-            incident.get("summary"),
-        )
-
-    async def add_incident_revision(self, revision: Dict[str, Any]):
-        rule_ids = revision.get("rule_ids", [])
-        evidence_ids = revision.get("evidence_ids", [])
-        assessment_json = json.dumps(revision.get("assessment_json", {}), default=str)
-
-        if self.db.is_sqlite:
-            query = """
-            INSERT INTO incident_revisions (
-                incident_id, revision, rule_ids, severity, enforcement,
-                assessment_json, model_name, reasoning_summary, evidence_ids
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            ON CONFLICT(incident_id, revision) DO NOTHING
-            """
             await self.db.execute(
                 query,
-                revision["incident_id"],
-                revision["revision"],
-                json.dumps(rule_ids),
-                revision["severity"],
-                revision["enforcement"],
-                assessment_json,
-                revision.get("model_name"),
-                revision.get("reasoning_summary"),
-                json.dumps(evidence_ids),
-            )
-        else:
-            query = """
-            INSERT INTO incident_revisions (
-                incident_id, revision, rule_ids, severity, enforcement,
-                assessment_json, model_name, reasoning_summary, evidence_ids
-            ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
-            ON CONFLICT (incident_id, revision) DO NOTHING
-            """
-            await self.db.execute(
-                query,
-                revision["incident_id"],
-                revision["revision"],
-                rule_ids,
-                revision["severity"],
-                revision["enforcement"],
-                assessment_json,
-                revision.get("model_name"),
-                revision.get("reasoning_summary"),
-                evidence_ids,
-            )
-
-    async def record_incident_transition(
-        self,
-        incident: Dict[str, Any],
-        revision: Optional[Dict[str, Any]] = None,
-        notification: Optional[Dict[str, Any]] = None,
-        job: Optional[Dict[str, Any]] = None,
-        processed_event_ids: Optional[List[str]] = None,
-    ) -> None:
-        """Atomic transaction updating incident, revision, outbox, job queue, and acknowledging processed events."""
-        async with self.db.transaction() as tx:
-            # 1. Upsert incident
-            if self.db.is_sqlite:
-                inc_query = """
-                INSERT INTO incidents (
-                    id, current_revision, status, severity, enforcement,
-                    exploitation_assessment, vd, direction, source_ip, target_ip,
-                    target_port, target_service, target_app,
-                    first_seen, last_seen, event_count, summary, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, CURRENT_TIMESTAMP)
-                ON CONFLICT(id) DO UPDATE SET
-                    current_revision = excluded.current_revision,
-                    status = excluded.status,
-                    severity = excluded.severity,
-                    enforcement = excluded.enforcement,
-                    exploitation_assessment = excluded.exploitation_assessment,
-                    target_port = excluded.target_port,
-                    target_service = excluded.target_service,
-                    last_seen = excluded.last_seen,
-                    event_count = excluded.event_count,
-                    summary = excluded.summary,
-                    updated_at = CURRENT_TIMESTAMP
-                """
-            else:
-                inc_query = """
-                INSERT INTO incidents (
-                    id, current_revision, status, severity, enforcement,
-                    exploitation_assessment, vd, direction, source_ip, target_ip,
-                    target_port, target_service, target_app,
-                    first_seen, last_seen, event_count, summary, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
-                ON CONFLICT (id) DO UPDATE SET
-                    current_revision = EXCLUDED.current_revision,
-                    status = EXCLUDED.status,
-                    severity = EXCLUDED.severity,
-                    enforcement = EXCLUDED.enforcement,
-                    exploitation_assessment = EXCLUDED.exploitation_assessment,
-                    target_port = EXCLUDED.target_port,
-                    target_service = EXCLUDED.target_service,
-                    last_seen = EXCLUDED.last_seen,
-                    event_count = EXCLUDED.event_count,
-                    summary = EXCLUDED.summary,
-                    updated_at = NOW()
-                """
-            await tx.execute(
-                inc_query,
                 incident["id"],
                 incident.get("current_revision", 1),
                 incident.get("status", "ACTIVE"),
@@ -341,59 +298,371 @@ class Repository:
                 incident.get("target_port"),
                 incident.get("target_service"),
                 incident.get("target_app"),
-                incident["first_seen"],
-                incident["last_seen"],
+                first_seen_dt.strftime("%Y-%m-%d %H:%M:%S") if first_seen_dt else None,
+                last_seen_dt.strftime("%Y-%m-%d %H:%M:%S") if last_seen_dt else None,
                 incident.get("event_count", 1),
                 incident.get("summary"),
+                incident.get("deterministic_severity", incident["severity"]),
+                incident.get("deterministic_enforcement", incident["enforcement"]),
+                json.dumps(rule_ids),
+                last_urgent_at_dt.strftime("%Y-%m-%d %H:%M:%S") if last_urgent_at_dt else None,
+            )
+        else:
+            query = """
+            INSERT INTO incidents (
+                id, current_revision, status, severity, enforcement,
+                exploitation_assessment, vd, direction, source_ip, target_ip,
+                target_port, target_service, target_app,
+                first_seen, last_seen, event_count, summary,
+                deterministic_severity, deterministic_enforcement, deterministic_rule_ids,
+                last_urgent_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                current_revision = EXCLUDED.current_revision,
+                status = EXCLUDED.status,
+                severity = EXCLUDED.severity,
+                enforcement = EXCLUDED.enforcement,
+                exploitation_assessment = EXCLUDED.exploitation_assessment,
+                target_port = EXCLUDED.target_port,
+                target_service = EXCLUDED.target_service,
+                last_seen = EXCLUDED.last_seen,
+                event_count = EXCLUDED.event_count,
+                summary = EXCLUDED.summary,
+                deterministic_severity = EXCLUDED.deterministic_severity,
+                deterministic_enforcement = EXCLUDED.deterministic_enforcement,
+                deterministic_rule_ids = EXCLUDED.deterministic_rule_ids,
+                last_urgent_at = EXCLUDED.last_urgent_at,
+                updated_at = NOW()
+            """
+            await self.db.execute(
+                query,
+                incident["id"],
+                incident.get("current_revision", 1),
+                incident.get("status", "ACTIVE"),
+                incident["severity"],
+                incident["enforcement"],
+                incident.get("exploitation_assessment", "INSUFFICIENT_EVIDENCE"),
+                incident.get("vd", "root"),
+                incident.get("direction", "INBOUND"),
+                incident["source_ip"],
+                incident["target_ip"],
+                incident.get("target_port"),
+                incident.get("target_service"),
+                incident.get("target_app"),
+                first_seen_dt,
+                last_seen_dt,
+                incident.get("event_count", 1),
+                incident.get("summary"),
+                incident.get("deterministic_severity", incident["severity"]),
+                incident.get("deterministic_enforcement", incident["enforcement"]),
+                rule_ids,
+                last_urgent_at_dt,
             )
 
-            # 2. Add revision if provided
+    async def add_incident_revision(self, revision: Dict[str, Any]):
+        rule_ids = revision.get("rule_ids", [])
+        if isinstance(rule_ids, set):
+            rule_ids = list(rule_ids)
+        evidence_ids = revision.get("evidence_ids", [])
+        assessment_json = json.dumps(revision.get("assessment_json", {}), default=str)
+        assessment_source = revision.get("assessment_source", "DETERMINISTIC")
+
+        if self.db.is_sqlite:
+            query = """
+            INSERT INTO incident_revisions (
+                incident_id, revision, rule_ids, severity, enforcement,
+                assessment_json, model_name, reasoning_summary, evidence_ids, assessment_source
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT(incident_id, revision) DO NOTHING
+            """
+            await self.db.execute(
+                query,
+                revision["incident_id"],
+                revision["revision"],
+                json.dumps(rule_ids),
+                revision["severity"],
+                revision["enforcement"],
+                assessment_json,
+                revision.get("model_name"),
+                revision.get("reasoning_summary"),
+                json.dumps(evidence_ids),
+                assessment_source,
+            )
+        else:
+            query = """
+            INSERT INTO incident_revisions (
+                incident_id, revision, rule_ids, severity, enforcement,
+                assessment_json, model_name, reasoning_summary, evidence_ids, assessment_source
+            ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)
+            ON CONFLICT (incident_id, revision) DO NOTHING
+            """
+            await self.db.execute(
+                query,
+                revision["incident_id"],
+                revision["revision"],
+                rule_ids,
+                revision["severity"],
+                revision["enforcement"],
+                assessment_json,
+                revision.get("model_name"),
+                revision.get("reasoning_summary"),
+                evidence_ids,
+                assessment_source,
+            )
+
+    async def record_incident_transition(
+        self,
+        incident: Dict[str, Any],
+        revision: Optional[Dict[str, Any]] = None,
+        notification: Optional[Dict[str, Any]] = None,
+        job: Optional[Dict[str, Any]] = None,
+        processed_event_ids: Optional[List[str]] = None,
+        expected_revision: Optional[int] = None,
+        fence_job_id: Optional[str] = None,
+        fence_version_token: Optional[int] = None,
+    ) -> int:
+        """Atomic transaction updating incident, revision, outbox, job queue, and acknowledging processed events.
+        
+        Enforces optimistic revision concurrency and job leasing fences.
+        Revision number is allocated inside transaction from freshly read current_revision.
+        """
+        async with self.db.transaction() as tx:
+            # 1. Fence check if completing a leased job
+            if fence_job_id is not None and fence_version_token is not None:
+                if self.db.is_sqlite:
+                    cursor = await tx.execute(
+                        "UPDATE jobs SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND version_token = $2",
+                        fence_job_id, fence_version_token,
+                    )
+                    if cursor.rowcount == 0:
+                        raise StaleJobLeaseError(f"Job {fence_job_id} lease stale (token {fence_version_token})")
+                else:
+                    res = await tx.fetch(
+                        "UPDATE jobs SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1 AND version_token = $2 RETURNING id",
+                        fence_job_id, fence_version_token,
+                    )
+                    if not res:
+                        raise StaleJobLeaseError(f"Job {fence_job_id} lease stale (token {fence_version_token})")
+
+            # 2. Fetch existing incident row to verify revision and allocate next revision
+            if self.db.is_sqlite:
+                existing = await tx.fetch_one("SELECT * FROM incidents WHERE id = $1", incident["id"])
+            else:
+                existing = await tx.fetch_one("SELECT * FROM incidents WHERE id = $1 FOR UPDATE", incident["id"])
+
+            if existing:
+                current_rev = existing["current_revision"]
+                if expected_revision is not None and current_rev != expected_revision:
+                    raise RevisionConflict(
+                        f"Incident {incident['id']} current revision is {current_rev}, expected {expected_revision}"
+                    )
+                new_rev = current_rev + 1
+            else:
+                if expected_revision is not None and expected_revision > 0:
+                    raise RevisionConflict(
+                        f"Incident {incident['id']} does not exist, but expected_revision was {expected_revision}"
+                    )
+                new_rev = 1
+
+            first_seen_dt = to_utc_datetime(incident["first_seen"])
+            last_seen_dt = to_utc_datetime(incident["last_seen"])
+            last_urgent_at_dt = to_utc_datetime(incident.get("last_urgent_at"))
+            rule_ids = incident.get("deterministic_rule_ids", [])
+            if isinstance(rule_ids, set):
+                rule_ids = list(rule_ids)
+
+            # 3. Update or Insert Incident row
+            if self.db.is_sqlite:
+                if existing:
+                    upd_query = """
+                    UPDATE incidents SET
+                        current_revision = $1, status = $2, severity = $3, enforcement = $4,
+                        exploitation_assessment = $5, target_port = $6, target_service = $7,
+                        last_seen = $8, event_count = $9, summary = $10,
+                        deterministic_severity = $11, deterministic_enforcement = $12,
+                        deterministic_rule_ids = $13, last_urgent_at = $14,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $15 AND current_revision = $16
+                    """
+                    cursor = await tx.execute(
+                        upd_query,
+                        new_rev,
+                        incident.get("status", "ACTIVE"),
+                        incident["severity"],
+                        incident["enforcement"],
+                        incident.get("exploitation_assessment", "INSUFFICIENT_EVIDENCE"),
+                        incident.get("target_port"),
+                        incident.get("target_service"),
+                        last_seen_dt.strftime("%Y-%m-%d %H:%M:%S") if last_seen_dt else None,
+                        incident.get("event_count", 1),
+                        incident.get("summary"),
+                        incident.get("deterministic_severity", incident["severity"]),
+                        incident.get("deterministic_enforcement", incident["enforcement"]),
+                        json.dumps(rule_ids),
+                        last_urgent_at_dt.strftime("%Y-%m-%d %H:%M:%S") if last_urgent_at_dt else None,
+                        incident["id"],
+                        current_rev,
+                    )
+                    if cursor.rowcount == 0:
+                        raise RevisionConflict(f"Concurrent update conflict on incident {incident['id']}")
+                else:
+                    ins_query = """
+                    INSERT INTO incidents (
+                        id, current_revision, status, severity, enforcement,
+                        exploitation_assessment, vd, direction, source_ip, target_ip,
+                        target_port, target_service, target_app,
+                        first_seen, last_seen, event_count, summary,
+                        deterministic_severity, deterministic_enforcement, deterministic_rule_ids,
+                        last_urgent_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, CURRENT_TIMESTAMP)
+                    """
+                    await tx.execute(
+                        ins_query,
+                        incident["id"],
+                        new_rev,
+                        incident.get("status", "ACTIVE"),
+                        incident["severity"],
+                        incident["enforcement"],
+                        incident.get("exploitation_assessment", "INSUFFICIENT_EVIDENCE"),
+                        incident.get("vd", "root"),
+                        incident.get("direction", "INBOUND"),
+                        incident["source_ip"],
+                        incident["target_ip"],
+                        incident.get("target_port"),
+                        incident.get("target_service"),
+                        incident.get("target_app"),
+                        first_seen_dt.strftime("%Y-%m-%d %H:%M:%S") if first_seen_dt else None,
+                        last_seen_dt.strftime("%Y-%m-%d %H:%M:%S") if last_seen_dt else None,
+                        incident.get("event_count", 1),
+                        incident.get("summary"),
+                        incident.get("deterministic_severity", incident["severity"]),
+                        incident.get("deterministic_enforcement", incident["enforcement"]),
+                        json.dumps(rule_ids),
+                        last_urgent_at_dt.strftime("%Y-%m-%d %H:%M:%S") if last_urgent_at_dt else None,
+                    )
+            else:
+                if existing:
+                    upd_query = """
+                    UPDATE incidents SET
+                        current_revision = $1, status = $2, severity = $3, enforcement = $4,
+                        exploitation_assessment = $5, target_port = $6, target_service = $7,
+                        last_seen = $8, event_count = $9, summary = $10,
+                        deterministic_severity = $11, deterministic_enforcement = $12,
+                        deterministic_rule_ids = $13, last_urgent_at = $14,
+                        updated_at = NOW()
+                    WHERE id = $15 AND current_revision = $16
+                    RETURNING id;
+                    """
+                    res = await tx.fetch(
+                        upd_query,
+                        new_rev,
+                        incident.get("status", "ACTIVE"),
+                        incident["severity"],
+                        incident["enforcement"],
+                        incident.get("exploitation_assessment", "INSUFFICIENT_EVIDENCE"),
+                        incident.get("target_port"),
+                        incident.get("target_service"),
+                        last_seen_dt,
+                        incident.get("event_count", 1),
+                        incident.get("summary"),
+                        incident.get("deterministic_severity", incident["severity"]),
+                        incident.get("deterministic_enforcement", incident["enforcement"]),
+                        rule_ids,
+                        last_urgent_at_dt,
+                        incident["id"],
+                        current_rev,
+                    )
+                    if not res:
+                        raise RevisionConflict(f"Concurrent update conflict on incident {incident['id']}")
+                else:
+                    ins_query = """
+                    INSERT INTO incidents (
+                        id, current_revision, status, severity, enforcement,
+                        exploitation_assessment, vd, direction, source_ip, target_ip,
+                        target_port, target_service, target_app,
+                        first_seen, last_seen, event_count, summary,
+                        deterministic_severity, deterministic_enforcement, deterministic_rule_ids,
+                        last_urgent_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, NOW())
+                    """
+                    await tx.execute(
+                        ins_query,
+                        incident["id"],
+                        new_rev,
+                        incident.get("status", "ACTIVE"),
+                        incident["severity"],
+                        incident["enforcement"],
+                        incident.get("exploitation_assessment", "INSUFFICIENT_EVIDENCE"),
+                        incident.get("vd", "root"),
+                        incident.get("direction", "INBOUND"),
+                        incident["source_ip"],
+                        incident["target_ip"],
+                        incident.get("target_port"),
+                        incident.get("target_service"),
+                        incident.get("target_app"),
+                        first_seen_dt,
+                        last_seen_dt,
+                        incident.get("event_count", 1),
+                        incident.get("summary"),
+                        incident.get("deterministic_severity", incident["severity"]),
+                        incident.get("deterministic_enforcement", incident["enforcement"]),
+                        rule_ids,
+                        last_urgent_at_dt,
+                    )
+
+            # 4. Add revision if provided
             if revision:
-                rule_ids = revision.get("rule_ids", [])
-                evidence_ids = revision.get("evidence_ids", [])
+                rev_rule_ids = revision.get("rule_ids", [])
+                if isinstance(rev_rule_ids, set):
+                    rev_rule_ids = list(rev_rule_ids)
+                rev_evidence_ids = revision.get("evidence_ids", [])
                 assessment_json = json.dumps(revision.get("assessment_json", {}), default=str)
+                assessment_src = revision.get("assessment_source", "DETERMINISTIC")
+
                 if self.db.is_sqlite:
                     rev_query = """
                     INSERT INTO incident_revisions (
                         incident_id, revision, rule_ids, severity, enforcement,
-                        assessment_json, model_name, reasoning_summary, evidence_ids
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        assessment_json, model_name, reasoning_summary, evidence_ids, assessment_source
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     ON CONFLICT(incident_id, revision) DO NOTHING
                     """
                     await tx.execute(
                         rev_query,
-                        revision["incident_id"],
-                        revision["revision"],
-                        json.dumps(rule_ids),
+                        incident["id"],
+                        new_rev,
+                        json.dumps(rev_rule_ids),
                         revision["severity"],
                         revision["enforcement"],
                         assessment_json,
                         revision.get("model_name"),
                         revision.get("reasoning_summary"),
-                        json.dumps(evidence_ids),
+                        json.dumps(rev_evidence_ids),
+                        assessment_src,
                     )
                 else:
                     rev_query = """
                     INSERT INTO incident_revisions (
                         incident_id, revision, rule_ids, severity, enforcement,
-                        assessment_json, model_name, reasoning_summary, evidence_ids
-                    ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+                        assessment_json, model_name, reasoning_summary, evidence_ids, assessment_source
+                    ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)
                     ON CONFLICT (incident_id, revision) DO NOTHING
                     """
                     await tx.execute(
                         rev_query,
-                        revision["incident_id"],
-                        revision["revision"],
-                        rule_ids,
+                        incident["id"],
+                        new_rev,
+                        rev_rule_ids,
                         revision["severity"],
                         revision["enforcement"],
                         assessment_json,
                         revision.get("model_name"),
                         revision.get("reasoning_summary"),
-                        evidence_ids,
+                        rev_evidence_ids,
+                        assessment_src,
                     )
 
-            # 3. Enqueue notification if provided
+            # 5. Enqueue notification if provided
             if notification:
                 n_payload = json.dumps(notification["payload"], default=str)
                 if self.db.is_sqlite:
@@ -410,15 +679,18 @@ class Repository:
                     """
                 await tx.execute(
                     notif_query,
-                    notification["incident_id"],
-                    notification["revision"],
+                    incident["id"],
+                    new_rev,
                     notification["notification_type"],
                     n_payload,
                 )
 
-            # 4. Enqueue job if provided
+            # 6. Enqueue job if provided
             if job:
-                j_payload = json.dumps(job["payload"], default=str)
+                j_payload = dict(job.get("payload", {}))
+                j_payload["revision"] = new_rev
+                j_payload_str = json.dumps(j_payload, default=str)
+                job_id = f"JOB-{incident['id']}-{new_rev}"
                 if self.db.is_sqlite:
                     job_query = """
                     INSERT INTO jobs (id, job_type, payload_json, priority, status, next_run_at)
@@ -437,9 +709,9 @@ class Repository:
                         status = CASE WHEN jobs.status IN ('COMPLETED', 'LEASED') THEN jobs.status ELSE 'PENDING' END,
                         updated_at = NOW()
                     """
-                await tx.execute(job_query, job["id"], job["job_type"], j_payload, job.get("priority", 10))
+                await tx.execute(job_query, job_id, job["job_type"], j_payload_str, job.get("priority", 10))
 
-            # 5. Acknowledge processed events
+            # 7. Acknowledge processed events
             if processed_event_ids:
                 if self.db.is_sqlite:
                     for eid in processed_event_ids:
@@ -452,6 +724,8 @@ class Repository:
                         "UPDATE selected_events SET processing_status = 'PROCESSED', processed_at = NOW() WHERE id = ANY($1::varchar[])",
                         processed_event_ids,
                     )
+
+            return new_rev
 
     # --- Leased Job Queue (Atomic & Fenced) ---
     async def enqueue_job(self, job_id: str, job_type: str, payload: Dict[str, Any], priority: int = 10):
@@ -482,8 +756,9 @@ class Repository:
             query = """
             WITH candidate AS (
                 SELECT id, version_token FROM jobs
-                WHERE (status = 'PENDING' AND next_run_at <= NOW())
-                   OR (status = 'LEASED' AND lease_expires_at < NOW())
+                WHERE ((status = 'PENDING' AND next_run_at <= NOW())
+                   OR (status = 'LEASED' AND lease_expires_at < NOW()))
+                  AND attempts < max_attempts
                 ORDER BY priority DESC, next_run_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -516,8 +791,9 @@ class Repository:
         async with self.db.transaction() as tx:
             select_query = """
             SELECT id, version_token FROM jobs
-            WHERE (status = 'PENDING' AND next_run_at <= CURRENT_TIMESTAMP)
-               OR (status = 'LEASED' AND lease_expires_at < CURRENT_TIMESTAMP)
+            WHERE ((status = 'PENDING' AND next_run_at <= CURRENT_TIMESTAMP)
+               OR (status = 'LEASED' AND lease_expires_at < CURRENT_TIMESTAMP))
+              AND attempts < max_attempts
             ORDER BY priority DESC, next_run_at ASC
             LIMIT 1
             """
@@ -555,22 +831,83 @@ class Repository:
         await self.db.execute(query, job_id, version_token)
 
     async def fail_job(self, job_id: str, version_token: int, error_msg: str):
-        if self.db.is_sqlite:
-            query = """
-            UPDATE jobs
-            SET status = CASE WHEN attempts >= max_attempts THEN 'FAILED' ELSE 'PENDING' END,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $1 AND version_token = $2
-            """
+        job = await self.db.fetch_one("SELECT * FROM jobs WHERE id = $1", job_id)
+        if not job:
+            return
+        attempts = job["attempts"]
+        max_attempts = job.get("max_attempts", 3)
+
+        if attempts >= max_attempts:
+            if self.db.is_sqlite:
+                await self.db.execute(
+                    "UPDATE jobs SET status = 'FAILED', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND version_token = $2",
+                    job_id, version_token,
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE jobs SET status = 'FAILED', updated_at = NOW() WHERE id = $1 AND version_token = $2",
+                    job_id, version_token,
+                )
+            MODEL_FAILURES_TOTAL.inc()
+            logger.error("Job %s reached max_attempts (%s); marked FAILED: %s", job_id, max_attempts, error_msg)
+
+            # Persist MODEL_REJECTED_FALLBACK revision
+            payload = job.get("payload_json")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            if isinstance(payload, dict):
+                inc_id = payload.get("incident_id")
+                rule_eval = payload.get("rule_eval", {})
+                if inc_id:
+                    existing_inc = await self.get_incident(inc_id)
+                    cur_rev = existing_inc["current_revision"] if existing_inc else payload.get("revision", 1)
+                    fallback_rev_num = cur_rev + 1
+                    fallback_summary = "Deterministic assessment only. Model analysis unavailable (reason code: MODEL_UNREACHABLE)."
+                    fallback_rev = {
+                        "incident_id": inc_id,
+                        "revision": fallback_rev_num,
+                        "rule_ids": rule_eval.get("matched_rule_ids", []),
+                        "severity": rule_eval.get("severity_floor", "MEDIUM"),
+                        "enforcement": payload.get("episode", {}).get("enforcement", "UNKNOWN"),
+                        "assessment_json": {
+                            "severity": rule_eval.get("severity_floor", "MEDIUM"),
+                            "enforcement": payload.get("episode", {}).get("enforcement", "UNKNOWN"),
+                            "summary": fallback_summary,
+                            "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS"],
+                            "reason_code": "MODEL_UNREACHABLE",
+                        },
+                        "model_name": None,
+                        "reasoning_summary": fallback_summary,
+                        "evidence_ids": [],
+                        "assessment_source": "MODEL_REJECTED_FALLBACK",
+                    }
+                    try:
+                        await self.add_incident_revision(fallback_rev)
+                        if existing_inc:
+                            if self.db.is_sqlite:
+                                await self.db.execute("UPDATE incidents SET current_revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", fallback_rev_num, inc_id)
+                            else:
+                                await self.db.execute("UPDATE incidents SET current_revision = $1, updated_at = NOW() WHERE id = $2", fallback_rev_num, inc_id)
+                    except Exception as rev_err:
+                        logger.warning("Could not persist fallback revision for %s: %s", inc_id, rev_err)
         else:
-            query = """
-            UPDATE jobs
-            SET status = CASE WHEN attempts >= max_attempts THEN 'FAILED' ELSE 'PENDING' END,
-                updated_at = NOW()
-            WHERE id = $1 AND version_token = $2
-            """
-        await self.db.execute(query, job_id, version_token)
-        logger.error("Job %s failed: %s", job_id, error_msg)
+            delay_seconds = min((2 ** attempts) * 30, 900)
+            if self.db.is_sqlite:
+                now = datetime.now(timezone.utc)
+                next_run = (now + timedelta(seconds=delay_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+                await self.db.execute(
+                    "UPDATE jobs SET status = 'PENDING', next_run_at = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND version_token = $3",
+                    next_run, job_id, version_token,
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE jobs SET status = 'PENDING', next_run_at = NOW() + ($1 || ' seconds')::interval, updated_at = NOW() WHERE id = $2 AND version_token = $3",
+                    str(delay_seconds), job_id, version_token,
+                )
+            logger.warning("Job %s backoff scheduled in %ss (attempt %s/%s): %s", job_id, delay_seconds, attempts, max_attempts, error_msg)
 
     # --- Notification Outbox ---
     async def enqueue_notification(self, incident_id: str, revision: int, notif_type: str, payload: Dict[str, Any]):

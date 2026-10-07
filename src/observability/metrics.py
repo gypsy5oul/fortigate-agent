@@ -53,6 +53,15 @@ OUTBOX_FAILURES_TOTAL = Counter(
     "forti_outbox_failures_total",
     "Failures while dispatching alerts to Google Chat",
 )
+UNKNOWN_ACTIONS_TOTAL = Counter(
+    "forti_unknown_actions_total",
+    "Total unmapped log action values encountered",
+    ["type", "subtype"],
+)
+INVESTIGATIONS_RATE_LIMITED_TOTAL = Counter(
+    "forti_investigations_rate_limited_total",
+    "Total incident investigations suppressed by per-source or per-target rate limits",
+)
 
 
 def create_app(db=None) -> FastAPI:

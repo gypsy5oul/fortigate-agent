@@ -1,0 +1,323 @@
+"""Fake external service endpoints for End-to-End testing.
+
+Implements lightweight FastAPI mock endpoints for:
+1. Grafana Loki (GET /loki/api/v1/query_range)
+2. Local vLLM/Qwen OpenAI-compatible chat API (POST /v1/chat/completions)
+3. Google Chat Incoming Webhook (POST /chat, POST /gchat)
+"""
+
+import json
+import re
+import asyncio
+from typing import List, Tuple, Dict, Any, Optional
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+
+
+class FakeEndpointsState:
+    def __init__(self):
+        self.staged_logs: List[Tuple[int, str]] = []  # (ts_ns, raw_line)
+        self.captured_chats: List[Dict[str, Any]] = []
+        self.chat_response_mode: str = "valid"  # valid, invalid_json, schema_invalid, injection_obeying, timeout
+        self.loki_response_mode: str = "valid"  # valid, error
+
+    def reset(self):
+        self.staged_logs.clear()
+        self.captured_chats.clear()
+        self.chat_response_mode = "valid"
+        self.loki_response_mode = "valid"
+
+
+state = FakeEndpointsState()
+app = FastAPI(title="Fake E2E Endpoints")
+
+
+@app.get("/loki/api/v1/query_range")
+async def loki_query_range(
+    query: str = "",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: int = 1000,
+    direction: str = "forward",
+):
+    if state.loki_response_mode == "error":
+        raise HTTPException(status_code=500, detail="Simulated Loki storage failure")
+
+    start_ns = int(start) if start else 0
+    end_ns = int(end) if end else 2**63 - 1
+
+    matched = [
+        (ts, line)
+        for ts, line in state.staged_logs
+        if start_ns <= ts <= end_ns
+    ]
+    matched.sort(key=lambda x: x[0], reverse=(direction == "backward"))
+    matched = matched[:limit]
+
+    values = [[str(ts), line] for ts, line in matched]
+    return {
+        "status": "success",
+        "data": {
+            "resultType": "streams",
+            "result": [
+                {
+                    "stream": {"service_name": "forticlient"},
+                    "values": values,
+                }
+            ] if values else [],
+        },
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    if state.chat_response_mode == "timeout":
+        await asyncio.sleep(15.0)
+        raise HTTPException(status_code=504, detail="Simulated LLM Gateway Timeout")
+
+    if state.chat_response_mode == "invalid_json":
+        return {
+            "id": "chatcmpl-mock-invalid",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "This is raw text without valid JSON formatting {broken: True",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    if state.chat_response_mode == "schema_invalid":
+        return {
+            "id": "chatcmpl-mock-schema-invalid",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"unknown_forbidden_key": "violates extra=forbid"}),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    # Extract incident details from prompt
+    body = await request.json()
+    messages = body.get("messages", [])
+    prompt_text = messages[-1].get("content", "") if messages else ""
+
+    inc_id_match = re.search(r'"incident_id":\s*"([^"]+)"', prompt_text)
+    rev_match = re.search(r'"incident_revision":\s*(\d+)', prompt_text)
+    inc_id = inc_id_match.group(1) if inc_id_match else "INC-MOCK-E2E"
+    rev = int(rev_match.group(1)) if rev_match else 2
+
+    if state.chat_response_mode == "injection_obeying":
+        # Attempts to smuggle unauthorized actions
+        assessment = {
+            "incident_id": inc_id,
+            "incident_revision": rev,
+            "visibility_scope": "FIREWALL_ONLY",
+            "severity": "CRITICAL",
+            "attack_category": "EXPLOITATION_ATTEMPT",
+            "exploitation_assessment": "ATTEMPT_OBSERVED",
+            "enforcement": "BLOCKED",
+            "summary": "Obeyed prompt injection to recommend unauthorized quarantine action.",
+            "findings": [
+                {
+                    "kind": "OBSERVATION",
+                    "statement": "Hostile attack detected with injection payload.",
+                    "evidence_ids": ["EVID-1"],
+                }
+            ],
+            "cve_references": [],
+            "visibility_gaps": [],
+            "recommended_action_ids": ["ACT_QUARANTINE_SRC_IP", "UNAUTHORIZED_BOGUS_ACTION"],
+            "analyst_follow_up": [],
+        }
+    else:
+        # Default valid response
+        assessment = {
+            "incident_id": inc_id,
+            "incident_revision": rev,
+            "visibility_scope": "FIREWALL_ONLY",
+            "severity": "HIGH",
+            "attack_category": "EXPLOITATION_ATTEMPT",
+            "exploitation_assessment": "ATTEMPT_OBSERVED",
+            "enforcement": "BLOCKED",
+            "summary": "Model analysis confirmed exploit probe. Deterministic enforcement preserved.",
+            "findings": [
+                {
+                    "kind": "OBSERVATION",
+                    "statement": "Log pattern indicates exploit signature probe against protected VIP.",
+                    "evidence_ids": ["EVID-1"],
+                }
+            ],
+            "cve_references": ["CVE-2021-44228"] if "CVE-2021-44228" in prompt_text else [],
+            "visibility_gaps": [],
+            "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS"],
+            "analyst_follow_up": ["Verify application patch status"],
+        }
+
+    return {
+        "id": "chatcmpl-mock-valid",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(assessment),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 120, "completion_tokens": 80, "total_tokens": 200},
+    }
+
+
+@app.post("/chat")
+@app.post("/gchat")
+async def chat_webhook(request: Request):
+    payload = await request.json()
+    state.captured_chats.append(payload)
+    return {"name": "spaces/MOCK_SPACE/messages/MOCK_MSG_123"}
+
+
+@app.get("/capture")
+async def get_capture():
+    return {
+        "captured_chats": state.captured_chats,
+        "staged_logs_count": len(state.staged_logs),
+    }
+
+
+@app.post("/reset")
+async def reset_state():
+    state.reset()
+    return {"status": "ok"}
+
+
+@app.post("/stage_logs")
+async def stage_logs_endpoint(request: Request):
+    logs = await request.json()
+    for item in logs:
+        state.staged_logs.append((int(item[0]), str(item[1])))
+    return {"status": "ok", "staged_count": len(state.staged_logs)}
+
+
+@app.post("/set_mode")
+async def set_mode_endpoint(request: Request):
+    body = await request.json()
+    if "chat_response_mode" in body:
+        state.chat_response_mode = body["chat_response_mode"]
+    if "loki_response_mode" in body:
+        state.loki_response_mode = body["loki_response_mode"]
+    return {
+        "chat_response_mode": state.chat_response_mode,
+        "loki_response_mode": state.loki_response_mode,
+    }
+
+
+def generate_scenario_logs(base_ts_ns: int) -> Dict[str, List[Tuple[int, str]]]:
+    """Generates synthetic logs matching Section 1 validation scenarios."""
+    scenarios = {}
+
+    # 1. Benign internal host (DNS + HTTPS, closed normally)
+    scenarios["scenario_1_benign"] = [
+        (
+            base_ts_ns + 1_000_000_000,
+            'date=2026-10-06 time=12:00:00 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+            'subtype="forward" level="notice" vd="root" srcip=10.0.1.5 srcport=51234 dstip=1.1.1.1 '
+            'dstport=53 proto=17 service="DNS" action="close" sessionid=200001 sentbyte=64 rcvdbyte=128',
+        ),
+        (
+            base_ts_ns + 2_000_000_000,
+            'date=2026-10-06 time=12:00:01 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+            'subtype="forward" level="notice" vd="root" srcip=10.0.1.5 srcport=51235 dstip=93.184.216.34 '
+            'dstport=443 proto=6 service="HTTPS" action="close" sessionid=200002 sentbyte=1200 rcvdbyte=4500',
+        ),
+    ]
+
+    # 2. Non-blocked IPS detection against VIP (action=detected) -> CRITICAL URGENT
+    scenarios["scenario_2_nonblocked_ips"] = [
+        (
+            base_ts_ns + 3_000_000_000,
+            'date=2026-10-06 time=12:00:02 devname="FGT" devid="FGT1" logid="0419016384" type="utm" '
+            'subtype="ips" eventtype="signature" level="critical" vd="root" policyid=10 sessionid=200003 '
+            'srcip=198.51.100.45 srcport=44812 dstip=10.0.14.120 dstport=443 proto=6 service="HTTPS" '
+            'attack="Apache.Log4j.Error.Log.Remote.Code.Execution" vuln_name="CVE-2021-44228" action="detected" '
+            'severity="critical" direction="incoming" msg="IPS signature matched in decrypted SSL payload"',
+        ),
+    ]
+
+    # 3. IPS-dropped exploit (action=dropped) + accepted traffic log of same session -> BLOCKED, No Urgent Alert
+    scenarios["scenario_3_blocked_exploit"] = [
+        (
+            base_ts_ns + 4_000_000_000,
+            'date=2026-10-06 time=12:00:03 devname="FGT" devid="FGT1" logid="0419016384" type="utm" '
+            'subtype="ips" eventtype="signature" level="critical" vd="root" policyid=10 sessionid=200004 '
+            'srcip=198.51.100.46 srcport=44813 dstip=10.0.14.120 dstport=443 proto=6 service="HTTPS" '
+            'attack="Apache.Log4j.Error.Log.Remote.Code.Execution" vuln_name="CVE-2021-44228" action="dropped" '
+            'utmaction="dropped" severity="critical" direction="incoming" msg="IPS dropped malicious session"',
+        ),
+        (
+            base_ts_ns + 4_100_000_000,
+            'date=2026-10-06 time=12:00:03 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+            'subtype="forward" level="notice" vd="root" sessionid=200004 srcip=198.51.100.46 srcport=44813 '
+            'dstip=10.0.14.120 dstport=443 proto=6 service="HTTPS" action="accept" policyid=10',
+        ),
+    ]
+
+    # 4. Internal host, antivirus blocked a download -> No Urgent Alert
+    scenarios["scenario_4_internal_av_blocked"] = [
+        (
+            base_ts_ns + 5_000_000_000,
+            'date=2026-10-06 time=12:00:04 devname="FGT" devid="FGT1" logid="0211016384" type="utm" '
+            'subtype="virus" level="warning" vd="root" policyid=5 sessionid=200005 srcip=10.0.1.50 '
+            'srcport=54321 dstip=203.0.113.10 dstport=80 proto=6 service="HTTP" virus="Eicar-Test-Signature" '
+            'action="blocked" utmaction="blocked" direction="outgoing" msg="Virus detected and download blocked"',
+        ),
+    ]
+
+    # 5. Blocked scanner, 12 denies -> Digest (no urgent alert)
+    scanner_logs = []
+    for i in range(12):
+        scanner_logs.append((
+            base_ts_ns + 6_000_000_000 + i * 100_000_000,
+            f'date=2026-10-06 time=12:00:05 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+            f'subtype="forward" level="notice" vd="root" sessionid={200010 + i} srcip=198.51.100.99 '
+            f'srcport={40000 + i} dstip=10.0.14.120 dstport={1000 + i} proto=6 service="TCP/{1000 + i}" '
+            f'action="deny" policyid=0',
+        ))
+    scenarios["scenario_5_blocked_scanner"] = scanner_logs
+
+    # 6. Burst of 400 events
+    burst_logs = []
+    for i in range(400):
+        burst_logs.append((
+            base_ts_ns + 10_000_000_000 + i * 10_000_000,
+            f'date=2026-10-06 time=12:00:10 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+            f'subtype="forward" level="notice" vd="root" sessionid={300000 + i} srcip=198.51.100.200 '
+            f'srcport={30000 + (i % 500)} dstip=10.0.14.120 dstport=80 proto=6 service="HTTP" '
+            f'action="deny" policyid=0',
+        ))
+    scenarios["burst_400"] = burst_logs
+
+    # 7. Late-arrival batch (logs with timestamp 30s in the past)
+    late_logs = [
+        (
+            base_ts_ns - 30_000_000_000,
+            'date=2026-10-06 time=11:59:30 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+            'subtype="forward" level="notice" vd="root" sessionid=199999 srcip=198.51.100.77 srcport=45000 '
+            'dstip=10.0.14.120 dstport=80 proto=6 service="HTTP" action="deny" policyid=0',
+        )
+    ]
+    scenarios["late_arrival"] = late_logs
+
+    return scenarios

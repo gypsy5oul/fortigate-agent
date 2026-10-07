@@ -2,37 +2,101 @@
 
 import hashlib
 import ipaddress
+from pathlib import Path
 from typing import Dict, Any, Optional
+import yaml
 from src.parsing.fortios_parser import parse_fortios_line
+from src.observability.metrics import UNKNOWN_ACTIONS_TOTAL
 
-# Security blocking actions: firewall or UTM dropped/denied/quarantined the traffic
+_ACTION_MAP: Optional[Dict[str, Any]] = None
+_ACTION_MAP_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "action_map.yaml"
+
+
+def get_action_map() -> Dict[str, Any]:
+    global _ACTION_MAP
+    if _ACTION_MAP is None:
+        if _ACTION_MAP_PATH.exists():
+            try:
+                with open(_ACTION_MAP_PATH, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+                    _ACTION_MAP = data.get("mappings", {})
+            except Exception:
+                _ACTION_MAP = {}
+        else:
+            _ACTION_MAP = {}
+    return _ACTION_MAP
+
+
+# Security blocking fallback actions
 BLOCKED_ACTIONS = frozenset([
     "deny", "drop", "blocked", "block", "dropped", "ip-block", "quarantine",
-    "reset", "reset-client", "reset-server", "reset-both"
+    "reset", "reset-client", "reset-server", "reset-both", "reset_client", "reset_server",
+    "drop_session", "clear_session"
 ])
 
-# Permitted actions: firewall or UTM allowed the traffic to pass / detected without blocking
+# Permitted fallback actions
 ALLOWED_ACTIONS = frozenset([
-    "accept", "pass", "passthrough", "detected", "monitor", "permit"
+    "accept", "pass", "passthrough", "detected", "monitor", "permit", "monitored",
+    "pass_session", "exempt"
 ])
 
-# Normal session termination actions: routine TCP closure, RST, or timeout
+# Session termination fallback actions
 SESSION_CLOSE_ACTIONS = frozenset([
-    "close", "client-rst", "server-rst", "timeout", "clear_session"
+    "close", "client-rst", "server-rst", "timeout"
 ])
 
 
-def normalize_action(action_raw: Optional[str]) -> str:
-    """Map raw FortiOS action to standardized enforcement categories."""
-    if not action_raw:
+def normalize_action(
+    action_raw: Optional[str],
+    log_type: Optional[str] = None,
+    subtype: Optional[str] = None,
+    utmaction: Optional[str] = None,
+) -> str:
+    """Map raw FortiOS action to standardized enforcement categories using config/action_map.yaml.
+    
+    If utmaction is present in traffic logs, it takes precedence over action.
+    """
+    norm_type = (log_type or "").strip().lower()
+    norm_subtype = (subtype or "").strip().lower()
+
+    target_action = utmaction if (norm_type == "traffic" and utmaction) else action_raw
+    if not target_action:
         return "UNKNOWN"
-    act = action_raw.strip().lower()
+
+    act = target_action.strip().lower()
+    action_map = get_action_map()
+
+    entry = None
+    if norm_type and norm_type in action_map:
+        type_cfg = action_map[norm_type]
+        if norm_subtype and norm_subtype in type_cfg:
+            entry = type_cfg[norm_subtype].get(act)
+        if not entry and "default" in type_cfg:
+            entry = type_cfg["default"].get(act)
+
+    # Check top-level or other namespaces if not matched or no log_type supplied
+    if not entry:
+        for t_name, t_cfg in action_map.items():
+            if isinstance(t_cfg, dict):
+                if norm_subtype and norm_subtype in t_cfg and act in t_cfg[norm_subtype]:
+                    entry = t_cfg[norm_subtype][act]
+                    break
+                if "default" in t_cfg and act in t_cfg["default"]:
+                    entry = t_cfg["default"][act]
+                    break
+
+    if entry and "enforcement" in entry:
+        return entry["enforcement"]
+
+    # Fallback to hardcoded sets if action map had no match
     if act in BLOCKED_ACTIONS:
         return "BLOCKED"
     if act in ALLOWED_ACTIONS:
         return "ALLOWED_OR_DETECTED"
     if act in SESSION_CLOSE_ACTIONS:
         return "SESSION_CLOSED"
+
+    UNKNOWN_ACTIONS_TOTAL.labels(type=norm_type or "unknown", subtype=norm_subtype or "unknown").inc()
     return "UNKNOWN"
 
 
@@ -119,7 +183,10 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         return None
 
     action_raw = parsed.get("action")
-    action_normalized = normalize_action(action_raw)
+    utmaction = parsed.get("utmaction")
+    log_type = parsed.get("type", "unknown")
+    subtype = parsed.get("subtype")
+    action_normalized = normalize_action(action_raw, log_type=log_type, subtype=subtype, utmaction=utmaction)
 
     def _to_int(val: Optional[str]) -> Optional[int]:
         if val is None or val == "":
@@ -129,13 +196,18 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         except ValueError:
             return None
 
-    signature = (
+    raw_signature = (
         parsed.get("attack") or
         parsed.get("virus") or
         parsed.get("app") or
         parsed.get("msg") or
         parsed.get("vuln_name")
     )
+    signature_truncated = False
+    signature = raw_signature
+    if signature and len(signature) > 512:
+        signature = signature[:512]
+        signature_truncated = True
 
     srcintfrole = parsed.get("srcintfrole")
     dstintfrole = parsed.get("dstintfrole")
@@ -155,9 +227,10 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         "srcintfrole": srcintfrole,
         "dstintfrole": dstintfrole,
         "logid": parsed.get("logid"),
-        "log_type": parsed.get("type", "unknown"),
-        "subtype": parsed.get("subtype"),
+        "log_type": log_type,
+        "subtype": subtype,
         "action_raw": action_raw,
+        "utmaction": utmaction,
         "action_normalized": action_normalized,
         "srcip": srcip,
         "srcport": _to_int(parsed.get("srcport")),
@@ -168,6 +241,7 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         "policyid": _to_int(parsed.get("policyid")),
         "sessionid": _to_int(parsed.get("sessionid")),
         "signature": signature,
+        "signature_truncated": signature_truncated,
         "url": parsed.get("url"),
         "http_method": parsed.get("httpmethod"),
         "severity_raw": parsed.get("level") or parsed.get("crlevel") or parsed.get("severity"),

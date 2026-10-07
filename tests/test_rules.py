@@ -57,8 +57,9 @@ def test_scanner_digest_rule(rule_engine):
     ev = normalize_event(1791271940000000000, SAMPLE_TRAFFIC_DENY)
     episode = {
         "incident_id": "INC-TEST-003",
-        "source_ip": ev["srcip"],
-        "target_ip": ev["dstip"],
+        "source_ip": "198.51.100.5",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
         "enforcement": "BLOCKED",
         "event_count": 15,
         "signatures": [],

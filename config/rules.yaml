@@ -14,12 +14,12 @@ rules:
   - id: "RULE_MIXED_ENFORCEMENT_SEQUENCE"
     name: "Mixed Enforcement Attack Sequence"
     description: "Source IP exhibits both blocked probes and allowed connections within the same episode."
-    priority: "URGENT_ALERT_AND_INVESTIGATE"
+    priority: "INVESTIGATE"
     min_severity: "HIGH"
     condition:
       enforcement: ["MIXED"]
       min_events: 2
-    reason_template: "Attacker observed probing with blocked requests followed by accepted application flows."
+    reason_template: "Mixed enforcement sequence detected across UTM events ({event_count} events; mixed enforcement, not proven bypass)."
 
   - id: "RULE_HIGH_FREQUENCY_SCANNER"
     name: "High Frequency Perimeter Scanner"
@@ -28,6 +28,7 @@ rules:
     min_severity: "MEDIUM"
     condition:
       enforcement: ["BLOCKED"]
+      direction: "INBOUND"
       min_events: 10
     reason_template: "Persistent external automated scanner detected ({event_count} blocked attempts)."
 
@@ -51,3 +52,12 @@ rules:
       type: "utm"
       subtypes: ["virus"]
     reason_template: "Antivirus inspection detected malware signature: {signature}"
+
+  - id: "RULE_UNKNOWN_ACTION_MAPPING"
+    name: "Unknown Log Action Visibility Gap"
+    description: "One or more events carried unmapped FortiOS action values."
+    priority: "DIGEST"
+    min_severity: "LOW"
+    condition:
+      action_normalized: "UNKNOWN"
+    reason_template: "Unmapped FortiOS action observed in log stream requiring configuration review."

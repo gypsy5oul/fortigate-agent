@@ -30,10 +30,12 @@ class Episode:
         self.services: Set[str] = set()
         self.enforcement_counts: Dict[str, int] = {
             "BLOCKED": 0,
+            "ALLOWED": 0,
             "ALLOWED_OR_DETECTED": 0,
             "SESSION_CLOSED": 0,
             "UNKNOWN": 0,
         }
+        self.blocked_session_ids: Set[int] = set()
         # Deterministic incident ID scoped by VDOM, direction, IPs and start timestamp
         seed = f"{vdom}|{direction}|{source_ip}|{target_ip}|{int(first_seen_ts)}"
         self.incident_id = f"INC-{hashlib.sha256(seed.encode()).hexdigest()[:12].upper()}"
@@ -71,8 +73,30 @@ class Episode:
         if svc:
             self.services.add(svc)
 
+        sid = event.get("sessionid")
+        log_type = event.get("log_type")
         action_norm = event.get("action_normalized", "UNKNOWN")
-        if action_norm in self.enforcement_counts:
+
+        # UTM events that were blocked mark this sessionid as blocked
+        if log_type == "utm" and action_norm == "BLOCKED" and sid is not None:
+            if sid not in self.blocked_session_ids:
+                self.blocked_session_ids.add(sid)
+                # If a prior traffic log for this session was counted as ALLOWED, discount it
+                for prev_ev in self.events:
+                    if prev_ev.get("log_type") == "traffic" and prev_ev.get("sessionid") == sid:
+                        if prev_ev.get("action_normalized") == "ALLOWED":
+                            if self.enforcement_counts["ALLOWED"] > 0:
+                                self.enforcement_counts["ALLOWED"] -= 1
+                                self.enforcement_counts["BLOCKED"] += 1
+                        elif prev_ev.get("action_normalized") == "ALLOWED_OR_DETECTED":
+                            if self.enforcement_counts["ALLOWED_OR_DETECTED"] > 0:
+                                self.enforcement_counts["ALLOWED_OR_DETECTED"] -= 1
+                                self.enforcement_counts["BLOCKED"] += 1
+
+        # Traffic logs whose sessionid matches a UTM log that was BLOCKED do not count as ALLOWED
+        if log_type == "traffic" and sid is not None and sid in self.blocked_session_ids:
+            self.enforcement_counts["BLOCKED"] += 1
+        elif action_norm in self.enforcement_counts:
             self.enforcement_counts[action_norm] += 1
         else:
             self.enforcement_counts["UNKNOWN"] += 1
@@ -85,8 +109,14 @@ class Episode:
 
     @property
     def overall_enforcement(self) -> str:
+        # Check UTM events specifically for mixed UTM enforcement
+        utm_blocked = any(ev.get("log_type") == "utm" and ev.get("action_normalized") == "BLOCKED" for ev in self.events)
+        utm_allowed = any(ev.get("log_type") == "utm" and ev.get("action_normalized") == "ALLOWED_OR_DETECTED" for ev in self.events)
+        if utm_blocked and utm_allowed:
+            return "MIXED"
+
         blocked = self.enforcement_counts["BLOCKED"]
-        allowed = self.enforcement_counts["ALLOWED_OR_DETECTED"]
+        allowed = self.enforcement_counts["ALLOWED_OR_DETECTED"] + self.enforcement_counts["ALLOWED"]
         if blocked > 0 and allowed > 0:
             return "MIXED"
         if allowed > 0:
@@ -94,7 +124,7 @@ class Episode:
         if blocked > 0:
             return "BLOCKED"
         if self.enforcement_counts.get("SESSION_CLOSED", 0) > 0:
-            return "ALLOWED_OR_DETECTED"
+            return "SESSION_CLOSED"
         return "UNKNOWN"
 
     def to_dict(self) -> Dict[str, Any]:
