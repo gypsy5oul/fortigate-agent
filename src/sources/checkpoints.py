@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Tuple, Optional, Callable
 from src.sources.loki_client import LokiClient
 from src.storage.repository import Repository
 from src.parsing.normalizer import normalize_event
+from src.sources.query_profiles import QueryProfile, UTM_DETECTIONS_PROFILE
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ class PollerOrchestrator:
         loki_client: LokiClient,
         repository: Repository,
         selector: str,
+        query_profile: Optional[QueryProfile] = None,
         overlap_seconds: int = 120,
         query_end_delay_seconds: int = 15,
         default_bootstrap_seconds: int = 600,
@@ -27,6 +29,7 @@ class PollerOrchestrator:
         self.client = loki_client
         self.repo = repository
         self.selector = selector
+        self.query_profile = query_profile
         self.overlap_ns = overlap_seconds * 1_000_000_000
         self.end_delay_ns = query_end_delay_seconds * 1_000_000_000
         self.bootstrap_ns = default_bootstrap_seconds * 1_000_000_000
@@ -34,7 +37,7 @@ class PollerOrchestrator:
         self.limit = limit
         self.max_slices_per_cycle = max_slices_per_cycle
         self.now_fn = now_fn or time.time_ns
-        self.stream_name = selector
+        self.stream_name = query_profile.stream_key(selector) if query_profile else selector
 
     async def poll_once(self) -> Tuple[int, int]:
         """Execute one polling cycle with bounded catch-up slices.
@@ -76,8 +79,9 @@ class PollerOrchestrator:
             )
 
             # Query Loki (raises exception if Loki failed or returned non-success envelope)
+            query_str = self.query_profile.render(self.selector) if self.query_profile else self.selector
             raw_records, had_saturation = await self.client.query_range_safe(
-                self.selector,
+                query_str,
                 start_ns,
                 target_end_ns,
                 limit=self.limit,

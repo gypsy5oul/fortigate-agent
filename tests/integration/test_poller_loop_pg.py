@@ -77,7 +77,7 @@ async def test_pg_batch_insert_rejection_fallback(pg_repo):
         raw_line = (
             f'date=2026-10-06 time=12:00:00 devname="FGT" devid="FGT1" logid="0000000013" '
             f'type="traffic" subtype="forward" level="notice" vd="root" srcip=10.0.1.{i+1} dstip=10.0.2.10 '
-            f'action="accept" sessionid={2000 + i}'
+            f'action="deny" sessionid={2000 + i}'
         )
         ev = normalize_event(base_ts + i * 1_000_000, raw_line)
         valid_events.append(ev)
@@ -114,7 +114,7 @@ async def test_pg_durable_inbox_ordered_draining(pg_repo):
         raw_line = (
             f'date=2026-10-06 time=12:00:00 devname="FGT" devid="FGT1" logid="0000000013" '
             f'type="traffic" subtype="forward" level="notice" vd="root" srcip=10.0.1.{idx} dstip=10.0.2.10 '
-            f'action="accept" sessionid={3000 + idx}'
+            f'action="deny" sessionid={3000 + idx}'
         )
         ev = normalize_event(base_ts + offset * 1_000_000_000, raw_line)
         events.append(ev)

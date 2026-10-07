@@ -170,23 +170,45 @@ def generate_event_id(loki_ts_ns: int, raw_line: str, parsed: Dict[str, str]) ->
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
-def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
-    """Parse raw log line and return normalized security event dictionary."""
+def normalize_event(
+    loki_ts_ns: int,
+    raw_line: str,
+    allow_accepted_traffic: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Parse raw log line and return normalized security event dictionary.
+    
+    In accordance with B1, accepted traffic logs are not ingested into selected_events
+    unless explicitly requested by enrichment (allow_accepted_traffic=True).
+    """
     parsed = parse_fortios_line(raw_line)
     if not parsed:
         return None
 
     srcip = parsed.get("srcip")
     dstip = parsed.get("dstip")
-    if not srcip or not dstip:
-        # Ignore events without source/destination IP (e.g. system status banners)
-        return None
+    log_type = parsed.get("type", "unknown")
+
+    if log_type.lower() == "event":
+        if not srcip and not dstip:
+            # Event status banner with no IP
+            return None
+        # In event logs (e.g. admin login, system alerts), one IP may be omitted
+        srcip = srcip or "127.0.0.1"
+        dstip = dstip or "127.0.0.1"
+    else:
+        if not srcip or not dstip:
+            # Security traffic and UTM events require valid IP pair
+            return None
 
     action_raw = parsed.get("action")
     utmaction = parsed.get("utmaction")
-    log_type = parsed.get("type", "unknown")
     subtype = parsed.get("subtype")
     action_normalized = normalize_action(action_raw, log_type=log_type, subtype=subtype, utmaction=utmaction)
+
+    # B1 requirement: do not copy accepted traffic into PostgreSQL
+    if not allow_accepted_traffic and log_type.lower() == "traffic":
+        if action_normalized in ("ALLOWED", "SESSION_CLOSED"):
+            return None
 
     def _to_int(val: Optional[str]) -> Optional[int]:
         if val is None or val == "":
@@ -196,11 +218,10 @@ def normalize_event(loki_ts_ns: int, raw_line: str) -> Optional[Dict[str, Any]]:
         except ValueError:
             return None
 
+    # Strict signature derivation: attack, virus, or vuln_name only (never app or msg)
     raw_signature = (
         parsed.get("attack") or
         parsed.get("virus") or
-        parsed.get("app") or
-        parsed.get("msg") or
         parsed.get("vuln_name")
     )
     signature_truncated = False

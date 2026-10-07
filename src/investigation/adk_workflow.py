@@ -2,18 +2,33 @@
 
 import os
 import json
-import yaml
+import time
+import hashlib
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 import httpx
 
 from src.investigation.schemas import IncidentPacket, QwenAssessment, FindingItem
-from src.investigation.prompts import SYSTEM_PROMPT, build_user_prompt
+from src.investigation.prompts import (
+    SYSTEM_PROMPT,
+    SYSTEM_PROMPT_VERSION,
+    USER_PROMPT_VERSION,
+    build_user_prompt,
+)
+from src.investigation.eligibility import get_eligible_actions, load_action_catalog
+from src.investigation.validator import validate_assessment, ValidationReport
+from src.parsing.redaction import redact_evidence_record, wrap_untrusted_evidence
+from src.observability.metrics import MODEL_FAILURES_TOTAL
 
 logger = logging.getLogger(__name__)
 
 SEVERITY_RANKS = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 RANK_TO_SEVERITY = {4: "CRITICAL", 3: "HIGH", 2: "MEDIUM", 1: "LOW"}
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative token count estimation (~3.5 chars per token)."""
+    return max(1, int(len(text) / 3.5))
 
 
 class ADKInvestigationWorkflow:
@@ -24,65 +39,261 @@ class ADKInvestigationWorkflow:
         api_key: str = "EMPTY",
         timeout_seconds: float = 60.0,
         action_catalog_path: Optional[str] = None,
+        max_input_tokens: int = 12000,
         max_output_tokens: int = 3500,
+        fortios_build: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout_seconds
+        self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
+        self.fortios_build = fortios_build
 
-        if not action_catalog_path:
-            action_catalog_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "config", "action_catalog.yaml"
-            )
-        self.valid_action_ids = self._load_action_catalog(action_catalog_path)
+        self._all_catalog_actions = load_action_catalog()
+        self.valid_action_ids = [a["id"] for a in self._all_catalog_actions if "id" in a] or [
+            "ACT_QUARANTINE_SRC_IP",
+            "ACT_INSPECT_APPLICATION_LOGS",
+            "ACT_MONITOR_AND_DIGEST",
+        ]
 
         self._client = httpx.AsyncClient(
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=timeout_seconds,
         )
 
-    def _load_action_catalog(self, path: str) -> List[str]:
-        if not os.path.exists(path):
-            return ["ACT_QUARANTINE_SRC_IP", "ACT_INSPECT_APPLICATION_LOGS", "ACT_MONITOR_AND_DIGEST"]
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-                return [a["id"] for a in data.get("actions", [])]
-        except Exception:
-            return ["ACT_QUARANTINE_SRC_IP", "ACT_INSPECT_APPLICATION_LOGS", "ACT_MONITOR_AND_DIGEST"]
-
     async def close(self):
         await self._client.aclose()
 
+    def _prepare_evidence_and_catalog(self, packet: IncidentPacket):
+        # 1. Action catalog
+        if packet.action_catalog:
+            eligible_actions = packet.action_catalog
+        else:
+            eligible_actions = get_eligible_actions(
+                packet.model_dump(),
+                configured_build=self.fortios_build,
+            )
+        eligible_action_ids = {a["id"] for a in eligible_actions if "id" in a}
+
+        prompt_catalog = [
+            {
+                "id": a["id"],
+                "name": a.get("name", a["id"]),
+                "category": a.get("category", "REMEDIATION"),
+                "risk": a.get("risk", "LOW"),
+                "requires_approval": a.get("requires_approval", True),
+            }
+            for a in eligible_actions
+            if "id" in a
+        ]
+
+        # 2. Evidence sanitization & wrapping
+        sanitized_events = []
+        for ev in packet.evidence_events:
+            redacted_ev = redact_evidence_record(ev)
+            ev_id = str(redacted_ev.get("id", "UNKNOWN"))
+            ev_repr = json.dumps(redacted_ev, sort_keys=True)
+            sanitized_events.append({
+                "id": ev_id,
+                "wrapped_evidence": wrap_untrusted_evidence(ev_id, ev_repr),
+                "log_type": redacted_ev.get("log_type", "traffic"),
+                "has_sig": bool(redacted_ev.get("signature")),
+                "action": redacted_ev.get("action_normalized"),
+            })
+
+        # Token budgeting: shrink evidence if necessary
+        json_schema = json.dumps(QwenAssessment.model_json_schema(), indent=2)
+        action_cat_json = json.dumps(prompt_catalog, indent=2)
+
+        # Sort evidence to preserve most severe / UTM first
+        sanitized_events.sort(
+            key=lambda e: (
+                1 if e["log_type"] == "utm" else 0,
+                1 if e["has_sig"] else 0,
+                1 if e["action"] in ("ALLOWED_OR_DETECTED", "MIXED") else 0,
+            ),
+            reverse=True,
+        )
+
+        packet_copy = packet.model_dump()
+        packet_copy["evidence_events"] = [e["wrapped_evidence"] for e in sanitized_events]
+        packet_json = json.dumps(packet_copy, indent=2)
+        user_prompt = build_user_prompt(packet_json, action_cat_json, json_schema)
+
+        while estimate_tokens(user_prompt) > self.max_input_tokens and len(sanitized_events) > 1:
+            sanitized_events.pop()
+            packet_copy["evidence_events"] = [e["wrapped_evidence"] for e in sanitized_events]
+            packet_json = json.dumps(packet_copy, indent=2)
+            user_prompt = build_user_prompt(packet_json, action_cat_json, json_schema)
+
+        return user_prompt, eligible_action_ids, json_schema
+
     async def investigate_packet(self, packet: IncidentPacket) -> QwenAssessment:
         """Execute bounded model investigation on incident packet with deterministic guardrails."""
-        packet_json = packet.model_dump_json(indent=2)
+        user_prompt, eligible_action_ids, json_schema_str = self._prepare_evidence_and_catalog(packet)
         url = f"{self.base_url}/chat/completions"
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_user_prompt(packet_json)},
-            ],
-            "temperature": 0.1,
-            "max_tokens": self.max_output_tokens,
-            "response_format": {"type": "json_object"},
-        }
+        input_hash = hashlib.sha256(user_prompt.encode("utf-8")).hexdigest()
+        input_tokens = estimate_tokens(user_prompt)
+        t_start = time.time()
+
+        structured_mode = "json_schema"
+        server_reported_model = self.model
+        output_tokens = 0
+        validation_result = "VALID"
+        reason_codes: List[str] = []
 
         try:
-            resp = await self._client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            assessment_dict = json.loads(content)
-            assessment = QwenAssessment(**assessment_dict)
-            return self._apply_guardrails(assessment, packet)
+            # 1. Try structured output with json_schema
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": self.max_output_tokens,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "QwenAssessment",
+                        "schema": QwenAssessment.model_json_schema(),
+                        "strict": True,
+                    },
+                },
+            }
+
+            try:
+                resp = await self._client.post(url, json=payload)
+                if resp.status_code == 400:
+                    # Fall back to json_object mode if server does not support json_schema
+                    logger.info("vLLM rejected json_schema; falling back to json_object response_format")
+                    structured_mode = "json_object"
+                    payload["response_format"] = {"type": "json_object"}
+                    resp = await self._client.post(url, json=payload)
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                if structured_mode == "json_schema" and e.response.status_code == 400:
+                    structured_mode = "json_object"
+                    payload["response_format"] = {"type": "json_object"}
+                    resp = await self._client.post(url, json=payload)
+                    resp.raise_for_status()
+                else:
+                    raise
+
+            resp_data = resp.json()
+            server_reported_model = resp_data.get("model", self.model)
+            content = resp_data["choices"][0]["message"]["content"]
+            output_tokens = resp_data.get("usage", {}).get("completion_tokens", estimate_tokens(content))
+            input_tokens = resp_data.get("usage", {}).get("prompt_tokens", input_tokens)
+
+            # 2. Parse JSON & Validate
+            parsed_dict = None
+            try:
+                parsed_dict = json.loads(content)
+            except Exception as e:
+                logger.warning("Model returned invalid JSON: %s. Attempting repair.", e)
+
+            repaired = False
+            if parsed_dict is not None:
+                try:
+                    assessment_candidate = QwenAssessment(**parsed_dict)
+                    v_report = validate_assessment(assessment_candidate, packet, eligible_action_ids)
+                except Exception as e:
+                    v_report = ValidationReport(
+                        is_valid=False,
+                        assessment=None,
+                        reason_codes=["SCHEMA_VALIDATION_ERROR"],
+                        needs_repair=True,
+                        repair_prompt=f"Validation error: {e}. Please return valid JSON matching the schema.",
+                    )
+            else:
+                v_report = ValidationReport(
+                    is_valid=False,
+                    assessment=None,
+                    reason_codes=["INVALID_JSON"],
+                    needs_repair=True,
+                    repair_prompt="Your previous output was not valid JSON. Please return valid JSON matching the schema.",
+                )
+
+            # 3. One Repair Attempt if needed
+            if not v_report.is_valid and v_report.needs_repair:
+                try:
+                    repair_payload = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt},
+                            {"role": "assistant", "content": content},
+                            {"role": "user", "content": v_report.repair_prompt or "Please correct and output valid JSON."},
+                        ],
+                        "temperature": 0.1,
+                        "max_tokens": self.max_output_tokens,
+                        "response_format": {"type": "json_object"},
+                    }
+                    rep_resp = await self._client.post(url, json=repair_payload)
+                    rep_resp.raise_for_status()
+                    rep_data = rep_resp.json()
+                    rep_content = rep_data["choices"][0]["message"]["content"]
+                    output_tokens += rep_data.get("usage", {}).get("completion_tokens", estimate_tokens(rep_content))
+                    rep_dict = json.loads(rep_content)
+                    rep_assessment = QwenAssessment(**rep_dict)
+                    rep_v_report = validate_assessment(rep_assessment, packet, eligible_action_ids)
+                    if rep_v_report.is_valid and rep_v_report.assessment:
+                        v_report = rep_v_report
+                        repaired = True
+                    else:
+                        v_report.reason_codes.extend(rep_v_report.reason_codes)
+                except Exception as e:
+                    logger.warning("Repair prompt failed: %s", e)
+                    v_report.reason_codes.append(f"REPAIR_FAILED_{type(e).__name__}")
+
+            # 4. Final Assessment Decision
+            if v_report.is_valid and v_report.assessment is not None:
+                final_assessment = v_report.assessment
+                final_assessment.assessment_source = "MODEL_REPAIRED" if repaired else "MODEL_VALIDATED"
+                validation_result = "REPAIRED" if repaired else "VALID"
+                reason_codes = v_report.reason_codes
+            else:
+                MODEL_FAILURES_TOTAL.inc()
+                validation_result = "REJECTED"
+                reason_codes = v_report.reason_codes
+                final_assessment = self._build_fallback_assessment(packet, error_reason="MODEL_INVALID_OUTPUT")
+                final_assessment.assessment_source = "MODEL_REJECTED_FALLBACK"
+
         except Exception as e:
+            MODEL_FAILURES_TOTAL.inc()
             logger.warning("Local Qwen inference failed or timed out: %s. Using deterministic fallback.", e)
-            return self._build_fallback_assessment(packet, error_reason=str(e))
+            final_assessment = self._build_fallback_assessment(packet, error_reason=str(e))
+            final_assessment.assessment_source = "MODEL_REJECTED_FALLBACK"
+            validation_result = "TIMEOUT" if "timeout" in str(e).lower() else "ERROR"
+            reason_codes = [validation_result, str(e)[:100]]
+
+        latency_ms = int((time.time() - t_start) * 1000)
+
+        # Attach audited model_run metadata
+        final_assessment.model_run = {
+            "incident_id": packet.incident_id,
+            "revision": packet.incident_revision,
+            "model_id": self.model,
+            "server_reported_model": server_reported_model,
+            "prompt_version": USER_PROMPT_VERSION,
+            "schema_version": "1.0.0",
+            "rule_pack_version": "1.0.0",
+            "catalog_version": "1.0.0",
+            "action_map_version": "1.0.0",
+            "input_hash": input_hash,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "latency_ms": latency_ms,
+            "structured_output_mode": structured_mode,
+            "validation_result": validation_result,
+            "reason_codes": reason_codes,
+        }
+
+        return final_assessment
 
     def _apply_guardrails(self, assessment: QwenAssessment, packet: IncidentPacket) -> QwenAssessment:
         """Enforce architectural constraints: severity floors, action allowlists, and evidence integrity."""
@@ -90,18 +301,18 @@ class ADKInvestigationWorkflow:
         assessment.incident_id = packet.incident_id
         assessment.incident_revision = packet.incident_revision
 
-        # 0. Enforcement is ALWAYS deterministic from packet
+        # Enforcement is ALWAYS deterministic from packet
         assessment.model_reported_enforcement = assessment.enforcement
         assessment.enforcement = packet.enforcement
         assessment.assessment_source = "MODEL_VALIDATED"
 
-        # 1. Enforce deterministic severity floor
+        # Enforce deterministic severity floor
         floor_rank = SEVERITY_RANKS.get(packet.deterministic_severity_floor, 1)
         model_rank = SEVERITY_RANKS.get(assessment.severity, 1)
         effective_rank = max(floor_rank, model_rank)
         assessment.severity = RANK_TO_SEVERITY.get(effective_rank, packet.deterministic_severity_floor)
 
-        # 2. Strict allowlist check on recommended action IDs (quarantine removed automatically if not valid)
+        # Strict allowlist check on recommended action IDs
         assessment.recommended_action_ids = [
             act_id for act_id in assessment.recommended_action_ids
             if act_id in self.valid_action_ids and act_id != "ACT_QUARANTINE_SRC_IP"
@@ -109,10 +320,10 @@ class ADKInvestigationWorkflow:
         if not assessment.recommended_action_ids:
             assessment.recommended_action_ids = ["ACT_INSPECT_APPLICATION_LOGS"]
 
-        # 3. Grounded CVE validation: strip hallucinated CVEs not grounded in packet evidence
+        # Grounded CVE validation
         import re
         cve_regex = re.compile(r"^CVE-\d{4}-\d{4,}$")
-        evidence_text = json.dumps([e.get("raw_message", "") for e in packet.evidence_events] + packet.signatures + packet.deterministic_reasons)
+        evidence_text = json.dumps([e.get("raw_message", "") for e in packet.evidence_events if isinstance(e, dict)] + packet.signatures + packet.deterministic_reasons)
         grounded_cves = []
         for cve in assessment.cve_references:
             cve_clean = cve.strip().upper()
@@ -120,8 +331,8 @@ class ADKInvestigationWorkflow:
                 grounded_cves.append(cve_clean)
         assessment.cve_references = grounded_cves
 
-        # 4. Evidence ID integrity: remove fabricated evidence references
-        valid_evidence_ids = {e["id"] for e in packet.evidence_events if "id" in e}
+        # Evidence ID integrity: remove fabricated evidence references
+        valid_evidence_ids = {str(e.get("id")) for e in packet.evidence_events if isinstance(e, dict) and "id" in e}
         cleaned_findings = []
         for finding in assessment.findings:
             valid_ids = [eid for eid in finding.evidence_ids if eid in valid_evidence_ids]
@@ -142,7 +353,7 @@ class ADKInvestigationWorkflow:
 
     def _build_fallback_assessment(self, packet: IncidentPacket, error_reason: str) -> QwenAssessment:
         """Deterministic fallback when Qwen inference is unavailable."""
-        evidence_ids = [e["id"] for e in packet.evidence_events][:5]
+        evidence_ids = [str(e.get("id")) for e in packet.evidence_events if isinstance(e, dict) and "id" in e][:5]
         default_finding = FindingItem(
             kind="OBSERVATION",
             statement=f"Observed {packet.event_count} firewall events from {packet.source_ip} to {packet.target_ip} with {packet.enforcement} enforcement.",

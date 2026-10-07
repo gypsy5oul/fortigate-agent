@@ -98,15 +98,108 @@ async def test_pg_outbox_failure_redacts_webhook_url(pg_repo):
 
     assert dispatched == 0
 
-    # Verify notification in database
+    # Verify notification in database transitions to DEAD_LETTER for permanent 403
     row = await pg_repo.db.fetch_one("SELECT * FROM notification_outbox WHERE incident_id = $1", "INC-OUTBOX-FAIL")
-    assert row["status"] == "PENDING"
+    assert row["status"] == "DEAD_LETTER"
     assert row["attempts"] == 1
     assert row["last_error"] is not None
     # Verify confidential URL/token was redacted!
     assert "AIzaSySecretKey999" not in row["last_error"]
     assert "SecretToken111" not in row["last_error"]
     assert "[URL_REDACTED]" in row["last_error"]
+
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_pg_outbox_transient_failure_retries_with_backoff(pg_repo):
+    """When webhook returns transient HTTP 500, notification stays PENDING with backoff scheduled."""
+    worker = OutboxWorker(
+        repository=pg_repo,
+        webhook_url="https://mock-gchat.local/webhook",
+        dry_run=False,
+        rate_limit_delay_seconds=0.01,
+    )
+
+    await pg_repo.enqueue_notification(
+        incident_id="INC-OUTBOX-500",
+        revision=1,
+        notif_type="URGENT",
+        payload={"text": "Transient failure attempt"},
+    )
+
+    mock_response = httpx.Response(
+        status_code=500,
+        request=httpx.Request("POST", "https://mock-gchat.local/webhook"),
+        text="Internal Server Error",
+    )
+
+    with patch.object(worker._client, "post", new=AsyncMock(side_effect=httpx.HTTPStatusError("Server Error", request=mock_response.request, response=mock_response))):
+        dispatched = await worker.process_outbox_batch(limit=5)
+
+    assert dispatched == 0
+    row = await pg_repo.db.fetch_one("SELECT * FROM notification_outbox WHERE incident_id = $1", "INC-OUTBOX-500")
+    assert row["status"] == "PENDING"
+    assert row["attempts"] == 1
+    assert row["retry_after_ts"] is not None
+
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_pg_outbox_rate_limit_honors_retry_after(pg_repo):
+    """When webhook returns HTTP 429 with Retry-After header, notification respects retry_after_seconds."""
+    worker = OutboxWorker(
+        repository=pg_repo,
+        webhook_url="https://mock-gchat.local/webhook",
+        dry_run=False,
+        rate_limit_delay_seconds=0.01,
+    )
+
+    await pg_repo.enqueue_notification(
+        incident_id="INC-OUTBOX-429",
+        revision=1,
+        notif_type="URGENT",
+        payload={"text": "Rate limited attempt"},
+    )
+
+    mock_response = httpx.Response(
+        status_code=429,
+        headers={"Retry-After": "15"},
+        request=httpx.Request("POST", "https://mock-gchat.local/webhook"),
+        text="Too Many Requests",
+    )
+
+    with patch.object(worker._client, "post", new=AsyncMock(side_effect=httpx.HTTPStatusError("Rate limited", request=mock_response.request, response=mock_response))):
+        dispatched = await worker.process_outbox_batch(limit=5)
+
+    assert dispatched == 0
+    row = await pg_repo.db.fetch_one("SELECT * FROM notification_outbox WHERE incident_id = $1", "INC-OUTBOX-429")
+    assert row["status"] == "PENDING"
+    assert row["attempts"] == 1
+    assert row["retry_after_ts"] is not None
+
+    await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_pg_outbox_priority_ordering(pg_repo):
+    """Notifications must be dispatched by priority order: URGENT (1), INVESTIGATION_UPDATE (2), DIGEST (3)."""
+    worker = OutboxWorker(
+        repository=pg_repo,
+        webhook_url="https://mock-gchat.local/webhook",
+        dry_run=True,
+    )
+
+    await pg_repo.enqueue_notification("INC-ORD-3", 1, "DIGEST", {"text": "Digest alert"})
+    await pg_repo.enqueue_notification("INC-ORD-1", 1, "URGENT", {"text": "Urgent alert"})
+    await pg_repo.enqueue_notification("INC-ORD-2", 1, "INVESTIGATION_UPDATE", {"text": "Investigation update"})
+
+    pending = await pg_repo.fetch_pending_notifications(limit=10)
+    assert len(pending) == 3
+    assert pending[0]["notification_type"] == "URGENT"
+    assert pending[1]["notification_type"] == "INVESTIGATION_UPDATE"
+    assert pending[2]["notification_type"] == "DIGEST"
 
     await worker.close()
 

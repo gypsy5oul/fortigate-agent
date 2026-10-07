@@ -1,6 +1,7 @@
 """Google Chat Cards v2 payload builder with strict HTML escaping and incident threading."""
 
 import html
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
 
@@ -158,4 +159,85 @@ def build_gchat_card(
         "text": plain_text,
         "cardsV2": [card_v2],
         "thread": {"threadKey": incident_id},
+    }
+
+
+def build_digest_gchat_card(
+    digest_data: Dict[str, Any],
+    grafana_base_url: str = "https://grafana.6dcorp.internal",
+    datasource_uid: str = "loki",
+) -> Dict[str, Any]:
+    """Render Google Chat Cards v2 payload for aggregated periodic DIGEST alerts."""
+    total_incidents = digest_data.get("total_incidents", 0)
+    sources = digest_data.get("counts_by_source", {})
+    targets = digest_data.get("counts_by_target", {})
+    rules = digest_data.get("counts_by_rule", {})
+
+    top_sources = sorted(sources.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_targets = sorted(targets.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_rules = sorted(rules.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    src_text = ", ".join(f"{html.escape(s)} ({c})" for s, c in top_sources) or "None"
+    dst_text = ", ".join(f"{html.escape(t)} ({c})" for t, c in top_targets) or "None"
+    rule_text = ", ".join(f"{html.escape(r)} ({c})" for r, c in top_rules) or "None"
+
+    explore_url = f"{grafana_base_url.rstrip('/')}/explore?left=%5B%22now-1h%22,%22now%22,%22{datasource_uid}%22,%7B%22expr%22:%22%7Bservice_name%3D%5C%22forticlient%5C%22%7D%22%7D%5D"
+
+    card_v2 = {
+        "cardId": f"forti_digest_{int(digest_data.get('since', datetime.now(timezone.utc)).timestamp()) if hasattr(digest_data.get('since'), 'timestamp') else 0}",
+        "card": {
+            "header": {
+                "title": "🛡️ FortiGate Security Activity Digest",
+                "subtitle": f"Aggregated {total_incidents} events in interval • FortiGate DPI Monitor",
+            },
+            "sections": [
+                {
+                    "widgets": [
+                        {
+                            "decoratedText": {
+                                "topLabel": "Active Scanner & Low-Severity Sources",
+                                "text": src_text,
+                            }
+                        },
+                        {
+                            "decoratedText": {
+                                "topLabel": "Target Destinations / VIPs",
+                                "text": dst_text,
+                            }
+                        },
+                        {
+                            "decoratedText": {
+                                "topLabel": "Triggered Security Rules",
+                                "text": rule_text,
+                            }
+                        },
+                        {
+                            "buttonList": {
+                                "buttons": [
+                                    {
+                                        "text": "View Activity in Grafana",
+                                        "onClick": {"openLink": {"url": explore_url}}
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ],
+        },
+    }
+
+    plain_text = (
+        f"[DIGEST] FortiGate Security Activity Digest\n"
+        f"Total Events: {total_incidents}\n"
+        f"Top Sources: {src_text}\n"
+        f"Top Targets: {dst_text}\n"
+        f"Rules: {rule_text}\n"
+        f"Explore: {explore_url}"
+    )
+
+    return {
+        "text": plain_text,
+        "cardsV2": [card_v2],
+        "thread": {"threadKey": "FORTIGATE-PERIODIC-DIGEST"},
     }

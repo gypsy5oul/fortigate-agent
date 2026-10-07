@@ -21,8 +21,9 @@ from src.sources.checkpoints import PollerOrchestrator
 from src.correlator.session_aggregator import SessionAggregator
 from src.rules.engine import RuleEngine
 from src.investigation.schemas import IncidentPacket
+from src.investigation.eligibility import get_eligible_actions
 from src.investigation.adk_workflow import ADKInvestigationWorkflow
-from src.notifications.gchat_cards import build_gchat_card
+from src.notifications.gchat_cards import build_gchat_card, build_digest_gchat_card
 from src.notifications.outbox_worker import OutboxWorker
 from src.observability.metrics import (
     create_app,
@@ -129,7 +130,14 @@ class IntelligenceService:
             webhook_url=self.settings.gchat_webhook_url,
             dry_run=self.settings.gchat_dry_run,
             rate_limit_delay_seconds=self.settings.gchat_rate_limit_delay_seconds,
+            thread_by_incident=self.settings.gchat_thread_by_incident,
         )
+
+        self.service_state = {
+            "last_poller_success": 0.0,
+            "poll_interval_seconds": self.settings.loki_poll_interval_seconds,
+            "model_degraded": False,
+        }
 
         self.running = False
 
@@ -138,8 +146,16 @@ class IntelligenceService:
         await self.db.connect()
         self.running = True
 
+        # Restore open episodes on startup (B6)
+        try:
+            open_eps = await self.repo.load_open_episodes()
+            self.aggregator.load_open_episodes(open_eps)
+            logger.info("Restored %s open episodes from persistent database.", len(open_eps))
+        except Exception as e:
+            logger.warning("Failed to restore open episodes on startup: %s", e)
+
         # Start HTTP server for metrics and health checks
-        app = create_app(self.db)
+        app = create_app(self.db, service_state=self.service_state)
         server_config = uvicorn.Config(
             app=app,
             host="0.0.0.0",
@@ -154,11 +170,12 @@ class IntelligenceService:
         poller_task = asyncio.create_task(self._run_poller_loop())
         investigation_task = asyncio.create_task(self._run_investigation_loop())
         outbox_task = asyncio.create_task(self._run_outbox_loop())
+        digest_task = asyncio.create_task(self._run_digest_loop())
 
         logger.info("Service initialized. Running asynchronous supervision loops.")
 
         try:
-            await asyncio.gather(server_task, poller_task, investigation_task, outbox_task)
+            await asyncio.gather(server_task, poller_task, investigation_task, outbox_task, digest_task)
         except asyncio.CancelledError:
             logger.info("Service shutdown received.")
         finally:
@@ -187,6 +204,7 @@ class IntelligenceService:
                 POLLER_QUERY_DURATION.observe(duration)
                 RAW_LINES_TOTAL.inc(raw_count)
                 NORMALIZED_EVENTS_TOTAL.inc(saved_count)
+                self.service_state["last_poller_success"] = time.time()
 
                 # Drain durable inbox (all pending events in stable ascending order)
                 while self.running:
@@ -196,6 +214,10 @@ class IntelligenceService:
 
                     episodes = self.aggregator.process_events(pending_events)
                     INCIDENTS_ACTIVE.set(len(episodes))
+                    try:
+                        await self.repo.save_episodes(episodes)
+                    except Exception as ep_err:
+                        logger.warning("Failed to persist episodes to database: %s", ep_err)
                     pending_ids = [ev["id"] for ev in pending_events]
                     touched = {(ev.get("vd", "root"), ev.get("direction", "INBOUND"), ev["srcip"], ev["dstip"]) for ev in pending_events}
 
@@ -427,7 +449,7 @@ class IntelligenceService:
                     deterministic_reasons=rule_eval.get("reasons", []),
                     signatures=ep.get("signatures", []),
                     evidence_events=ep.get("events", []),
-                    action_catalog=[],
+                    action_catalog=get_eligible_actions(ep, configured_build=self.settings.fortios_build),
                 )
 
                 t0 = time.time()
@@ -494,6 +516,7 @@ class IntelligenceService:
                         "notification_type": "INVESTIGATION_UPDATE",
                         "payload": card_payload,
                     },
+                    model_run=getattr(assessment, "model_run", None),
                     expected_revision=trigger_rev,
                     fence_job_id=job_id,
                     fence_version_token=version_token,
@@ -518,6 +541,39 @@ class IntelligenceService:
                 logger.error("Error in outbox loop: %s", e)
 
             await asyncio.sleep(self.settings.gchat_rate_limit_delay_seconds)
+
+    async def _run_digest_loop(self):
+        """Periodically aggregates DIGEST-priority incidents into summary notifications (B6)."""
+        logger.info("Starting periodic DIGEST aggregation worker loop.")
+        interval_secs = max(5.0, self.settings.digest_interval_minutes * 60.0)
+        last_digest_time = datetime.now(timezone.utc)
+
+        while self.running:
+            try:
+                await asyncio.sleep(interval_secs)
+                if not self.running:
+                    break
+
+                now_dt = datetime.now(timezone.utc)
+                summary = await self.repo.get_digest_summary(last_digest_time)
+                if summary.get("total_incidents", 0) > 0:
+                    card_payload = build_digest_gchat_card(
+                        summary,
+                        grafana_base_url=self.settings.grafana_base_url,
+                        datasource_uid=self.settings.grafana_datasource_uid,
+                    )
+                    rev_ts = int(now_dt.timestamp())
+                    await self.repo.enqueue_notification(
+                        incident_id="DIGEST-PERIODIC",
+                        revision=rev_ts,
+                        notif_type="DIGEST",
+                        payload=card_payload,
+                    )
+                    logger.info("Queued periodic DIGEST notification with %s incidents", summary["total_incidents"])
+                    last_digest_time = now_dt
+            except Exception as e:
+                logger.error("Error in digest aggregation worker: %s", e, exc_info=True)
+                await asyncio.sleep(5.0)
 
 
 def main():

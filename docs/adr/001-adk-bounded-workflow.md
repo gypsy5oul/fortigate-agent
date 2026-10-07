@@ -1,20 +1,22 @@
-# ADR 001: Google ADK for Bounded Investigation Workflow
+# ADR 001: Bounded Investigation Workflow & Structured Output
 
 ## Status
-Accepted (6 October 2026)
+Accepted (6 October 2026; updated Phase B, 7 October 2026)
 
 ## Context
-We need an AI agent to investigate security events from FortiGate 200G firewall logs. Raw firewall volume is too high for direct LLM ingestion, and arbitrary agent autonomy (unconstrained swarms, shell execution, database manipulation) poses security and reliability risks. The runtime investigation model is a local Qwen3.8-27B served via vLLM.
+We need automated investigation of security incidents derived from FortiGate 200G firewall logs. Raw firewall volume is too high for direct LLM ingestion, and arbitrary agent autonomy (unconstrained swarms, shell execution, database manipulation) poses security and reliability risks. The runtime investigation model is a local Qwen3.8-27B served via vLLM (`http://10.0.6.31:8000/v1`).
 
 ## Decision
-1. Use Google ADK (`google-adk 1.18.0`) to define a bounded, deterministic investigation workflow:
-   `Deterministic Packet Assembly` -> `ADK Qwen Analysis` -> `Pydantic Schema Validation` -> `DB Outbox Commit`.
-2. Do not install or use LangChain Deep Agents, unconstrained agent swarms, critic loops, or arbitrary tool-execution agents.
-3. Integrate with the local vLLM endpoint (`http://10.0.6.31:8000/v1`) using an OpenAI-compatible adapter.
-4. Strictly enforce `visibility_scope=FIREWALL_ONLY` and prevent hallucinations of application compromise (`CONFIRMED_COMPROMISE` is forbidden in v1 schema).
-5. Deterministic rule evaluation sets a severity floor that Qwen cannot lower. If Qwen fails or times out, deterministic alerts are dispatched without disruption.
+1. Implement a bounded, single-pass investigation workflow:
+   `Deterministic Packet Assembly & Redaction` -> `Structured LLM Analysis` -> `Pydantic Schema & Security Guardrail Validation` -> `Transactional DB & Outbox Commit`.
+2. Do not install unconstrained agent swarms, arbitrary tool loops, or unverified agent runtimes. In Phase B, the model is invoked via structured JSON schema (`response_format={"type": "json_schema", ...}`) with a 1-repair prompt loop and deterministic fallback. Full Google ADK tool-calling agent is scoped for Phase C following a formal compatibility spike.
+3. Integrate with the local vLLM OpenAI-compatible endpoint with temperature 0.1 and strict per-request token limits.
+4. Strictly enforce `visibility_scope=FIREWALL_ONLY` and prevent unsupported claims of application or endpoint compromise (`CONFIRMED_COMPROMISE` is strictly rejected; downgraded to `ATTEMPT_OBSERVED`).
+5. Deterministic rule evaluation sets a severity floor that the model cannot lower. If the model fails or times out, deterministic alerts are dispatched without disruption.
+6. Untrusted attacker text (URLs, headers, payloads) is delimited with `<<UNTRUSTED id=...>>` to contain prompt injection.
 
 ## Consequences
-- Predictable execution latency (< 3s total investigation time).
-- No cloud dependencies or telemetry leaks.
-- Zero risk of hallucinated actions or uncontrolled tool loops.
+- Bounded execution latency governed by strict network deadlines (90 s deadline) and single repair retry.
+- All model runs are audited in the `model_runs` table with token counts, prompt versions, schema versions, and hashes.
+- External model outages degrade gracefully: deterministic severity floors deliver without interruption.
+- No external cloud dependencies or third-party telemetry leaks.

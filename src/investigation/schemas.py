@@ -1,7 +1,7 @@
 """Pydantic schemas and guardrails for bounded ADK investigation."""
 
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, PrivateAttr
 
 VisibilityScope = Literal["FIREWALL_ONLY"]
 SeverityLevel = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
@@ -47,6 +47,15 @@ class QwenAssessment(BaseModel):
     analyst_follow_up: List[str] = Field(default_factory=list, max_length=5)
     model_reported_enforcement: Optional[str] = Field(default=None)
     assessment_source: Optional[str] = Field(default="DETERMINISTIC")
+    _model_run: Optional[dict] = PrivateAttr(default=None)
+
+    @property
+    def model_run(self) -> Optional[dict]:
+        return self._model_run
+
+    @model_run.setter
+    def model_run(self, val: Optional[dict]):
+        self._model_run = val
 
 
 class IncidentPacket(BaseModel):

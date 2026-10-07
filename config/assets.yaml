@@ -1,13 +1,14 @@
 version: "1.0.0"
+
 vips:
   - public_ip: "10.0.14.120"
-    target_app: "Corporate Gateway / Portal"
+    application: "Corporate Gateway / Portal"
     environment: "production"
     criticality: "HIGH"
     owner: "DevOps Team"
 
   - public_ip: "10.0.20.150"
-    target_app: "Loki / Observability Cluster"
+    application: "Loki / Observability Cluster"
     environment: "infrastructure"
     criticality: "CRITICAL"
     owner: "Infra Team"
@@ -16,8 +17,29 @@ trusted_networks:
   - cidr: "127.0.0.0/8"
     description: "Loopback"
   - cidr: "10.0.0.0/8"
-    description: "Internal RFC1918 Private Subnet"
+    description: "Internal RFC1918 Private Subnet (10/8)"
+  - cidr: "172.16.0.0/12"
+    description: "Internal RFC1918 Private Subnet (172.16/12)"
+  - cidr: "192.168.0.0/16"
+    description: "Internal RFC1918 Private Subnet (192.168/16)"
+
+nat_cdn_ranges:
+  - cidr: "104.16.0.0/12"
+    description: "Cloudflare Shared CDN Egress"
+  - cidr: "199.27.128.0/21"
+    description: "Fastly CDN Egress"
+  - cidr: "198.51.100.200/32"
+    description: "Shared NAT Gateway Egress"
 
 approved_scanners:
   - cidr: "192.168.100.50/32"
-    description: "Internal Vulnerability Scanner"
+    owner: "SecOps Team"
+    reason: "Authorized weekly vulnerability scan"
+    scope: "Corporate DMZ"
+    expiry: "2099-12-31T23:59:59Z"
+
+  - cidr: "198.51.100.77/32"
+    owner: "PenTest Vendor"
+    reason: "Annual penetration test"
+    scope: "Perimeter VIPs"
+    expiry: "2025-01-01T00:00:00Z"

@@ -1,5 +1,5 @@
 # Production runtime dependencies for FortiGate Firewall Intelligence Service
-# Pinned exact versions without range specs (google-adk deferred to Phase C)
+# Dropped range specs and unused dependencies (google-adk deferred to Phase C)
 pydantic==2.12.5
 pydantic-settings==2.11.0
 pyyaml==6.0.3

@@ -33,6 +33,11 @@ class Repository:
         row = await self.db.fetch_one(query, stream_name)
         if row:
             return row["last_queried_ts_ns"]
+        if "#" not in stream_name:
+            prefix_query = "SELECT last_queried_ts_ns FROM query_checkpoints WHERE stream_name LIKE $1 ORDER BY updated_at DESC LIMIT 1"
+            row = await self.db.fetch_one(prefix_query, f"{stream_name}#%")
+            if row:
+                return row["last_queried_ts_ns"]
         return None
 
     async def save_checkpoint(self, stream_name: str, ts_ns: int):
@@ -68,7 +73,11 @@ class Repository:
 
     async def get_coverage_gaps(self, stream_name: str) -> List[Dict[str, Any]]:
         query = "SELECT * FROM coverage_gaps WHERE stream_name = $1 ORDER BY start_ts_ns ASC"
-        return await self.db.fetch_all(query, stream_name)
+        rows = await self.db.fetch_all(query, stream_name)
+        if not rows and "#" not in stream_name:
+            prefix_query = "SELECT * FROM coverage_gaps WHERE stream_name LIKE $1 ORDER BY start_ts_ns ASC"
+            rows = await self.db.fetch_all(prefix_query, f"{stream_name}#%")
+        return rows
 
     # --- Selected Events (Deduplicated with Accurate Counts) ---
     async def save_events(self, events: List[Dict[str, Any]]) -> int:
@@ -416,6 +425,7 @@ class Repository:
         revision: Optional[Dict[str, Any]] = None,
         notification: Optional[Dict[str, Any]] = None,
         job: Optional[Dict[str, Any]] = None,
+        model_run: Optional[Dict[str, Any]] = None,
         processed_event_ids: Optional[List[str]] = None,
         expected_revision: Optional[int] = None,
         fence_job_id: Optional[str] = None,
@@ -664,27 +674,94 @@ class Repository:
                         assessment_src,
                     )
 
+            # 4b. Record model_runs audit row if provided
+            if model_run:
+                m_run = dict(model_run)
+                m_reason_codes = m_run.get("reason_codes", [])
+                if isinstance(m_reason_codes, set):
+                    m_reason_codes = list(m_reason_codes)
+
+                if self.db.is_sqlite:
+                    m_query = """
+                    INSERT INTO model_runs (
+                        incident_id, revision, model_id, server_reported_model,
+                        prompt_version, schema_version, rule_pack_version, catalog_version,
+                        action_map_version, input_hash, input_tokens, output_tokens,
+                        latency_ms, structured_output_mode, validation_result, reason_codes
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    """
+                    await tx.execute(
+                        m_query,
+                        incident["id"],
+                        new_rev,
+                        m_run.get("model_id", "qwen3.8-27b"),
+                        m_run.get("server_reported_model"),
+                        m_run.get("prompt_version", "1.0.0"),
+                        m_run.get("schema_version", "1.0.0"),
+                        m_run.get("rule_pack_version", "1.0.0"),
+                        m_run.get("catalog_version", "1.0.0"),
+                        m_run.get("action_map_version", "1.0.0"),
+                        m_run.get("input_hash", ""),
+                        m_run.get("input_tokens", 0),
+                        m_run.get("output_tokens", 0),
+                        m_run.get("latency_ms", 0),
+                        m_run.get("structured_output_mode", "json_schema"),
+                        m_run.get("validation_result", "VALID"),
+                        json.dumps(m_reason_codes),
+                    )
+                else:
+                    m_query = """
+                    INSERT INTO model_runs (
+                        incident_id, revision, model_id, server_reported_model,
+                        prompt_version, schema_version, rule_pack_version, catalog_version,
+                        action_map_version, input_hash, input_tokens, output_tokens,
+                        latency_ms, structured_output_mode, validation_result, reason_codes
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    """
+                    await tx.execute(
+                        m_query,
+                        incident["id"],
+                        new_rev,
+                        m_run.get("model_id", "qwen3.8-27b"),
+                        m_run.get("server_reported_model"),
+                        m_run.get("prompt_version", "1.0.0"),
+                        m_run.get("schema_version", "1.0.0"),
+                        m_run.get("rule_pack_version", "1.0.0"),
+                        m_run.get("catalog_version", "1.0.0"),
+                        m_run.get("action_map_version", "1.0.0"),
+                        m_run.get("input_hash", ""),
+                        m_run.get("input_tokens", 0),
+                        m_run.get("output_tokens", 0),
+                        m_run.get("latency_ms", 0),
+                        m_run.get("structured_output_mode", "json_schema"),
+                        m_run.get("validation_result", "VALID"),
+                        m_reason_codes,
+                    )
+
             # 5. Enqueue notification if provided
             if notification:
+                n_type = notification["notification_type"]
+                prio = 10 if "URGENT" in n_type else (20 if "INVESTIGATION" in n_type else 50)
                 n_payload = json.dumps(notification["payload"], default=str)
                 if self.db.is_sqlite:
                     notif_query = """
-                    INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status)
-                    VALUES ($1, $2, $3, $4, 'PENDING')
+                    INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status, type_priority)
+                    VALUES ($1, $2, $3, $4, 'PENDING', $5)
                     ON CONFLICT(incident_id, revision, notification_type) DO NOTHING
                     """
                 else:
                     notif_query = """
-                    INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status)
-                    VALUES ($1, $2, $3, $4::jsonb, 'PENDING')
+                    INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status, type_priority)
+                    VALUES ($1, $2, $3, $4::jsonb, 'PENDING', $5)
                     ON CONFLICT (incident_id, revision, notification_type) DO NOTHING
                     """
                 await tx.execute(
                     notif_query,
                     incident["id"],
                     new_rev,
-                    notification["notification_type"],
+                    n_type,
                     n_payload,
+                    prio,
                 )
 
             # 6. Enqueue job if provided
@@ -914,22 +991,37 @@ class Repository:
     # --- Notification Outbox ---
     async def enqueue_notification(self, incident_id: str, revision: int, notif_type: str, payload: Dict[str, Any]):
         payload_str = json.dumps(payload, default=str)
+        prio = 10 if "URGENT" in notif_type else (20 if "INVESTIGATION" in notif_type else 50)
         if self.db.is_sqlite:
             query = """
-            INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status)
-            VALUES ($1, $2, $3, $4, 'PENDING')
+            INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status, type_priority)
+            VALUES ($1, $2, $3, $4, 'PENDING', $5)
             ON CONFLICT(incident_id, revision, notification_type) DO NOTHING
             """
         else:
             query = """
-            INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status)
-            VALUES ($1, $2, $3, $4::jsonb, 'PENDING')
+            INSERT INTO notification_outbox (incident_id, revision, notification_type, payload_json, status, type_priority)
+            VALUES ($1, $2, $3, $4::jsonb, 'PENDING', $5)
             ON CONFLICT (incident_id, revision, notification_type) DO NOTHING
             """
-        await self.db.execute(query, incident_id, revision, notif_type, payload_str)
+        await self.db.execute(query, incident_id, revision, notif_type, payload_str, prio)
 
     async def fetch_pending_notifications(self, limit: int = 10) -> List[Dict[str, Any]]:
-        query = "SELECT * FROM notification_outbox WHERE status = 'PENDING' ORDER BY id ASC LIMIT $1"
+        """Fetch pending notifications ordered strictly by priority (urgent first) and retry availability."""
+        if self.db.is_sqlite:
+            query = """
+            SELECT * FROM notification_outbox
+            WHERE status = 'PENDING' AND (retry_after_ts IS NULL OR retry_after_ts <= CURRENT_TIMESTAMP)
+            ORDER BY type_priority ASC, id ASC
+            LIMIT $1
+            """
+        else:
+            query = """
+            SELECT * FROM notification_outbox
+            WHERE status = 'PENDING' AND (retry_after_ts IS NULL OR retry_after_ts <= NOW())
+            ORDER BY type_priority ASC, id ASC
+            LIMIT $1
+            """
         rows = await self.db.fetch_all(query, limit)
         for r in rows:
             if isinstance(r["payload_json"], str):
@@ -952,19 +1044,183 @@ class Repository:
             query = "UPDATE notification_outbox SET status = 'SIMULATED', sent_at = NOW() WHERE id = $1"
         await self.db.execute(query, outbox_id)
 
-    async def mark_notification_failed(self, outbox_id: int, error_msg: str):
+    async def mark_notification_failed(
+        self,
+        outbox_id: int,
+        error_msg: str,
+        retry_after_seconds: Optional[float] = None,
+        dead_letter: bool = False,
+    ):
+        """Mark notification failure with exponential backoff or immediate dead-letter."""
+        delay = max(1.0, float(retry_after_seconds or 30.0))
+        if self.db.is_sqlite:
+            if dead_letter:
+                query = "UPDATE notification_outbox SET attempts = attempts + 1, last_error = $1, status = 'DEAD_LETTER' WHERE id = $2"
+                await self.db.execute(query, error_msg[:500], outbox_id)
+            else:
+                query = """
+                UPDATE notification_outbox
+                SET attempts = attempts + 1, last_error = $1,
+                    status = CASE WHEN attempts >= 10 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+                    retry_after_ts = datetime(CURRENT_TIMESTAMP, '+' || $2 || ' seconds')
+                WHERE id = $3
+                """
+                await self.db.execute(query, error_msg[:500], int(delay), outbox_id)
+        else:
+            if dead_letter:
+                query = "UPDATE notification_outbox SET attempts = attempts + 1, last_error = $1, status = 'DEAD_LETTER' WHERE id = $2"
+                await self.db.execute(query, error_msg[:500], outbox_id)
+            else:
+                query = """
+                UPDATE notification_outbox
+                SET attempts = attempts + 1, last_error = $1,
+                    status = CASE WHEN attempts >= 10 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+                    retry_after_ts = NOW() + ($2 || ' seconds')::interval
+                WHERE id = $3
+                """
+                await self.db.execute(query, error_msg[:500], str(int(delay)), outbox_id)
+
+    # --- Episode Persistence (B6) ---
+    async def save_episodes(self, episodes: List[Dict[str, Any]]):
+        """Persist or update episodes in the episodes table."""
+        if not episodes:
+            return
+        for ep in episodes:
+            ep_id = ep.get("episode_id") or ep.get("id") or f"{ep.get('vdom', 'root')}:{ep.get('source_ip')}->{ep.get('target_ip')}"
+            first_dt = ep.get("first_seen")
+            last_dt = ep.get("last_seen")
+            first_str = first_dt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(first_dt, datetime) else str(first_dt)
+            last_str = last_dt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(last_dt, datetime) else str(last_dt)
+            ev_ids = [str(x) for x in ep.get("evidence_ids", [])]
+            s_ids = [int(x) for x in ep.get("session_ids", [])]
+
+            if self.db.is_sqlite:
+                query = """
+                INSERT INTO episodes (
+                    id, vdom, direction, source_ip, target_ip, service,
+                    incident_id, status, first_seen, last_seen, last_event_ts_ns,
+                    event_count, enforcement, evidence_ids, session_ids, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    last_event_ts_ns = excluded.last_event_ts_ns,
+                    event_count = excluded.event_count,
+                    enforcement = excluded.enforcement,
+                    evidence_ids = excluded.evidence_ids,
+                    session_ids = excluded.session_ids,
+                    status = excluded.status,
+                    updated_at = CURRENT_TIMESTAMP
+                """
+                await self.db.execute(
+                    query,
+                    ep_id,
+                    ep.get("vdom", "root"),
+                    ep.get("direction", "INBOUND"),
+                    ep["source_ip"],
+                    ep["target_ip"],
+                    ep.get("service"),
+                    ep["incident_id"],
+                    ep.get("status", "OPEN"),
+                    first_str,
+                    last_str,
+                    ep.get("last_event_ts_ns", 0),
+                    ep.get("event_count", 1),
+                    ep.get("enforcement", "UNKNOWN"),
+                    json.dumps(ev_ids),
+                    json.dumps(s_ids),
+                )
+            else:
+                query = """
+                INSERT INTO episodes (
+                    id, vdom, direction, source_ip, target_ip, service,
+                    incident_id, status, first_seen, last_seen, last_event_ts_ns,
+                    event_count, enforcement, evidence_ids, session_ids, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    last_seen = EXCLUDED.last_seen,
+                    last_event_ts_ns = EXCLUDED.last_event_ts_ns,
+                    event_count = EXCLUDED.event_count,
+                    enforcement = EXCLUDED.enforcement,
+                    evidence_ids = EXCLUDED.evidence_ids,
+                    session_ids = EXCLUDED.session_ids,
+                    status = EXCLUDED.status,
+                    updated_at = NOW()
+                """
+                await self.db.execute(
+                    query,
+                    ep_id,
+                    ep.get("vdom", "root"),
+                    ep.get("direction", "INBOUND"),
+                    ep["source_ip"],
+                    ep["target_ip"],
+                    ep.get("service"),
+                    ep["incident_id"],
+                    ep.get("status", "OPEN"),
+                    first_dt if isinstance(first_dt, datetime) else to_utc_datetime(first_dt),
+                    last_dt if isinstance(last_dt, datetime) else to_utc_datetime(last_dt),
+                    ep.get("last_event_ts_ns", 0),
+                    ep.get("event_count", 1),
+                    ep.get("enforcement", "UNKNOWN"),
+                    ev_ids,
+                    s_ids,
+                )
+
+    async def load_open_episodes(self) -> List[Dict[str, Any]]:
+        """Fetch all currently open episodes from database to resume correlation state."""
+        query = "SELECT * FROM episodes WHERE status = 'OPEN'"
+        rows = await self.db.fetch_all(query)
+        res = []
+        for r in rows:
+            d = dict(r)
+            if self.db.is_sqlite:
+                if isinstance(d.get("evidence_ids"), str):
+                    d["evidence_ids"] = json.loads(d["evidence_ids"])
+                if isinstance(d.get("session_ids"), str):
+                    d["session_ids"] = json.loads(d["session_ids"])
+            res.append(d)
+        return res
+
+    async def get_digest_summary(self, since_dt: datetime) -> Dict[str, Any]:
+        """Aggregate DIGEST incidents into summary counts across sources, targets, and rules."""
         if self.db.is_sqlite:
             query = """
-            UPDATE notification_outbox
-            SET attempts = attempts + 1, last_error = $1,
-                status = CASE WHEN attempts >= 5 THEN 'DEAD_LETTER' ELSE 'PENDING' END
-            WHERE id = $2
+            SELECT source_ip, target_ip, deterministic_rule_ids, deterministic_severity, event_count
+            FROM incidents
+            WHERE updated_at >= $1
             """
+            rows = await self.db.fetch_all(query, since_dt.strftime("%Y-%m-%d %H:%M:%S"))
         else:
             query = """
-            UPDATE notification_outbox
-            SET attempts = attempts + 1, last_error = $1,
-                status = CASE WHEN attempts >= 5 THEN 'DEAD_LETTER' ELSE 'PENDING' END
-            WHERE id = $2
+            SELECT source_ip, target_ip, deterministic_rule_ids, deterministic_severity, event_count
+            FROM incidents
+            WHERE updated_at >= $1
             """
-        await self.db.execute(query, error_msg[:500], outbox_id)
+            rows = await self.db.fetch_all(query, since_dt)
+
+        counts_by_source: Dict[str, int] = defaultdict(int)
+        counts_by_target: Dict[str, int] = defaultdict(int)
+        counts_by_rule: Dict[str, int] = defaultdict(int)
+
+        for r in rows:
+            src = r["source_ip"]
+            dst = r["target_ip"]
+            counts_by_source[src] += r.get("event_count", 1)
+            counts_by_target[dst] += r.get("event_count", 1)
+            rules_raw = r["deterministic_rule_ids"]
+            if isinstance(rules_raw, str):
+                try:
+                    rules_list = json.loads(rules_raw)
+                except Exception:
+                    rules_list = [rules_raw]
+            else:
+                rules_list = rules_raw or []
+            for r_id in rules_list:
+                counts_by_rule[r_id] += 1
+
+        return {
+            "since": since_dt,
+            "total_incidents": len(rows),
+            "counts_by_source": dict(counts_by_source),
+            "counts_by_target": dict(counts_by_target),
+            "counts_by_rule": dict(counts_by_rule),
+        }

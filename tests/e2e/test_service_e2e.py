@@ -148,9 +148,11 @@ async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean):
     assert latest_cp is not None
     assert latest_cp > 0
 
-    # 2. Database Event Counts Equal Ground Truth
+    # 2. Database Event Counts Equal Ground Truth (Zero accepted traffic mirrored per Brief B1)
     events_in_db = await pg_clean.fetch_all("SELECT id, raw_message FROM selected_events")
-    assert len(events_in_db) == expected_event_count
+    accepted_rows = [e for e in events_in_db if 'action="accept"' in e["raw_message"] or 'action="close"' in e["raw_message"]]
+    assert len(accepted_rows) == 0, f"Expected 0 accepted traffic rows in PostgreSQL, found {len(accepted_rows)}"
+    assert len(events_in_db) == 15, f"Expected 15 security events in PostgreSQL, found {len(events_in_db)}"
 
     # 3. Verify Scenario 1: Benign host (10.0.1.5 -> 1.1.1.1)
     # No urgent incidents or alerts

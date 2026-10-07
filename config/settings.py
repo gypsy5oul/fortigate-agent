@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     gchat_dry_run: bool = Field(default=True, description="When True, logs cards without making HTTP calls")
     gchat_rate_limit_delay_seconds: float = Field(default=2.0, description="Delay between consecutive outbox deliveries")
     gchat_thread_by_incident: bool = Field(default=True, description="Group incident revisions under the same thread")
+    digest_interval_minutes: int = Field(default=60, description="Interval in minutes for periodic DIGEST aggregation")
+    loki_query_profile: Optional[str] = Field(default=None, description="Optional named LogQL query profile")
 
     # FortiOS Actions & Recommendations
     cli_recommendations_enabled: bool = Field(default=False, description="Enable FortiOS CLI command recommendations")

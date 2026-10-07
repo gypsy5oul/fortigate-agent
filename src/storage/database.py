@@ -146,6 +146,8 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     notification_type TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'PENDING',
+    type_priority INTEGER DEFAULT 50,
+    retry_after_ts TIMESTAMP,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     sent_at TIMESTAMP,
@@ -154,6 +156,51 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox(status, created_at);
+
+CREATE TABLE IF NOT EXISTS model_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    model_id TEXT NOT NULL,
+    server_reported_model TEXT,
+    prompt_version TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    rule_pack_version TEXT NOT NULL,
+    catalog_version TEXT NOT NULL,
+    action_map_version TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    structured_output_mode TEXT NOT NULL DEFAULT 'json_schema',
+    validation_result TEXT NOT NULL,
+    reason_codes TEXT DEFAULT '[]',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_runs_inc_rev ON model_runs(incident_id, revision);
+
+CREATE TABLE IF NOT EXISTS episodes (
+    id TEXT PRIMARY KEY,
+    vdom TEXT NOT NULL DEFAULT 'root',
+    direction TEXT NOT NULL DEFAULT 'UNKNOWN',
+    source_ip TEXT NOT NULL,
+    target_ip TEXT NOT NULL,
+    service TEXT,
+    incident_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN',
+    first_seen TIMESTAMP NOT NULL,
+    last_seen TIMESTAMP NOT NULL,
+    last_event_ts_ns INTEGER NOT NULL,
+    event_count INTEGER NOT NULL DEFAULT 1,
+    enforcement TEXT NOT NULL,
+    evidence_ids TEXT DEFAULT '[]',
+    session_ids TEXT DEFAULT '[]',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodes_open ON episodes(status, vdom, direction, source_ip, target_ip);
 """
 
 

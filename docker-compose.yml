@@ -27,6 +27,20 @@ services:
       dockerfile: Dockerfile
     container_name: forti-intel-agent
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /app/data:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,9 +59,7 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./src:/app/src:ro
-      - ./tests:/app/tests:ro
-      - ./pytest.ini:/app/pytest.ini:ro
-      - /etc/pki/tls/certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+      - ${CA_BUNDLE_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
     networks:
       - forti_net
 

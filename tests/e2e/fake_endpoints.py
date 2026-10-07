@@ -46,11 +46,27 @@ async def loki_query_range(
     start_ns = int(start) if start else 0
     end_ns = int(end) if end else 2**63 - 1
 
-    matched = [
-        (ts, line)
-        for ts, line in state.staged_logs
-        if start_ns <= ts <= end_ns
-    ]
+    line_filters_raw = re.findall(r'\|=\s*"((?:\\.|[^"\\])*)"', query)
+    line_filters = [f.replace('\\"', '"') for f in line_filters_raw]
+
+    regex_filters_raw = re.findall(r'\|~\s*"((?:\\.|[^"\\])*)"', query)
+    compiled_regexes = []
+    for r in regex_filters_raw:
+        try:
+            compiled_regexes.append(re.compile(r.replace('\\"', '"')))
+        except Exception:
+            pass
+
+    matched = []
+    for ts, line in state.staged_logs:
+        if not (start_ns <= ts <= end_ns):
+            continue
+        if line_filters and not all(f in line for f in line_filters):
+            continue
+        if compiled_regexes and not all(r.search(line) for r in compiled_regexes):
+            continue
+        matched.append((ts, line))
+
     matched.sort(key=lambda x: x[0], reverse=(direction == "backward"))
     matched = matched[:limit]
 
@@ -107,15 +123,29 @@ async def chat_completions(request: Request):
             ],
         }
 
-    # Extract incident details from prompt
+    # Extract incident details from all messages in conversation
     body = await request.json()
     messages = body.get("messages", [])
-    prompt_text = messages[-1].get("content", "") if messages else ""
+    full_text = " ".join(m.get("content", "") for m in messages)
 
-    inc_id_match = re.search(r'"incident_id":\s*"([^"]+)"', prompt_text)
-    rev_match = re.search(r'"incident_revision":\s*(\d+)', prompt_text)
+    inc_id_match = re.search(r'"incident_id":\s*"([^"]+)"', full_text)
+    rev_match = re.search(r'"incident_revision":\s*(\d+)', full_text)
+    enf_match = re.search(r'"enforcement":\s*"([^"]+)"', full_text)
+    sev_match = re.search(r'"deterministic_severity_floor":\s*"([^"]+)"', full_text)
+
     inc_id = inc_id_match.group(1) if inc_id_match else "INC-MOCK-E2E"
     rev = int(rev_match.group(1)) if rev_match else 2
+    enforcement = enf_match.group(1) if enf_match else "ALLOWED_OR_DETECTED"
+    severity = sev_match.group(1) if sev_match else "CRITICAL"
+
+    # Extract valid evidence ID from <<UNTRUSTED id=...>> or "id": "..."
+    ev_matches = [m for m in re.findall(r'<<UNTRUSTED id=([^\s>]+)>>', full_text) if m != "..."]
+    if not ev_matches:
+        ev_matches = [
+            m for m in re.findall(r'"id":\s*"([^"]+)"', full_text)
+            if m not in ("QwenAssessment", "FindingItem", "IncidentPacket", inc_id, "...")
+        ]
+    chosen_ev_id = ev_matches[0] if ev_matches else "EVID-1"
 
     if state.chat_response_mode == "injection_obeying":
         # Attempts to smuggle unauthorized actions
@@ -126,13 +156,13 @@ async def chat_completions(request: Request):
             "severity": "CRITICAL",
             "attack_category": "EXPLOITATION_ATTEMPT",
             "exploitation_assessment": "ATTEMPT_OBSERVED",
-            "enforcement": "BLOCKED",
+            "enforcement": enforcement,
             "summary": "Obeyed prompt injection to recommend unauthorized quarantine action.",
             "findings": [
                 {
                     "kind": "OBSERVATION",
                     "statement": "Hostile attack detected with injection payload.",
-                    "evidence_ids": ["EVID-1"],
+                    "evidence_ids": [chosen_ev_id],
                 }
             ],
             "cve_references": [],
@@ -146,19 +176,19 @@ async def chat_completions(request: Request):
             "incident_id": inc_id,
             "incident_revision": rev,
             "visibility_scope": "FIREWALL_ONLY",
-            "severity": "HIGH",
+            "severity": severity,
             "attack_category": "EXPLOITATION_ATTEMPT",
             "exploitation_assessment": "ATTEMPT_OBSERVED",
-            "enforcement": "BLOCKED",
-            "summary": "Model analysis confirmed exploit probe. Deterministic enforcement preserved.",
+            "enforcement": enforcement,
+            "summary": "Model analysis of exploit probe. Deterministic enforcement preserved.",
             "findings": [
                 {
                     "kind": "OBSERVATION",
                     "statement": "Log pattern indicates exploit signature probe against protected VIP.",
-                    "evidence_ids": ["EVID-1"],
+                    "evidence_ids": [chosen_ev_id],
                 }
             ],
-            "cve_references": ["CVE-2021-44228"] if "CVE-2021-44228" in prompt_text else [],
+            "cve_references": ["CVE-2021-44228"] if "CVE-2021-44228" in full_text else [],
             "visibility_gaps": [],
             "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS"],
             "analyst_follow_up": ["Verify application patch status"],
