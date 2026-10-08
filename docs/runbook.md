@@ -6,7 +6,7 @@ This operational runbook documents deployment procedures, failure modes, data ma
 
 ## 1. System Overview & Architecture
 
-The service runs as a containerized Python service alongside a dedicated PostgreSQL 16 database. It ingests FortiOS security syslog events from Grafana Loki, normalizes and correlates them into persistent attack episodes, evaluates deterministic security rules, selectively requests structured LLM investigations from local Qwen 2.5, and dispatches rate-limited Cards v2 alerts to Google Chat via an outbox worker.
+The service runs as a containerized Python service alongside a dedicated PostgreSQL 16 database. It ingests FortiOS security syslog events from Grafana Loki, normalizes and correlates them into persistent attack episodes, evaluates deterministic security rules, selectively requests one bounded structured investigation per incident revision from the local Qwen model served by vLLM (`LLM_MODEL`, default `qwen3.8-27b`), and dispatches rate-limited Cards v2 alerts to Google Chat via an outbox worker.
 
 ---
 
@@ -53,8 +53,8 @@ docker compose start app
 
 ### 3.1 Checkpoint Semantics
 Log ingestion cursors are durably stored in the `query_checkpoints` table keyed by profile stream keys (`<stream_selector>#<profile>@v<version>`):
-- **Monotonic Forward Progress**: The poller queries Loki in finite time slices (`LOKI_SLICE_SECONDS`, default 15s) and only advances `last_queried_ts_ns` upon successful persistence of events in PostgreSQL.
-- **Bootstrapping**: If no checkpoint exists, the service bootstraps looking back a default 600 seconds before current time (or seeds from an existing bare selector checkpoint).
+- **Monotonic Forward Progress**: The poller queries Loki in finite time slices (`LOKI_SLICE_SECONDS`, default 30 s) and only advances `last_queried_ts_ns` upon successful persistence of events in PostgreSQL.
+- **Bootstrapping**: If no checkpoint exists, the service bootstraps looking back 60 seconds before current time (or seeds from an existing bare selector checkpoint).
 
 ### 3.2 Implications After Database Restore
 Restoring a backup from $T_{\text{backup}}$ will roll back the checkpoint cursor in `query_checkpoints` to $T_{\text{backup}}$:
@@ -66,10 +66,12 @@ Restoring a backup from $T_{\text{backup}}$ will roll back the checkpoint cursor
 If an operator needs to deliberately replay or reprocess logs from a specific historical timestamp:
 
 ```sql
--- Rewind checkpoint for a specific stream profile to 2 hours ago (nanoseconds)
+-- Rewind the checkpoint of the live stream profile to 2 hours ago (nanoseconds).
+-- The key is <LOKI_SELECTOR>#<LOKI_QUERY_PROFILE>@v1; check it first with
+--   SELECT stream_name FROM query_checkpoints;
 UPDATE query_checkpoints
 SET last_queried_ts_ns = EXTRACT(EPOCH FROM (NOW() - INTERVAL '2 hours'))::BIGINT * 1000000000
-WHERE stream_name LIKE '%utm_detections%';
+WHERE stream_name = '{service_name="forticlient"}#security_events@v1';
 ```
 
 Restart the agent to begin historical ingestion:
@@ -82,24 +84,24 @@ docker compose restart app
 ## 4. Degraded Modes & Recovery
 
 ### 4.1 Loki Outage or Poller Lag
-- **Symptom**: Metric `forti_loki_last_success_age_seconds` exceeds 3× `LOKI_POLL_INTERVAL_SECONDS`. `/health/ready` reports HTTP 503 (`poller_lagging`).
-- **Behavior**: The poller logs an error and backs off using exponential jitter. Ingestion cursor remains at last committed nanosecond; no events are skipped.
+- **Symptom**: Metric `forti_loki_last_success_age_seconds` exceeds 3× `LOKI_POLL_INTERVAL_SECONDS`. `/health/ready` reports HTTP 503 with `{"status": "not_ready", "error": "Poller lag exceeded 3x interval"}`.
+- **Behavior**: The poller logs the error and retries on the next poll interval (`LOKI_POLL_INTERVAL_SECONDS`); there is no additional backoff. The ingestion cursor remains at the last committed nanosecond; no events are skipped.
 - **Action**: Check Loki read gateway availability and network connectivity (`ping loki.internal`). Once Loki is reachable, the poller automatically drains the lag in bounded slices.
 
 ### 4.2 Local LLM Gateway Outage
-- **Symptom**: Metric `forti_model_last_success_age_seconds` grows. `MODEL_FAILURES_TOTAL` increments.
+- **Symptom**: Metric `forti_model_last_success_age_seconds` grows; `forti_model_failures_total` and `forti_model_consecutive_failures` increase.
 - **Behavior**: The service enters **Degraded Mode** (advisory model failure).
   - Deterministic rules and severity floors continue to function without interruption.
   - Urgent alerts are dispatched with deterministic assessment.
-  - Investigation jobs trigger the deterministic fallback validator, recording `MODEL_FALLBACK` in `incident_revisions` and auditing the failure in `model_runs`.
-  - `/health/ready` reports `{"status": "degraded", "model": "degraded"}` with HTTP 200 (does not trigger container restarts).
+  - Investigation jobs trigger the deterministic fallback validator, recording `MODEL_REJECTED_FALLBACK` in `incident_revisions` and auditing the failure in `model_runs`.
+  - After 3 consecutive failures `/health/ready` reports HTTP 200 with `{"status": "degraded", "database": "connected", "note": "Model inference degraded; deterministic rules active"}` (does not trigger container restarts), and the `FortiGateModelDegraded` alert fires on `forti_model_consecutive_failures >= 3`.
 - **Action**: Verify vLLM service health and GPU memory utilization.
 
 ### 4.3 Google Chat Rate Limiting & Webhook Errors
-- **Symptom**: `OUTBOX_FAILURES_TOTAL` increments. Warnings logged by `outbox_worker`.
+- **Symptom**: `forti_outbox_failures_total` increments. Warnings logged by `outbox_worker`.
 - **Behavior**:
-  - **HTTP 429 (Rate Limit) & HTTP 408 (Request Timeout)**: Honors `Retry-After` header (HTTP date or integer seconds) or falls back to exponential backoff with jitter. Outbox rows remain `PENDING`.
-  - **Transient 5xx / 408 Errors**: Retried with exponential backoff up to 10 attempts (dead-letters after 10 attempts).
+  - **HTTP 429 (Rate Limit)**: Honors the `Retry-After` header (integer seconds or HTTP-date); without the header the row is retried after a fixed 3 s. Outbox rows remain `PENDING`.
+  - **HTTP 408, 5xx and network errors**: Retried with exponential backoff and jitter (`min(900, 30 x 2^attempts)` plus 0.5 to 3 s). A row is dead-lettered on its 10th failed attempt.
   - **Permanent 4xx Errors (400, 401, 403, 404)**: Immediately transitioned to `DEAD_LETTER` to prevent blocking the outbox queue.
   - **Priority Ordering**: URGENT (priority 10) alerts are dispatched before INVESTIGATION_UPDATE (priority 20) and DIGEST (priority 50).
 - **Action**:

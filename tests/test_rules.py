@@ -205,6 +205,7 @@ def test_restored_episode_evaluation(rule_engine):
         "enforcement_counts": {"ALLOWED_OR_DETECTED": 3},
         "event_count": 3,
         "signatures": ["CVE-2021-44228"],
+        "utm_subtypes": ["ips"],
         "restored": True,
         "events": [],  # No raw events in memory
     }
@@ -214,3 +215,92 @@ def test_restored_episode_evaluation(rule_engine):
     assert res["routing_outcome"] == "URGENT_ALERT_AND_INVESTIGATE"
     assert "CVE-2021-44228" in res["reasons"][0]
 
+
+
+def test_restored_episode_with_new_deny_keeps_exploit_rule(rule_engine):
+    """B.1 Defect A: after a restart the episode's stored signatures and enforcement counts
+    stay in force when new events arrive; one blocked probe must not reduce a CRITICAL
+    non-blocked exploit episode to a port-scan match."""
+    deny = normalize_event(
+        1791271950000000000,
+        'date=2026-10-08 time=12:02:00 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+        'subtype="forward" level="notice" vd="root" sessionid=500001 srcip=198.51.100.45 srcport=46000 '
+        'dstip=10.0.14.120 dstport=22 proto=6 service="SSH" action="deny" policyid=0',
+    )
+    assert deny is not None
+    restored_ep = {
+        "incident_id": "INC-RESTORED-002",
+        "source_ip": "198.51.100.45",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
+        "enforcement": "MIXED",
+        "enforcement_counts": {"BLOCKED": 13, "ALLOWED_OR_DETECTED": 1},
+        "event_count": 14,
+        "signatures": ["Apache.Log4j.Error.Log.Remote.Code.Execution"],
+        "utm_subtypes": ["ips"],
+        "services": ["HTTPS", "HTTP", "SSH"],
+        "target_ports": [443, 80, 22],
+        "restored": True,
+        "events": [deny],  # only the post-restart event is in memory
+    }
+    res = rule_engine.evaluate_episode(restored_ep)
+    assert "RULE_NONBLOCKED_EXPLOIT_ATTEMPT" in res["matched_rule_ids"]
+    assert "RULE_PORT_SCAN_MULTI_SERVICE" in res["matched_rule_ids"]
+    assert res["severity_floor"] == "CRITICAL"
+    assert res["routing_outcome"] == "URGENT_ALERT_AND_INVESTIGATE"
+    assert any("Apache.Log4j" in r for r in res["reasons"])
+
+
+def test_stored_evidence_does_not_invent_utm_for_pure_denies(rule_engine):
+    """A restored scanner episode (denies only, no signatures) still matches no UTM rule."""
+    deny = normalize_event(
+        1791271950000000000,
+        'date=2026-10-08 time=12:02:01 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+        'subtype="forward" level="notice" vd="root" sessionid=500002 srcip=198.51.100.99 srcport=46001 '
+        'dstip=10.0.14.120 dstport=8443 proto=6 service="HTTPS" action="deny" policyid=0',
+    )
+    restored_ep = {
+        "incident_id": "INC-RESTORED-003",
+        "source_ip": "198.51.100.99",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
+        "enforcement": "BLOCKED",
+        "enforcement_counts": {"BLOCKED": 12, "ALLOWED": 0, "ALLOWED_OR_DETECTED": 0, "SESSION_CLOSED": 0, "UNKNOWN": 0},
+        "event_count": 13,
+        "signatures": [],
+        "restored": True,
+        "events": [deny],
+    }
+    res = rule_engine.evaluate_episode(restored_ep)
+    assert "RULE_NONBLOCKED_EXPLOIT_ATTEMPT" not in res["matched_rule_ids"]
+    assert "RULE_MIXED_ENFORCEMENT_SEQUENCE" not in res["matched_rule_ids"]
+    assert "RULE_HIGH_FREQUENCY_SCANNER" in res["matched_rule_ids"]
+    assert res["severity_floor"] == "MEDIUM"
+
+
+def test_stored_subtypes_gate_subtype_specific_rules(rule_engine):
+    """Stored evidence from an antivirus episode must not satisfy the IPS/WAF or SSL rules."""
+    deny = normalize_event(
+        1791271950000000000,
+        'date=2026-10-08 time=12:02:02 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+        'subtype="forward" level="notice" vd="root" sessionid=500003 srcip=198.51.100.60 srcport=46002 '
+        'dstip=10.0.14.120 dstport=80 proto=6 service="HTTP" action="deny" policyid=0',
+    )
+    restored_av = {
+        "incident_id": "INC-RESTORED-004",
+        "source_ip": "198.51.100.60",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
+        "enforcement": "BLOCKED",
+        "enforcement_counts": {"BLOCKED": 2},
+        "event_count": 2,
+        "signatures": ["EICAR_Test_File"],
+        "utm_subtypes": ["virus"],
+        "restored": True,
+        "events": [deny],
+    }
+    res = rule_engine.evaluate_episode(restored_av)
+    assert "RULE_ANTIVIRUS_BLOCKED" in res["matched_rule_ids"]
+    assert "RULE_NONBLOCKED_EXPLOIT_ATTEMPT" not in res["matched_rule_ids"]
+    assert "RULE_SSL_INSPECTION_ANOMALY" not in res["matched_rule_ids"]
+    assert res["severity_floor"] == "MEDIUM"

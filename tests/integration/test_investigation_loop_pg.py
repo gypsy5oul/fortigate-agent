@@ -397,7 +397,7 @@ async def test_pg_unchanged_episode_poller_and_investigation_completion(pg_repo,
         analyst_follow_up=[],
     )
 
-    with patch.object(service.adk_workflow, "investigate_packet", new=AsyncMock(return_value=mock_assessment)):
+    with patch.object(service.investigation_workflow, "investigate_packet", new=AsyncMock(return_value=mock_assessment)):
         job = await service.repo.lease_next_job("worker-supervisor", lease_duration_seconds=90)
         assert job is not None
         assert job["id"] == f"JOB-{inc_id}-1"
@@ -407,7 +407,7 @@ async def test_pg_unchanged_episode_poller_and_investigation_completion(pg_repo,
         trigger_rev = payload.get("revision", 1)
         target_rev = trigger_rev + 1
 
-        assessment = await service.adk_workflow.investigate_packet(None)
+        assessment = await service.investigation_workflow.investigate_packet(None)
         await service.repo.record_incident_transition(
             incident={
                 "id": inc_id,

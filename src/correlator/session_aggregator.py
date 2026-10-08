@@ -1,5 +1,6 @@
 """Stateful correlation engine grouping security events into attack episodes with stable incident identity."""
 
+import json
 import time
 import hashlib
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ class Episode:
         self.events: List[Dict[str, Any]] = []
         self.seen_event_ids: Set[str] = set()
         self.signatures: Set[str] = set()
+        self.utm_subtypes: Set[str] = set()
         self.target_ports: Set[int] = set()
         self.services: Set[str] = {service} if service else set()
         self.enforcement_counts: Dict[str, int] = {
@@ -96,6 +98,11 @@ class Episode:
 
         log_type = event.get("log_type")
         action_norm = event.get("action_normalized", "UNKNOWN")
+
+        if log_type == "utm":
+            subtype = (event.get("subtype") or "").lower()
+            if subtype:
+                self.utm_subtypes.add(subtype)
 
         # UTM events that were blocked mark this sessionid as blocked
         if log_type == "utm" and action_norm == "BLOCKED" and sid is not None:
@@ -172,6 +179,7 @@ class Episode:
             "enforcement": self.overall_enforcement,
             "enforcement_counts": dict(self.enforcement_counts),
             "signatures": sorted(list(self.signatures)),
+            "utm_subtypes": sorted(list(self.utm_subtypes)),
             "events": self.events,
             "evidence_ids": [str(e["id"]) for e in self.events if "id" in e],
             "session_ids": sorted(list(self.session_ids)),
@@ -252,6 +260,16 @@ class SessionAggregator:
                     sigs = []
             if isinstance(sigs, (list, set)):
                 ep.signatures = set(sigs)
+
+            # Restore UTM subtypes seen (migration 005)
+            subtypes = rec.get("utm_subtypes")
+            if isinstance(subtypes, str):
+                try:
+                    subtypes = json.loads(subtypes)
+                except Exception:
+                    subtypes = []
+            if isinstance(subtypes, (list, set)):
+                ep.utm_subtypes = {str(s).lower() for s in subtypes if s}
 
             # Restore evidence IDs if present
             ev_ids = rec.get("evidence_ids")

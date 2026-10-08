@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     enforcement TEXT NOT NULL,
     enforcement_counts TEXT DEFAULT '{}',
     signatures TEXT DEFAULT '[]',
+    utm_subtypes TEXT DEFAULT '[]',
     evidence_ids TEXT DEFAULT '[]',
     session_ids TEXT DEFAULT '[]',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -286,6 +287,12 @@ class Database:
             self._sqlite_conn = await aiosqlite.connect(db_path)
             self._sqlite_conn.row_factory = aiosqlite.Row
             await self._sqlite_conn.executescript(SQLITE_SCHEMA)
+            # Dev-only SQLite files created before migration 005 lack this column.
+            try:
+                await self._sqlite_conn.execute("ALTER TABLE episodes ADD COLUMN utm_subtypes TEXT DEFAULT '[]'")
+                await self._sqlite_conn.commit()
+            except Exception:
+                pass
             await self._sqlite_conn.commit()
             logger.info("Initialized SQLite database: %s", db_path)
         else:

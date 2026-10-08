@@ -78,6 +78,21 @@ class RuleEngine:
         direction = (episode.get("direction") or "UNKNOWN").upper()
         source_ip = episode.get("source_ip", "")
 
+        # Cumulative evidence carried by the episode itself. The aggregator keeps
+        # ``signatures`` and ``enforcement_counts`` for every event it ever saw, while
+        # ``events`` holds at most 25 retained lines and is empty right after a restart.
+        # Every check below therefore combines the live event list with this evidence,
+        # so an episode is never judged on its newest event alone (B.1 Defect A).
+        stored_sigs = [s for s in (episode.get("signatures") or []) if s]
+        stored_subtypes = {str(s).lower() for s in (episode.get("utm_subtypes") or []) if s}
+        stored_counts = {
+            k: v for k, v in (episode.get("enforcement_counts") or {}).items()
+            if isinstance(v, (int, float)) and v > 0
+        }
+        # Subtypes and signatures only come from UTM logs; ALLOWED_OR_DETECTED is only
+        # produced by UTM logs.
+        stored_has_utm = bool(stored_subtypes) or bool(stored_sigs) or stored_counts.get("ALLOWED_OR_DETECTED", 0) > 0
+
         template_params: Dict[str, Any] = {
             "event_count": event_count,
             "source_ip": source_ip,
@@ -104,12 +119,7 @@ class RuleEngine:
         # 4. Required evidence presence
         req_ev = cond.get("required_evidence")
         if req_ev == "utm":
-            if episode.get("restored") and not events:
-                sigs = episode.get("signatures", [])
-                enf_counts = episode.get("enforcement_counts", {})
-                has_utm = bool(sigs) or any(k in enf_counts for k in ("ALLOWED_OR_DETECTED", "BLOCKED", "MIXED"))
-            else:
-                has_utm = any(ev.get("log_type") == "utm" for ev in events)
+            has_utm = any(ev.get("log_type") == "utm" for ev in events) or stored_has_utm
             if not has_utm:
                 return False, {}
 
@@ -118,54 +128,56 @@ class RuleEngine:
         req_subtypes = [s.lower() for s in cond.get("subtypes", [])]
 
         if req_type or req_subtypes:
-            if episode.get("restored") and not events:
-                sigs = episode.get("signatures", [])
-                if not sigs and req_type == "utm":
-                    return False, {}
-                if "enforcement" in cond:
-                    allowed_enfs = set(cond["enforcement"])
-                    enf_counts = episode.get("enforcement_counts", {})
-                    matched_enf = any(k in allowed_enfs for k, v in enf_counts.items() if v > 0)
-                    if not matched_enf and episode.get("enforcement") not in allowed_enfs:
-                        return False, {}
-                if sigs:
-                    template_params["signature"] = sigs[0]
-            else:
-                matching_events = []
-                for ev in events:
-                    if req_type and ev.get("log_type", "").lower() != req_type.lower():
-                        continue
-                    if req_subtypes and ev.get("subtype", "").lower() not in req_subtypes:
-                        continue
-                    matching_events.append(ev)
+            matching_events = []
+            for ev in events:
+                if req_type and ev.get("log_type", "").lower() != req_type.lower():
+                    continue
+                if req_subtypes and ev.get("subtype", "").lower() not in req_subtypes:
+                    continue
+                matching_events.append(ev)
 
-                if not matching_events:
-                    return False, {}
+            # Stored UTM subtypes and signatures stand in for UTM events that are no longer
+            # in the retained event list (evicted by the 25-line cap or lost across a
+            # restart). A rule that names subtypes needs one of them in the stored set.
+            stored_match = (
+                (req_type or "").lower() == "utm"
+                and (bool(stored_subtypes) or bool(stored_sigs))
+                and (not req_subtypes or bool(stored_subtypes & set(req_subtypes)))
+            )
+            if not matching_events and not stored_match:
+                return False, {}
 
-                # If rule specifies enforcement with type=utm, verify against matching UTM events
-                if "enforcement" in cond and req_type == "utm":
-                    allowed_enfs = set(cond["enforcement"])
-                    utm_enfs = {ev.get("action_normalized") for ev in matching_events}
-                    if not (allowed_enfs & utm_enfs):
-                        return False, {}
-                    # Capture signature from matching event
-                    for ev in matching_events:
-                        sig = ev.get("signature") or ev.get("attack") or ev.get("virus") or ev.get("vuln_name")
-                        if sig:
-                            template_params["signature"] = sig
-                            break
+            # If rule specifies enforcement with type=utm, verify against the UTM evidence
+            if "enforcement" in cond and req_type == "utm":
+                allowed_enfs = set(cond["enforcement"])
+                utm_enfs = {ev.get("action_normalized") for ev in matching_events}
+                if stored_match:
+                    utm_enfs |= set(stored_counts)
+                    if enforcement in allowed_enfs:
+                        utm_enfs.add(enforcement)
+                if not (allowed_enfs & utm_enfs):
+                    return False, {}
+            # Capture signature from a matching event, else from the stored evidence
+            for ev in matching_events:
+                sig = ev.get("signature") or ev.get("attack") or ev.get("virus") or ev.get("vuln_name")
+                if sig:
+                    template_params["signature"] = sig
+                    break
+            if template_params["signature"] == "exploit" and stored_sigs:
+                template_params["signature"] = stored_sigs[0]
         else:
             # 6. Episode-level enforcement check
             if "enforcement" in cond:
                 allowed_enfs = set(cond["enforcement"])
                 if enforcement == "MIXED" and "MIXED" in allowed_enfs:
-                    if episode.get("restored") and not events:
-                        enf_counts = episode.get("enforcement_counts", {})
-                        utm_blocked = enf_counts.get("BLOCKED", 0) > 0
-                        utm_allowed = enf_counts.get("ALLOWED_OR_DETECTED", 0) > 0
-                    else:
-                        utm_blocked = any(ev.get("log_type") == "utm" and ev.get("action_normalized") == "BLOCKED" for ev in events)
-                        utm_allowed = any(ev.get("log_type") == "utm" and ev.get("action_normalized") == "ALLOWED_OR_DETECTED" for ev in events)
+                    utm_blocked = (
+                        any(ev.get("log_type") == "utm" and ev.get("action_normalized") == "BLOCKED" for ev in events)
+                        or stored_counts.get("BLOCKED", 0) > 0
+                    )
+                    utm_allowed = (
+                        any(ev.get("log_type") == "utm" and ev.get("action_normalized") == "ALLOWED_OR_DETECTED" for ev in events)
+                        or stored_counts.get("ALLOWED_OR_DETECTED", 0) > 0
+                    )
                     if not (utm_blocked and utm_allowed):
                         return False, {}
                 elif enforcement not in allowed_enfs:

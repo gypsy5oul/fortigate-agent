@@ -16,7 +16,7 @@ Stores security-relevant events extracted from FortiGate syslog via Loki. Routin
 | `eventtime_ns` | `BIGINT` | Yes | - | High-precision FortiOS event timestamp if present in log line |
 | `devid` | `TEXT` | Yes | - | FortiGate device serial / identifier |
 | `vd` | `TEXT` | Yes | `'root'` | FortiOS Virtual Domain partition |
-| `direction` | `VARCHAR(16)` | Yes | `'UNKNOWN'` | Inferred traffic flow direction (`INBOUND`, `OUTBOUND`, `INTERNAL`, `UNKNOWN`) |
+| `direction` | `VARCHAR(16)` | Yes | `'UNKNOWN'` | Inferred traffic flow direction (`INBOUND`, `OUTBOUND`, `LATERAL`, `EXTERNAL`, `UNKNOWN`) |
 | `srcintfrole` | `TEXT` | Yes | - | Source interface role (e.g. `wan`, `lan`, `dmz`) |
 | `dstintfrole` | `TEXT` | Yes | - | Destination interface role (e.g. `wan`, `lan`, `dmz`) |
 | `logid` | `TEXT` | Yes | - | FortiOS 10-digit log message ID |
@@ -39,7 +39,7 @@ Stores security-relevant events extracted from FortiGate syslog via Loki. Routin
 | `http_method` | `VARCHAR(16)` | Yes | - | Sanitized and length-capped HTTP request method |
 | `severity_raw` | `TEXT` | Yes | - | Raw severity string reported in syslog line |
 | `raw_message` | `TEXT` | No | - | Untrusted original log message payload |
-| `processing_status` | `VARCHAR(16)` | No | `'PENDING'` | Ingest state (`PENDING`, `PROCESSED`, `FAILED`) |
+| `processing_status` | `VARCHAR(16)` | No | `'PENDING'` | Ingest state (`PENDING`, `PROCESSED`) |
 | `processed_at` | `TIMESTAMPTZ` | Yes | - | Timestamp when normalizer/correlator processed event |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Database record insertion timestamp |
 
@@ -51,7 +51,7 @@ Maintains monotonic log ingestion positions per query profile and Loki stream se
 | Column | Data Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | `SERIAL` | No | - | Primary key surrogate |
-| `stream_name` | `VARCHAR(256)` | No | - | Compound stream profile tag (`<selector>#<profile>@v<version>`) |
+| `stream_name` | `VARCHAR(256)` | No | - | Compound stream profile tag (`<selector>#<profile>@v<version>`); UNIQUE, the upsert key |
 | `last_queried_ts_ns` | `BIGINT` | No | - | Monotonically advancing upper boundary nanosecond timestamp from Loki |
 | `last_successful_run` | `TIMESTAMPTZ` | No | `NOW()` | Timestamp of last successful polling cycle |
 | `updated_at` | `TIMESTAMPTZ` | No | `NOW()` | Timestamp when the checkpoint was durably advanced |
@@ -68,7 +68,7 @@ Tracks unpolled or skipped Loki timestamp intervals resulting from network parti
 | `end_ts_ns` | `BIGINT` | No | - | Gap end timestamp in nanoseconds |
 | `stream_name` | `VARCHAR(128)` | No | - | Loki stream identifier |
 | `reason` | `TEXT` | No | - | Reason gap occurred (e.g. timeout, backoff abort) |
-| `resolved` | `BOOLEAN` | No | `FALSE` | Whether backfill worker has reprocessed the window |
+| `resolved` | `BOOLEAN` | No | `FALSE` | Reserved for a future backfill; nothing sets it today |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Gap creation timestamp |
 
 ---
@@ -92,7 +92,7 @@ Tracks active and closed attack episodes correlated over 30-minute campaign wind
 |---|---|---|---|---|
 | `id` | `VARCHAR(128)` | No | - | Primary key: SHA256 hex digest prefix (`EP-<hash>`) of `vdom\|direction\|src\|dst\|start` |
 | `vdom` | `VARCHAR(64)` | No | `'root'` | FortiOS Virtual Domain partition |
-| `direction` | `VARCHAR(16)` | No | `'UNKNOWN'` | Traffic direction (`INBOUND`, `OUTBOUND`, `INTERNAL`, `UNKNOWN`) |
+| `direction` | `VARCHAR(16)` | No | `'UNKNOWN'` | Traffic direction (`INBOUND`, `OUTBOUND`, `LATERAL`, `EXTERNAL`, `UNKNOWN`) |
 | `source_ip` | `VARCHAR(64)` | No | - | Adversary or originating host IP address |
 | `target_ip` | `VARCHAR(64)` | No | - | Protected target host or VIP address |
 | `service` | `VARCHAR(64)` | Yes | - | Primary targeted application service |
@@ -107,6 +107,7 @@ Tracks active and closed attack episodes correlated over 30-minute campaign wind
 | `session_ids` | `BIGINT[]` | Yes | `'{}'` | Array of FortiOS firewall session IDs associated with episode |
 | `enforcement_counts` | `JSONB` | Yes | `'{}'` | Cached count of events per enforcement category (`BLOCKED`, `ALLOWED_OR_DETECTED`) |
 | `signatures` | `TEXT[]` | Yes | `'{}'` | Cached list of threat signatures matched in episode |
+| `utm_subtypes` | `TEXT[]` | Yes | `'{}'` | UTM log subtypes seen in the episode (`ips`, `waf`, `virus`, `ssl`, ...), used with `signatures` and `enforcement_counts` to re-evaluate rules after a restart (migration 005) |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Record creation timestamp |
 | `updated_at` | `TIMESTAMPTZ` | No | `NOW()` | Record modification timestamp |
 
@@ -119,8 +120,8 @@ Top-level security incident entities representing actionable operational threats
 |---|---|---|---|---|
 | `id` | `VARCHAR(64)` | No | - | Primary key: deterministic incident identifier (`INC-<hash>`) |
 | `current_revision` | `INT` | No | `1` | Optimistic concurrency control revision counter |
-| `status` | `VARCHAR(32)` | No | `'ACTIVE'` | Incident lifecycle status (`ACTIVE`, `SUPPRESSED`, `CLOSED_TRUE_POSITIVE`, `CLOSED_FALSE_POSITIVE`) |
-| `severity` | `VARCHAR(16)` | No | - | Active severity floor (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`) |
+| `status` | `VARCHAR(32)` | No | `'ACTIVE'` | Incident lifecycle status; `ACTIVE` is the only value written today (suppression and closure are Phase D analyst actions) |
+| `severity` | `VARCHAR(16)` | No | - | Incident severity (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`); monotonic, never lowered by a re-evaluation or a model revision |
 | `enforcement` | `VARCHAR(32)` | No | - | Primary enforcement state (`ALLOWED_OR_DETECTED`, `BLOCKED`, `MIXED`) |
 | `exploitation_assessment` | `VARCHAR(32)` | No | `'INSUFFICIENT_EVIDENCE'` | Analyst/Model verdict (`ATTEMPT_OBSERVED`, `SUSPICIOUS_SEQUENCE`, `INSUFFICIENT_EVIDENCE`) |
 | `vd` | `VARCHAR(64)` | Yes | `'root'` | FortiOS VDOM |
@@ -151,7 +152,7 @@ Immutable audit history of all deterministic and model assessments per incident 
 | `id` | `SERIAL` | No | - | Primary key surrogate |
 | `incident_id` | `VARCHAR(64)` | No | - | Foreign key referencing `incidents(id)` |
 | `revision` | `INT` | No | - | Revision number (1 for initial deterministic, 2+ for investigation) |
-| `assessment_source` | `VARCHAR(32)` | No | `'DETERMINISTIC'` | Source of revision (`DETERMINISTIC`, `MODEL_VALIDATED`, `MODEL_REPAIRED`, `MODEL_REJECTED_FALLBACK`) |
+| `assessment_source` | `VARCHAR(32)` | Yes | `'DETERMINISTIC'` | Source of revision (`DETERMINISTIC`, `RATE_LIMITED`, `MODEL_VALIDATED`, `MODEL_REPAIRED`, `MODEL_REJECTED_FALLBACK`) |
 | `rule_ids` | `TEXT[]` | No | `'{}'` | Rules triggering this assessment |
 | `severity` | `VARCHAR(16)` | No | - | Assessed severity floor |
 | `enforcement` | `VARCHAR(32)` | No | - | Assessed enforcement |
@@ -169,10 +170,10 @@ Asynchronous investigation work queue leased by worker loops.
 | Column | Data Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | `VARCHAR(64)` | No | - | Primary key (`JOB-<incident_id>-<revision>`) |
-| `job_type` | `VARCHAR(64)` | No | - | Type of background job (`INVESTIGATION`, `DIGEST_BATCH`) |
+| `job_type` | `VARCHAR(64)` | No | - | Type of background job (`INVESTIGATE_INCIDENT`) |
 | `payload_json` | `JSONB` | No | - | Serialized job execution parameters and context |
 | `priority` | `INT` | No | `10` | Higher integer = higher priority |
-| `status` | `VARCHAR(32)` | No | `'PENDING'` | Lifecycle state (`PENDING`, `LEASED`, `COMPLETED`, `FAILED`, `SUPERSEDED`) |
+| `status` | `VARCHAR(32)` | No | `'PENDING'` | Lifecycle state (`PENDING`, `LEASED`, `COMPLETED`, `FAILED`) |
 | `attempts` | `INT` | No | `0` | Execution attempt count |
 | `max_attempts` | `INT` | No | `3` | Maximum retry threshold before permanent failure |
 | `lease_owner` | `VARCHAR(64)` | Yes | - | Unique worker process / task identifier holding the lease |
@@ -204,7 +205,7 @@ Complete audit trail for every LLM interaction, token usage, validation result, 
 | `output_tokens` | `INT` | No | `0` | Completion tokens generated |
 | `latency_ms` | `INT` | No | `0` | Model roundtrip latency in milliseconds |
 | `structured_output_mode` | `VARCHAR(32)` | No | `'json_schema'` | Mode used (`json_schema` or `json_object`) |
-| `validation_result` | `VARCHAR(32)` | No | - | Schema check result (`VALID`, `REPAIRED`, `INVALID`, `FALLBACK`) |
+| `validation_result` | `VARCHAR(32)` | No | - | Schema check result (`VALID`, `REPAIRED`, `REJECTED`, `TIMEOUT`, `ERROR`) |
 | `reason_codes` | `TEXT[]` | Yes | `'{}'` | Guardrail rule violations or validator downgrade reasons |
 | `commit_status` | `VARCHAR(32)` | No | `'COMMITTED'` | State of transaction (`PENDING`, `COMMITTED`, `CONFLICT`, `FAILED`) |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Audit record creation timestamp |
@@ -231,6 +232,16 @@ Transactional outbox guaranteeing at-least-once, rate-limited Google Chat webhoo
 
 ---
 
+### 1.11 `schema_migrations`
+Records which SQL files under `migrations/` have been applied; `Database.connect()` applies the missing ones in order and refuses to start without the directory.
+
+| Column | Data Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `version` | `VARCHAR(64)` | No | - | Primary key: migration file stem, e.g. `004_phase_b1` |
+| `applied_at` | `TIMESTAMPTZ` | No | `NOW()` | When the migration was applied |
+
+---
+
 ## 2. Domain Enumerations
 
 ### 2.1 Severity Levels
@@ -249,6 +260,7 @@ Transactional outbox guaranteeing at-least-once, rate-limited Google Chat webhoo
 - `MODEL_VALIDATED`: Model investigation assessment validated on first pass against strict schema and guardrails.
 - `MODEL_REPAIRED`: Model investigation assessment required single-repair bounded pass before acceptance.
 - `MODEL_REJECTED_FALLBACK`: Model investigation rejected or failed; deterministic fallback values applied.
+- `RATE_LIMITED`: Deterministic revision whose investigation job was not queued because the per-source or per-target hourly limit was reached.
 
 ### 2.4 Model Run Commit Status
 - `PENDING`: Model inference executed; awaiting database revision transaction.

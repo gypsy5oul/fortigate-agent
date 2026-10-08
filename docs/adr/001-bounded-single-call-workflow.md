@@ -16,7 +16,7 @@ We need automated investigation of security incidents derived from FortiGate 200
 6. Untrusted attacker text (URLs, headers, payloads) is delimited with `<<UNTRUSTED id=...>>` to contain prompt injection.
 
 ## Consequences
-- Bounded execution latency governed by strict network deadlines (60 s timeout per call with up to one repair attempt) and deterministic fallback.
+- Bounded execution latency: one shared deadline (`LLM_TIMEOUT_SECONDS`, default 60 s) covers the primary call, the `json_object` fallback on HTTP 400 and the single repair call, so an investigation never exceeds that budget and always finishes inside the 90 s job lease; when it expires the deterministic fallback is written.
 - All model runs are audited in the `model_runs` table with token counts, prompt versions, schema versions, and hashes.
 - External model outages degrade gracefully: deterministic severity floors deliver without interruption.
 - No external cloud dependencies or third-party telemetry leaks.

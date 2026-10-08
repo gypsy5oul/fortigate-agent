@@ -1,13 +1,13 @@
-"""Unit tests for ADK workflow, guardrails, and deterministic fallback."""
+"""Unit tests for the single-call workflow guardrails and deterministic fallback."""
 
 import pytest
-from src.investigation.adk_workflow import ADKInvestigationWorkflow
+from src.investigation.single_call_workflow import SingleCallInvestigationWorkflow
 from src.investigation.schemas import IncidentPacket, QwenAssessment, FindingItem
 
 
 @pytest.fixture
 def workflow():
-    return ADKInvestigationWorkflow(
+    return SingleCallInvestigationWorkflow(
         base_url="http://127.0.0.1:9999/v1",  # Dummy URL to test offline fallback
         model="qwen3.8-27b",
         timeout_seconds=1.0,

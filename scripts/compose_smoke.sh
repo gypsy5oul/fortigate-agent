@@ -11,7 +11,7 @@ if [ ! -f .env ]; then
 fi
 
 echo "[1/5] Building container image..."
-docker compose build forti-intel
+docker compose build app
 
 echo "[2/5] Starting services via docker compose..."
 docker compose up -d
@@ -30,25 +30,25 @@ done
 
 if [ "$READY" -ne 1 ]; then
   echo "ERROR: Service failed to report ready on /health/ready within 30s"
-  docker compose logs forti-intel
+  docker compose logs app
   docker compose down
   exit 1
 fi
 
 echo "[4/5] Verifying database schema migrations..."
-MIGRATION_CHECK=$(docker compose exec -T forti-postgres psql -U forti_intel -d forti_intel -t -A -c "SELECT version FROM schema_migrations ORDER BY applied_at ASC;" 2>/dev/null || echo "NONE")
+MIGRATION_CHECK=$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-forti_intel}" -d "${POSTGRES_DB:-forti_intelligence}" -t -A -c "SELECT version FROM schema_migrations ORDER BY applied_at ASC;" 2>/dev/null || echo "NONE")
 echo "Applied migrations:"
 echo "${MIGRATION_CHECK}"
 
-if ! echo "${MIGRATION_CHECK}" | grep -q "004_phase_b1"; then
-  echo "ERROR: 004_phase_b1 migration missing from schema_migrations"
+if ! echo "${MIGRATION_CHECK}" | grep -q "005_episode_utm_subtypes"; then
+  echo "ERROR: 005_episode_utm_subtypes migration missing from schema_migrations"
   docker compose down
   exit 1
 fi
 
 echo "[5/5] Testing graceful SIGTERM shutdown (exit code 0 within 10s)..."
-docker compose stop -t 10 forti-intel
-CONTAINER_ID=$(docker compose ps -q forti-intel)
+docker compose stop -t 10 app
+CONTAINER_ID=$(docker compose ps -q app)
 EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' "${CONTAINER_ID}")
 echo "Container stop exit code: ${EXIT_CODE}"
 

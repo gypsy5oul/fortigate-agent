@@ -154,10 +154,10 @@ As verified by `tests/e2e/test_service_e2e.py` executed against PostgreSQL 16:
 ## 4. Live Checks Blocked (Environment Containment)
 
 In accordance with Rule 4 ("No live systems"):
-1. **Production Loki Gateway (`loki-readonly.6dcorp.internal`)**:
+1. **Production Loki Gateway (`<loki-gateway-host>`)**:
    - Status: Blocked from live querying during test runs.
    - Requirement to run live: Operator network connectivity and rotated production credentials.
-2. **Local Model Endpoint (`10.0.6.31:8000`)**:
+2. **Local Model Endpoint (`<vllm-host>:8000`)**:
    - Status: Mocked locally with FastAPI test server.
    - Requirement to run live: Active GPU container running vLLM with `qwen3.8-27b` and `--enable-auto-tool-choice`.
 3. **Live Google Chat Space Webhook**:
@@ -189,7 +189,7 @@ In accordance with Rule 4 ("No live systems"):
 2. **FortiOS Build Provisioning**:
    - CLI remediation templates are disabled by default (`cli_recommendations_enabled = false`). Operators must configure `FORTIOS_BUILD` before enabling CLI templates.
 3. **vLLM Structured Output Verification**:
-   - Required for Phase C: Verify whether vLLM release on `10.0.6.31` supports tool-calling combined with `response_format={"type": "json_object"}` or `json_schema`.
+   - Required for Phase C: Verify whether vLLM release on `<vllm-host>` supports tool-calling combined with `response_format={"type": "json_object"}` or `json_schema`.
 
 ---
 

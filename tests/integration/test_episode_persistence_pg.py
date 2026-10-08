@@ -19,7 +19,7 @@ async def pg_repo():
     db = Database(TEST_PG_URL)
     await db.connect()
     async with db._pg_pool.acquire() as conn:
-        await conn.execute("TRUNCATE TABLE episodes, incidents CASCADE;")
+        await conn.execute("TRUNCATE TABLE episodes, incidents, incident_revisions CASCADE;")
     repo = Repository(db)
     yield repo
     await db.close()
@@ -139,3 +139,64 @@ async def test_restore_skips_and_closes_stale_rows_pg(pg_repo):
     # Stale episode row was closed in database
     stale_row = await pg_repo.db.fetch_one("SELECT status FROM episodes WHERE id = 'EP-PG-STALE'")
     assert stale_row["status"] == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_restored_episode_plus_new_deny_still_matches_exploit_rule_pg(pg_repo):
+    """B.1 Defect A, PostgreSQL round trip: persist a CRITICAL MIXED episode, restore it into a
+    fresh aggregator, add one blocked probe, evaluate. The exploit rule must still match and
+    the floor must still be CRITICAL."""
+    from src.correlator.session_aggregator import SessionAggregator
+    from src.rules.engine import RuleEngine
+    from src.parsing.normalizer import normalize_event
+
+    now = datetime.now(timezone.utc)
+    episode = {
+        "id": "EP-PG-RESTART-001",
+        "incident_id": "INC-PG-RESTART-001",
+        "vdom": "root",
+        "direction": "INBOUND",
+        "source_ip": "198.51.100.45",
+        "target_ip": "10.0.14.120",
+        "service": "HTTPS",
+        "first_seen": (now - timedelta(seconds=60)).isoformat(),
+        "last_seen": now.isoformat(),
+        "last_event_ts_ns": int(now.timestamp() * 1e9),
+        "event_count": 13,
+        "enforcement": "MIXED",
+        "enforcement_counts": {"BLOCKED": 12, "ALLOWED_OR_DETECTED": 1},
+        "signatures": ["Apache.Log4j.Error.Log.Remote.Code.Execution", "CVE-2021-44228"],
+        "utm_subtypes": ["ips"],
+        "status": "OPEN",
+    }
+    await pg_repo.save_episodes([episode])
+
+    records = await pg_repo.load_open_episodes(idle_timeout_seconds=300)
+    assert len(records) == 1
+    assert list(records[0]["utm_subtypes"]) == ["ips"]
+
+    aggregator = SessionAggregator(idle_timeout_seconds=120, max_episode_seconds=600)
+    aggregator.load_open_episodes(records)
+
+    deny_ts_ns = int((now + timedelta(seconds=5)).timestamp() * 1e9)
+    deny = normalize_event(
+        deny_ts_ns,
+        'date=2026-10-08 time=12:02:00 devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+        'subtype="forward" level="notice" vd="root" sessionid=500001 srcip=198.51.100.45 srcport=46000 '
+        'dstip=10.0.14.120 dstport=22 proto=6 service="SSH" action="deny" policyid=0',
+    )
+    assert deny is not None
+    deny["id"] = "EVID-RESTART-DENY-1"
+    deny["loki_ts_ns"] = deny_ts_ns
+
+    touched = aggregator.process_events([deny])
+    assert len(touched) == 1
+    ep = touched[0]
+    assert ep["incident_id"] == "INC-PG-RESTART-001"
+    assert ep["restored"] is True
+    assert ep["event_count"] == 14
+    assert len(ep["events"]) == 1  # only the new event is in memory
+
+    result = RuleEngine().evaluate_episode(ep)
+    assert "RULE_NONBLOCKED_EXPLOIT_ATTEMPT" in result["matched_rule_ids"]
+    assert result["severity_floor"] == "CRITICAL"

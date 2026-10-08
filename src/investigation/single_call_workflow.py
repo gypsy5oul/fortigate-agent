@@ -1,6 +1,7 @@
 """Single-call investigation workflow with structured output, repair loop, and deterministic fallback.
 
-Note: Phase B uses a single bounded call; Phase C introduces Google ADK.
+One bounded request to the local OpenAI-compatible model endpoint, with at most one
+format fallback and one repair call, all under a single shared deadline.
 """
 
 import os
@@ -147,6 +148,14 @@ class SingleCallInvestigationWorkflow:
         t_start = time.time()
         url = f"{self.base_url}/chat/completions"
 
+        # One deadline for the whole investigation. The primary call, the json_object
+        # fallback on HTTP 400 and the single repair call all share it, so the worst case
+        # is ``timeout_seconds`` in total rather than one timeout per request.
+        deadline = time.monotonic() + self.timeout
+
+        def _remaining() -> float:
+            return max(0.05, deadline - time.monotonic())
+
         prompt_catalog, eligible_action_ids, sanitized_events = self._prepare_evidence_and_catalog(packet)
 
         # Budget token check & shrink if needed
@@ -196,19 +205,19 @@ class SingleCallInvestigationWorkflow:
             }
 
             try:
-                resp = await self._client.post(url, json=payload)
+                resp = await self._client.post(url, json=payload, timeout=_remaining())
                 if resp.status_code == 400:
                     # Fall back to json_object mode if server does not support json_schema
                     logger.info("vLLM rejected json_schema; falling back to json_object response_format")
                     structured_mode = "json_object"
                     payload["response_format"] = {"type": "json_object"}
-                    resp = await self._client.post(url, json=payload)
+                    resp = await self._client.post(url, json=payload, timeout=_remaining())
                 resp.raise_for_status()
             except httpx.HTTPStatusError as e:
                 if structured_mode == "json_schema" and e.response.status_code == 400:
                     structured_mode = "json_object"
                     payload["response_format"] = {"type": "json_object"}
-                    resp = await self._client.post(url, json=payload)
+                    resp = await self._client.post(url, json=payload, timeout=_remaining())
                     resp.raise_for_status()
                 else:
                     raise
@@ -263,7 +272,7 @@ class SingleCallInvestigationWorkflow:
                         "max_tokens": self.max_output_tokens,
                         "response_format": {"type": "json_object"},
                     }
-                    rep_resp = await self._client.post(url, json=repair_payload)
+                    rep_resp = await self._client.post(url, json=repair_payload, timeout=_remaining())
                     rep_resp.raise_for_status()
                     rep_data = rep_resp.json()
                     rep_content = rep_data["choices"][0]["message"]["content"]
@@ -298,7 +307,7 @@ class SingleCallInvestigationWorkflow:
             logger.warning("Local Qwen inference failed or timed out: %s. Using deterministic fallback.", e)
             final_assessment = self._build_fallback_assessment(packet, error_reason=str(e))
             final_assessment.assessment_source = "MODEL_REJECTED_FALLBACK"
-            validation_result = "TIMEOUT" if "timeout" in str(e).lower() else "ERROR"
+            validation_result = "TIMEOUT" if isinstance(e, httpx.TimeoutException) or "timeout" in str(e).lower() else "ERROR"
             reason_codes = [validation_result, str(e)[:100]]
 
         latency_ms = int((time.time() - t_start) * 1000)
@@ -361,6 +370,3 @@ class SingleCallInvestigationWorkflow:
             assessment_source="MODEL_REJECTED_FALLBACK",
         )
 
-
-# Backward compatibility alias
-ADKInvestigationWorkflow = SingleCallInvestigationWorkflow

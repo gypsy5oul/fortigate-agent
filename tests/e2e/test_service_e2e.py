@@ -71,11 +71,51 @@ async def pg_clean():
             """
             TRUNCATE TABLE selected_events, rejected_events, incidents,
                            incident_revisions, jobs, notification_outbox,
-                           query_checkpoints, coverage_gaps CASCADE;
+                           query_checkpoints, coverage_gaps, episodes, model_runs CASCADE;
             """
         )
     yield db
     await db.close()
+
+
+SEVERITY_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
+def _child_env(metrics_port: int) -> Dict[str, str]:
+    env = os.environ.copy()
+    env["DATABASE_URL"] = TEST_PG_URL
+    env["LOKI_BASE_URL"] = f"{FAKE_BASE_URL}/loki/api/v1/query_range"
+    env["LOKI_TLS_VERIFY"] = "true"
+    env["ALLOW_INSECURE_TLS"] = "true"
+    env["LLM_BASE_URL"] = f"{FAKE_BASE_URL}/v1"
+    env["LLM_ENABLED"] = "true"
+    env["GCHAT_WEBHOOK_URL"] = f"{FAKE_BASE_URL}/chat"
+    env["GCHAT_DRY_RUN"] = "false"
+    env["LOKI_POLL_INTERVAL_SECONDS"] = "0.2"
+    env["GCHAT_RATE_LIMIT_DELAY_SECONDS"] = "0.05"
+    env["METRICS_PORT"] = str(metrics_port)
+    return env
+
+
+async def _run_service_then_sigterm(env: Dict[str, str], run_seconds: float) -> float:
+    """Runs the real ``python -m src.main`` for ``run_seconds``, sends SIGTERM and enforces
+    the D4 contract: the process exits on its own, within 5 s, with exit code 0. The
+    process is only killed to clean up after that assertion has already failed."""
+    proc = subprocess.Popen([sys.executable, "-m", "src.main"], env=env)
+    try:
+        await asyncio.sleep(run_seconds)
+    finally:
+        t0 = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+            pytest.fail("service did not exit within 5 s of SIGTERM")
+        shutdown_seconds = time.monotonic() - t0
+    assert proc.returncode == 0, f"service exited with code {proc.returncode} after SIGTERM"
+    return shutdown_seconds
 
 
 @pytest.mark.asyncio
@@ -112,34 +152,9 @@ async def test_e2e_scenarios_and_service_lifecycle(fake_server, pg_clean):
         await client.post(f"{FAKE_BASE_URL}/stage_logs", json=all_staged)
         expected_event_count = len(all_staged)
 
-    # Configure environment for real child process
-    env = os.environ.copy()
-    env["DATABASE_URL"] = TEST_PG_URL
-    env["LOKI_BASE_URL"] = f"{FAKE_BASE_URL}/loki/api/v1/query_range"
-    env["LOKI_TLS_VERIFY"] = "true"
-    env["ALLOW_INSECURE_TLS"] = "true"
-    env["LLM_BASE_URL"] = f"{FAKE_BASE_URL}/v1"
-    env["LLM_ENABLED"] = "true"
-    env["GCHAT_WEBHOOK_URL"] = f"{FAKE_BASE_URL}/chat"
-    env["GCHAT_DRY_RUN"] = "false"
-    env["LOKI_POLL_INTERVAL_SECONDS"] = "0.2"
-    env["GCHAT_RATE_LIMIT_DELAY_SECONDS"] = "0.05"
-    env["METRICS_PORT"] = "18881"
-
-    # Spawn real process python -m src.main
-    proc = subprocess.Popen([sys.executable, "-m", "src.main"], env=env)
-
-    try:
-        # Allow process to execute supervised loops and process the staged batch
-        await asyncio.sleep(8.0)
-    finally:
-        # Gracefully shut down via SIGTERM
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=2.0)
+    # Real child process: run the supervised loops over the staged batch, then SIGTERM.
+    # D4 acceptance: cooperative shutdown, exit code 0, no kill.
+    await _run_service_then_sigterm(_child_env(18881), run_seconds=8.0)
 
     repo = Repository(pg_clean)
 
@@ -307,3 +322,74 @@ async def test_e2e_model_outage_fallback(fake_server, pg_clean, monkeypatch):
     )
     assert fallback is not None
     assert "MODEL_UNREACHABLE" in fallback["reasoning_summary"]
+
+
+@pytest.mark.asyncio
+async def test_e2e_restart_never_lowers_incident_severity(fake_server, pg_clean):
+    """B.1 Defect A, end to end: run the real process, stop it with SIGTERM, stage new blocked
+    probes from the source of the CRITICAL non-blocked exploit, restart on the same database,
+    stop again. No incident's severity may decrease across the restart, and the exploit
+    incident must absorb the new events while staying CRITICAL."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/reset")
+        base_ts = time.time_ns() - 25_000_000_000
+        scenarios = generate_scenario_logs(base_ts)
+        staged = []
+        staged.extend(scenarios["scenario_2_nonblocked_ips"])
+        staged.extend(scenarios["scenario_5_blocked_scanner"])
+        await client.post(f"{FAKE_BASE_URL}/stage_logs", json=staged)
+
+    env = _child_env(18882)
+
+    # Phase 1: ingest, alert, investigate; then a clean SIGTERM exit.
+    await _run_service_then_sigterm(env, run_seconds=8.0)
+
+    before = {
+        row["id"]: row
+        for row in await pg_clean.fetch_all("SELECT id, source_ip, severity, current_revision, event_count FROM incidents")
+    }
+    exploit_before = next(r for r in before.values() if r["source_ip"] == "198.51.100.45")
+    assert exploit_before["severity"] == "CRITICAL"
+    assert exploit_before["event_count"] == 1
+
+    # Between the runs: three blocked probes on distinct services from the exploit source.
+    # On their own these match only RULE_PORT_SCAN_MULTI_SERVICE (MEDIUM, DIGEST).
+    now_ns = time.time_ns()
+    probes = []
+    for i, (port, svc) in enumerate([(22, "SSH"), (3389, "RDP"), (8080, "HTTP-ALT")]):
+        probes.append((
+            now_ns - 1_000_000_000 + i * 10_000_000,
+            f'date=2026-10-08 time=12:02:0{i} devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
+            f'subtype="forward" level="notice" vd="root" sessionid={500001 + i} srcip=198.51.100.45 '
+            f'srcport={46000 + i} dstip=10.0.14.120 dstport={port} proto=6 service="{svc}" action="deny" policyid=0',
+        ))
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/stage_logs", json=probes)
+
+    # Phase 2: restart on the same database (episodes and checkpoints restored), then SIGTERM.
+    await _run_service_then_sigterm(env, run_seconds=8.0)
+
+    after = {
+        row["id"]: row
+        for row in await pg_clean.fetch_all("SELECT id, source_ip, severity, deterministic_severity, current_revision, event_count, deterministic_rule_ids FROM incidents")
+    }
+    for inc_id, old in before.items():
+        assert inc_id in after, f"incident {inc_id} disappeared across the restart"
+        assert SEVERITY_RANK[after[inc_id]["severity"]] >= SEVERITY_RANK[old["severity"]], (
+            f"incident {inc_id} ({old['source_ip']}) went from {old['severity']} to {after[inc_id]['severity']} across the restart"
+        )
+
+    exploit_after = after[exploit_before["id"]]
+    assert exploit_after["severity"] == "CRITICAL"
+    assert exploit_after["deterministic_severity"] == "CRITICAL"
+    assert exploit_after["event_count"] == 4, "the three probes must join the restored episode"
+    assert "RULE_NONBLOCKED_EXPLOIT_ATTEMPT" in list(exploit_after["deterministic_rule_ids"])
+    assert "RULE_PORT_SCAN_MULTI_SERVICE" in list(exploit_after["deterministic_rule_ids"])
+
+    revisions = await pg_clean.fetch_all(
+        "SELECT revision, severity, assessment_source FROM incident_revisions WHERE incident_id = $1 ORDER BY revision",
+        exploit_before["id"],
+    )
+    assert revisions[0]["revision"] == 1
+    assert all(r["severity"] == "CRITICAL" for r in revisions), [dict(r) for r in revisions]
+    assert [r["revision"] for r in revisions] == list(range(1, len(revisions) + 1))

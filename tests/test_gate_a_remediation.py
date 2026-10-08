@@ -11,7 +11,7 @@ from src.parsing.normalizer import normalize_action, normalize_event, classify_d
 from src.correlator.session_aggregator import SessionAggregator, Episode
 from src.rules.engine import RuleEngine
 from src.investigation.schemas import IncidentPacket, QwenAssessment, FindingItem
-from src.investigation.adk_workflow import ADKInvestigationWorkflow
+from src.investigation.single_call_workflow import SingleCallInvestigationWorkflow
 from src.notifications.gchat_cards import build_gchat_card
 from src.notifications.outbox_worker import OutboxWorker
 from tests.fixtures.fortios_logs import (

@@ -4,7 +4,7 @@ import json
 import pytest
 from src.notifications.gchat_cards import build_gchat_card
 from src.investigation.schemas import IncidentPacket
-from src.investigation.adk_workflow import ADKInvestigationWorkflow
+from src.investigation.single_call_workflow import SingleCallInvestigationWorkflow
 
 
 def test_cards_snapshot_html_escaping():
@@ -34,7 +34,7 @@ def test_cards_snapshot_html_escaping():
         incident=incident,
         revision=1,
         assessment=assessment,
-        grafana_base_url="https://grafana.6dcorp.internal",
+        grafana_base_url="https://grafana.example.internal",
         datasource_uid="loki",
         cli_recommendations_enabled=False,
     )
@@ -93,7 +93,7 @@ def test_cli_recommendations_disabled_by_default():
 
 def test_fallback_assessment_never_recommends_quarantine():
     """Fallback assessment must never contain ACT_QUARANTINE_SRC_IP."""
-    workflow = ADKInvestigationWorkflow(base_url="http://127.0.0.1:9999/v1")
+    workflow = SingleCallInvestigationWorkflow(base_url="http://127.0.0.1:9999/v1")
     packet = IncidentPacket(
         incident_id="INC-FALLBACK-1",
         incident_revision=1,

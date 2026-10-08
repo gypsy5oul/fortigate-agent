@@ -73,7 +73,7 @@ class Settings(BaseSettings):
 
     # Grafana Links
     grafana_base_url: str = Field(
-        default="https://grafana.6dcorp.internal",
+        default="https://grafana.example.internal",
         description="Base URL for drill-down explore links",
     )
     grafana_datasource_uid: str = Field(default="loki", description="Loki datasource UID in Grafana")

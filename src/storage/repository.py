@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from src.storage.database import Database
 from src.storage.timeutil import to_utc_datetime
-from src.observability.metrics import PARSER_ERRORS_TOTAL, MODEL_FAILURES_TOTAL
+from src.observability.metrics import PARSER_ERRORS_TOTAL, MODEL_FAILURES_TOTAL, COVERAGE_GAPS_TOTAL
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,7 @@ class Repository:
         VALUES ($1, $2, $3, $4)
         """
         await self.db.execute(query, stream_name, start_ns, end_ns, reason)
+        COVERAGE_GAPS_TOTAL.inc()
         logger.warning("Recorded coverage gap on stream %s from %s to %s: %s", stream_name, start_ns, end_ns, reason)
 
     async def get_coverage_gaps(self, stream_name: str) -> List[Dict[str, Any]]:
@@ -1131,7 +1132,7 @@ class Repository:
                 query = """
                 UPDATE notification_outbox
                 SET attempts = attempts + 1, last_error = $1,
-                    status = CASE WHEN attempts >= 10 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+                    status = CASE WHEN attempts + 1 >= 10 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
                     retry_after_ts = datetime(CURRENT_TIMESTAMP, '+' || $2 || ' seconds')
                 WHERE id = $3
                 """
@@ -1144,7 +1145,7 @@ class Repository:
                 query = """
                 UPDATE notification_outbox
                 SET attempts = attempts + 1, last_error = $1,
-                    status = CASE WHEN attempts >= 10 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+                    status = CASE WHEN attempts + 1 >= 10 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
                     retry_after_ts = NOW() + ($2 || ' seconds')::interval
                 WHERE id = $3
                 """
@@ -1165,14 +1166,15 @@ class Repository:
             s_ids = [int(x) for x in ep.get("session_ids", [])]
             enf_counts = ep.get("enforcement_counts", {})
             sigs = list(ep.get("signatures", []))
+            subtypes = [str(x).lower() for x in ep.get("utm_subtypes", []) if x]
 
             if self.db.is_sqlite:
                 query = """
                 INSERT INTO episodes (
                     id, vdom, direction, source_ip, target_ip, service,
                     incident_id, status, first_seen, last_seen, last_event_ts_ns,
-                    event_count, enforcement, enforcement_counts, signatures, evidence_ids, session_ids, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, CURRENT_TIMESTAMP)
+                    event_count, enforcement, enforcement_counts, signatures, evidence_ids, session_ids, utm_subtypes, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, CURRENT_TIMESTAMP)
                 ON CONFLICT(id) DO UPDATE SET
                     last_seen = excluded.last_seen,
                     last_event_ts_ns = excluded.last_event_ts_ns,
@@ -1182,6 +1184,7 @@ class Repository:
                     signatures = excluded.signatures,
                     evidence_ids = excluded.evidence_ids,
                     session_ids = excluded.session_ids,
+                    utm_subtypes = excluded.utm_subtypes,
                     status = excluded.status,
                     updated_at = CURRENT_TIMESTAMP
                 """
@@ -1204,14 +1207,15 @@ class Repository:
                     json.dumps(sigs),
                     json.dumps(ev_ids),
                     json.dumps(s_ids),
+                    json.dumps(subtypes),
                 )
             else:
                 query = """
                 INSERT INTO episodes (
                     id, vdom, direction, source_ip, target_ip, service,
                     incident_id, status, first_seen, last_seen, last_event_ts_ns,
-                    event_count, enforcement, enforcement_counts, signatures, evidence_ids, session_ids, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, NOW())
+                    event_count, enforcement, enforcement_counts, signatures, evidence_ids, session_ids, utm_subtypes, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, $18, NOW())
                 ON CONFLICT (id) DO UPDATE SET
                     last_seen = EXCLUDED.last_seen,
                     last_event_ts_ns = EXCLUDED.last_event_ts_ns,
@@ -1221,6 +1225,7 @@ class Repository:
                     signatures = EXCLUDED.signatures,
                     evidence_ids = EXCLUDED.evidence_ids,
                     session_ids = EXCLUDED.session_ids,
+                    utm_subtypes = EXCLUDED.utm_subtypes,
                     status = EXCLUDED.status,
                     updated_at = NOW()
                 """
@@ -1243,6 +1248,7 @@ class Repository:
                     sigs,
                     ev_ids,
                     s_ids,
+                    subtypes,
                 )
 
     async def close_episodes(self, episode_ids: List[str]):
@@ -1305,6 +1311,11 @@ class Repository:
                             d["signatures"] = json.loads(d["signatures"])
                         except Exception:
                             d["signatures"] = []
+                    if isinstance(d.get("utm_subtypes"), str):
+                        try:
+                            d["utm_subtypes"] = json.loads(d["utm_subtypes"])
+                        except Exception:
+                            d["utm_subtypes"] = []
                 else:
                     if isinstance(d.get("enforcement_counts"), str):
                         try:

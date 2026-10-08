@@ -55,7 +55,7 @@ INCIDENTS_ACTIVE = _metric(
 MODEL_INFERENCE_DURATION = _metric(
     Histogram,
     "forti_model_inference_duration_seconds",
-    "Time spent running ADK local Qwen investigation",
+    "Time spent in the bounded single-call local model investigation",
 )
 MODEL_FAILURES_TOTAL = _metric(
     Counter,
@@ -112,6 +112,11 @@ JOBS_OLDEST_PENDING_SECONDS = _metric(
     Gauge,
     "forti_jobs_oldest_pending_seconds",
     "Age of oldest pending investigation job in seconds",
+)
+MODEL_CONSECUTIVE_FAILURES = _metric(
+    Gauge,
+    "forti_model_consecutive_failures",
+    "Consecutive failed or rejected model investigations; readiness reports degraded at 3",
 )
 
 

@@ -19,7 +19,7 @@ def build_gchat_card(
     incident: Dict[str, Any],
     revision: int,
     assessment: Dict[str, Any],
-    grafana_base_url: str = "https://grafana.6dcorp.internal",
+    grafana_base_url: str = "https://grafana.example.internal",
     datasource_uid: str = "loki",
     cli_recommendations_enabled: bool = False,
     fortios_build: Optional[str] = None,
@@ -164,7 +164,7 @@ def build_gchat_card(
 
 def build_digest_gchat_card(
     digest_data: Dict[str, Any],
-    grafana_base_url: str = "https://grafana.6dcorp.internal",
+    grafana_base_url: str = "https://grafana.example.internal",
     datasource_uid: str = "loki",
 ) -> Dict[str, Any]:
     """Render Google Chat Cards v2 payload for aggregated periodic DIGEST alerts."""

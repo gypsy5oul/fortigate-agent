@@ -1,4 +1,4 @@
-"""Pydantic schemas and guardrails for bounded ADK investigation."""
+"""Pydantic schemas and guardrails for the bounded single-call investigation."""
 
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, ConfigDict, PrivateAttr

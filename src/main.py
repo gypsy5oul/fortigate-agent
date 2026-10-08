@@ -23,7 +23,7 @@ from src.correlator.session_aggregator import SessionAggregator
 from src.rules.engine import RuleEngine
 from src.investigation.schemas import IncidentPacket
 from src.investigation.eligibility import get_eligible_actions
-from src.investigation.adk_workflow import ADKInvestigationWorkflow
+from src.investigation.single_call_workflow import SingleCallInvestigationWorkflow
 from src.notifications.gchat_cards import build_gchat_card, build_digest_gchat_card
 from src.notifications.outbox_worker import OutboxWorker
 from src.observability.metrics import (
@@ -39,6 +39,7 @@ from src.observability.metrics import (
     CHAT_LAST_SUCCESS_AGE_SECONDS,
     BACKLOG_PENDING_EVENTS,
     JOBS_OLDEST_PENDING_SECONDS,
+    MODEL_CONSECUTIVE_FAILURES,
 )
 
 # Quiet HTTP transport logging to prevent credential exposure in URLs
@@ -124,7 +125,7 @@ class IntelligenceService:
 
         self.rule_engine = RuleEngine()
 
-        self.adk_workflow = ADKInvestigationWorkflow(
+        self.investigation_workflow = SingleCallInvestigationWorkflow(
             base_url=self.settings.llm_base_url,
             model=self.settings.llm_model,
             api_key=self.settings.llm_api_key,
@@ -150,6 +151,16 @@ class IntelligenceService:
         self.running = False
         self._stop: Optional[asyncio.Event] = None
         self._consecutive_model_failures = 0
+
+    @staticmethod
+    def _max_severity(*values: Optional[str]) -> str:
+        """Highest of the given severities; unknown or missing values rank lowest."""
+        ranks = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        best = "LOW"
+        for v in values:
+            if v and ranks.get(v, 0) > ranks.get(best, 0):
+                best = v
+        return best
 
     @property
     def stop_event(self) -> asyncio.Event:
@@ -214,7 +225,7 @@ class IntelligenceService:
         if hasattr(self, "_server") and self._server:
             self._server.should_exit = True
         await self.loki_client.close()
-        await self.adk_workflow.close()
+        await self.investigation_workflow.close()
         await self.outbox_worker.close()
         await self.db.close()
         logger.info("Service terminated gracefully.")
@@ -273,6 +284,17 @@ class IntelligenceService:
                         existing = await self.repo.get_incident(inc_id)
                         is_new = existing is None
 
+                        # Incident severity is monotonic. A deterministic re-evaluation may add
+                        # rules or raise severity on new evidence; it never lowers what the
+                        # incident already carries (that is an analyst action, Phase D). The
+                        # same holds for the rule list: rules that matched earlier stay.
+                        prior_sev = (existing.get("severity") if existing else None) or "LOW"
+                        prior_det_sev = (existing.get("deterministic_severity") if existing else None) or prior_sev
+                        prior_rules = list((existing.get("deterministic_rule_ids") if existing else None) or [])
+                        sev_out = self._max_severity(sev_floor, prior_sev)
+                        det_sev_out = self._max_severity(sev_floor, prior_det_sev)
+                        rules_out = prior_rules + [r for r in matched_rules if r not in prior_rules]
+
                         material_change = False
                         if is_new:
                             material_change = True
@@ -311,7 +333,7 @@ class IntelligenceService:
                             "id": inc_id,
                             "current_revision": next_rev,
                             "status": "ACTIVE",
-                            "severity": sev_floor,
+                            "severity": sev_out,
                             "enforcement": ep["enforcement"],
                             "exploitation_assessment": "ATTEMPT_OBSERVED" if ep["enforcement"] in ("ALLOWED_OR_DETECTED", "MIXED") else "INSUFFICIENT_EVIDENCE",
                             "vd": ep.get("vdom", "root"),
@@ -324,10 +346,10 @@ class IntelligenceService:
                             "last_seen": ep["last_seen"],
                             "event_count": ep["event_count"],
                             "summary": "; ".join(rule_eval["reasons"]),
-                            "rule_ids": matched_rules,
-                            "deterministic_severity": sev_floor,
+                            "rule_ids": rules_out,
+                            "deterministic_severity": det_sev_out,
                             "deterministic_enforcement": ep["enforcement"],
-                            "deterministic_rule_ids": matched_rules,
+                            "deterministic_rule_ids": rules_out,
                             "last_urgent_at": urgent_ts_to_save if (routing == "URGENT_ALERT_AND_INVESTIGATE" and notif_type == "URGENT") else (last_urgent_dt),
                         }
 
@@ -339,14 +361,14 @@ class IntelligenceService:
                             rev_data = {
                                 "incident_id": inc_id,
                                 "revision": next_rev,
-                                "rule_ids": matched_rules,
-                                "severity": sev_floor,
+                                "rule_ids": rules_out,
+                                "severity": sev_out,
                                 "enforcement": ep["enforcement"],
                                 "assessment_json": {
-                                    "severity": sev_floor,
+                                    "severity": sev_out,
                                     "enforcement": ep["enforcement"],
                                     "summary": f"[DETERMINISTIC PERIMETER ALERT - REV {next_rev}] {'; '.join(rule_eval['reasons'])}",
-                                    "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS"] if sev_floor in ("CRITICAL", "HIGH") else ["ACT_MONITOR_AND_DIGEST"],
+                                    "recommended_action_ids": ["ACT_INSPECT_APPLICATION_LOGS"] if sev_out in ("CRITICAL", "HIGH") else ["ACT_MONITOR_AND_DIGEST"],
                                 },
                                 "model_name": None,
                                 "reasoning_summary": "; ".join(rule_eval["reasons"]),
@@ -401,7 +423,7 @@ class IntelligenceService:
                                         "id": f"JOB-{inc_id}-{next_rev}",
                                         "job_type": "INVESTIGATE_INCIDENT",
                                         "payload": job_payload,
-                                        "priority": 20 if sev_floor in ("CRITICAL", "HIGH") else 10,
+                                        "priority": 20 if sev_out in ("CRITICAL", "HIGH") else 10,
                                     }
 
                         # Persist with optimistic revision check and retry once on conflict
@@ -454,7 +476,7 @@ class IntelligenceService:
             await self._sleep(self.settings.loki_poll_interval_seconds)
 
     async def _run_investigation_loop(self):
-        """Processes queued incident investigation jobs using Google ADK and local Qwen."""
+        """Processes queued investigation jobs with one bounded call to the local model."""
         while self.running and not self.stop_event.is_set():
             job = None
             try:
@@ -474,6 +496,16 @@ class IntelligenceService:
 
                 logger.info("Processing investigation job %s for Incident %s (Trigger Rev %s)", job_id, inc_id, trigger_rev)
 
+                # The floor handed to the model is the incident's current deterministic
+                # severity, never just the evaluation that queued this job, so a model
+                # verdict cannot land below what the incident already carries.
+                current_inc = await self.repo.get_incident(inc_id) or {}
+                severity_floor = self._max_severity(
+                    rule_eval.get("severity_floor", "LOW"),
+                    current_inc.get("deterministic_severity"),
+                )
+                rule_ids_in_force = list(current_inc.get("deterministic_rule_ids") or rule_eval.get("matched_rule_ids", []))
+
                 packet = IncidentPacket(
                     incident_id=inc_id,
                     incident_revision=target_rev,
@@ -485,8 +517,8 @@ class IntelligenceService:
                     event_count=ep["event_count"],
                     enforcement=ep["enforcement"],
                     enforcement_counts=ep.get("enforcement_counts", {}),
-                    deterministic_rule_ids=rule_eval.get("matched_rule_ids", []),
-                    deterministic_severity_floor=rule_eval.get("severity_floor", "LOW"),
+                    deterministic_rule_ids=rule_ids_in_force,
+                    deterministic_severity_floor=severity_floor,
                     deterministic_reasons=rule_eval.get("reasons", []),
                     signatures=ep.get("signatures", []),
                     evidence_events=ep.get("events", []),
@@ -494,18 +526,17 @@ class IntelligenceService:
                 )
 
                 t0 = time.time()
-                assessment = await self.adk_workflow.investigate_packet(packet)
+                assessment = await self.investigation_workflow.investigate_packet(packet)
                 MODEL_INFERENCE_DURATION.observe(time.time() - t0)
 
                 # Track model degradation and success
                 if getattr(assessment, "assessment_source", "") != "MODEL_REJECTED_FALLBACK":
-                    self.service_state["last_model_success"] = time.time()
-                    self._consecutive_model_failures = 0
-                    self.service_state["model_degraded"] = False
+                    self._note_model_success()
                 else:
-                    self._consecutive_model_failures += 1
-                    if self._consecutive_model_failures >= 3:
-                        self.service_state["model_degraded"] = True
+                    self._note_model_failure()
+
+                # Monotonic severity (see poller): the row never drops below its current value.
+                incident_severity = self._max_severity(assessment.severity, current_inc.get("severity"))
 
                 # Enforcement and exploitation on incident row remain deterministic
                 det_enforcement = ep["enforcement"]
@@ -519,7 +550,7 @@ class IntelligenceService:
                         "target_ip": ep["target_ip"],
                         "event_count": ep["event_count"],
                         "target_app": ep.get("target_service") or f"Target Host ({ep['target_ip']})",
-                        "rule_ids": rule_eval.get("matched_rule_ids", []),
+                        "rule_ids": rule_ids_in_force,
                     },
                     revision=target_rev,
                     assessment=assessment.model_dump(),
@@ -535,9 +566,17 @@ class IntelligenceService:
                         "id": inc_id,
                         "current_revision": target_rev,
                         "status": "ACTIVE",
-                        "severity": assessment.severity,
+                        "severity": incident_severity,
                         "enforcement": det_enforcement,
                         "exploitation_assessment": det_exploit,
+                        # Deterministic facts and the URGENT cooldown stamp are carried through
+                        # unchanged; a model revision must not blank them (the upsert writes
+                        # every column it is given a default for).
+                        "rule_ids": rule_ids_in_force,
+                        "deterministic_severity": severity_floor,
+                        "deterministic_enforcement": current_inc.get("deterministic_enforcement") or det_enforcement,
+                        "deterministic_rule_ids": rule_ids_in_force,
+                        "last_urgent_at": current_inc.get("last_urgent_at"),
                         "vd": ep.get("vdom", "root"),
                         "direction": ep.get("direction", "INBOUND"),
                         "source_ip": ep["source_ip"],
@@ -552,8 +591,8 @@ class IntelligenceService:
                     revision={
                         "incident_id": inc_id,
                         "revision": target_rev,
-                        "rule_ids": rule_eval.get("matched_rule_ids", []),
-                        "severity": assessment.severity,
+                        "rule_ids": rule_ids_in_force,
+                        "severity": incident_severity,
                         "enforcement": det_enforcement,
                         "assessment_json": assessment.model_dump(),
                         "model_name": self.settings.llm_model,
@@ -576,9 +615,7 @@ class IntelligenceService:
 
             except Exception as e:
                 logger.error("Error in investigation worker loop: %s", e, exc_info=True)
-                self._consecutive_model_failures += 1
-                if self._consecutive_model_failures >= 3:
-                    self.service_state["model_degraded"] = True
+                self._note_model_failure()
                 if job:
                     try:
                         await self.repo.fail_job(job["id"], job["version_token"], str(e))
@@ -628,42 +665,64 @@ class IntelligenceService:
                 logger.error("Error in digest aggregation worker: %s", e, exc_info=True)
                 await self._sleep(5.0)
 
+    def _note_model_success(self) -> None:
+        self.service_state["last_model_success"] = time.time()
+        self._consecutive_model_failures = 0
+        self.service_state["model_degraded"] = False
+        MODEL_CONSECUTIVE_FAILURES.set(0)
+
+    def _note_model_failure(self) -> None:
+        self._consecutive_model_failures += 1
+        MODEL_CONSECUTIVE_FAILURES.set(self._consecutive_model_failures)
+        if self._consecutive_model_failures >= 3:
+            self.service_state["model_degraded"] = True
+
+    async def _update_operational_metrics(self) -> None:
+        """One refresh of the lag, backlog and queue-age gauges (M2)."""
+        now = time.time()
+        last_loki = self.service_state.get("last_poller_success", 0.0)
+        if last_loki > 0:
+            LOKI_LAST_SUCCESS_AGE_SECONDS.set(now - last_loki)
+
+        last_model = self.service_state.get("last_model_success", 0.0)
+        if last_model > 0:
+            MODEL_LAST_SUCCESS_AGE_SECONDS.set(now - last_model)
+
+        last_chat = getattr(self.outbox_worker, "last_success_time", 0.0)
+        if last_chat > 0:
+            CHAT_LAST_SUCCESS_AGE_SECONDS.set(now - last_chat)
+
+        MODEL_CONSECUTIVE_FAILURES.set(self._consecutive_model_failures)
+
+        backlog_row = await self.db.fetch_one(
+            "SELECT COUNT(*) AS cnt FROM selected_events WHERE processing_status = 'PENDING'"
+        )
+        BACKLOG_PENDING_EVENTS.set(int(backlog_row["cnt"]) if backlog_row and backlog_row.get("cnt") is not None else 0)
+
+        if not self.db.is_sqlite:
+            oldest_job = await self.db.fetch_one(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) AS age_sec FROM jobs "
+                "WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1"
+            )
+        else:
+            oldest_job = await self.db.fetch_one(
+                "SELECT (strftime('%s', 'now') - strftime('%s', created_at)) AS age_sec FROM jobs "
+                "WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1"
+            )
+        if oldest_job and oldest_job.get("age_sec") is not None:
+            JOBS_OLDEST_PENDING_SECONDS.set(float(oldest_job["age_sec"]))
+        else:
+            JOBS_OLDEST_PENDING_SECONDS.set(0.0)
+
     async def _run_metrics_updater(self):
         """Periodically refreshes operational lag and backlog gauges (M2)."""
         logger.info("Starting operational metrics updater loop.")
         while self.running and not self.stop_event.is_set():
             try:
-                now = time.time()
-                last_loki = self.service_state.get("last_poller_success", 0.0)
-                if last_loki > 0:
-                    LOKI_LAST_SUCCESS_AGE_SECONDS.set(now - last_loki)
-
-                last_model = self.service_state.get("last_model_success", 0.0)
-                if last_model > 0:
-                    MODEL_LAST_SUCCESS_AGE_SECONDS.set(now - last_model)
-
-                last_chat = getattr(self.outbox_worker, "last_success_time", 0.0)
-                if last_chat > 0:
-                    CHAT_LAST_SUCCESS_AGE_SECONDS.set(now - last_chat)
-
-                backlog_row = await self.db.fetch_one("SELECT COUNT(*) as cnt FROM normalized_events WHERE NOT processed")
-                if backlog_row:
-                    BACKLOG_PENDING_EVENTS.set(backlog_row.get("cnt", 0))
-
-                if self.db.is_postgres:
-                    oldest_job = await self.db.fetch_one(
-                        "SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) as age_sec FROM investigation_jobs WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1"
-                    )
-                else:
-                    oldest_job = await self.db.fetch_one(
-                        "SELECT (strftime('%s', 'now') - strftime('%s', created_at)) as age_sec FROM investigation_jobs WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 1"
-                    )
-                if oldest_job and oldest_job.get("age_sec") is not None:
-                    JOBS_OLDEST_PENDING_SECONDS.set(float(oldest_job["age_sec"]))
-                else:
-                    JOBS_OLDEST_PENDING_SECONDS.set(0.0)
+                await self._update_operational_metrics()
             except Exception as e:
-                logger.debug("Operational metrics updater cycle error: %s", e)
+                # A broken gauge query is an operator-visible problem, not a debug detail.
+                logger.warning("Operational metrics updater cycle error: %s", e)
 
             await self._sleep(5.0)
 

@@ -7,7 +7,7 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 ## 1. Architectural Principles
 
 - **Containerized Hardened Runtime**: Operates in isolated Docker containers (`docker-compose.yml`) deploying the Python intelligence agent with a read-only root filesystem, dropped Linux capabilities (`cap_drop: [ALL]`), `no-new-privileges:true`, and resource limits alongside PostgreSQL 16.
-- **Selective, Budgeted Ingest**: Ingests security detections (`type="utm"`) and perimeter denies (`type="traffic" action="deny"`). Routine forward accepted traffic (`action="accept"`, `action="close"`) is filtered at ingest and NOT mirrored to the database to prevent storage bloat. Contextual traffic enrichment is queried on-demand directly from Loki.
+- **Selective, Budgeted Ingest**: The `security_events` query profile (`LOKI_QUERY_PROFILE`) asks Loki only for UTM detections (`type="utm"`), FortiOS event logs (`type="event"`), perimeter denies (`action="deny"`) and UTM blocks (`utmaction="block"`). Routine accepted traffic (`action="accept"`, `action="close"`) is dropped at ingest and never mirrored to the database. A `traffic_context` profile is defined for on-demand enrichment but is not called by the Phase B.1 runtime; Phase C wires it to the investigation agent.
 - **Monotonic Query Checkpoints**: Loki log cursors advance monotonically in durable PostgreSQL storage only after events are successfully inserted.
 - **Fail-Safe Deterministic Severity Floor**: High-impact non-blocked exploits (`action="detected"` or `"passthrough"`) immediately establish a critical severity floor. If the local LLM is offline, degraded, or times out, deterministic alerts are dispatched without disruption.
 - **Bounded Structured Model Output**: Uses OpenAI-compatible `response_format={"type": "json_schema"}` with strict Pydantic schemas, defensive delimiters (`<<UNTRUSTED id=...>>`) against prompt injection, a single-repair retry loop, and complete audit persistence in `model_runs`.
@@ -19,7 +19,7 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 ## 2. Directory Structure
 
 ```
-/opt/firewall-log-analysis-agent/
+<repository root>/
 ├── docker-compose.yml              # Hardened orchestration (App + PostgreSQL 16)
 ├── Dockerfile                      # Multi-stage non-root container with --require-hashes
 ├── requirements.lock               # Cryptographically pinned dependencies with SHA256 hashes
@@ -104,10 +104,12 @@ docker compose up -d --build
 
 ### Step 3: Verify Health Probes
 ```bash
-# Liveness probe (HTTP 200 when supervisor tasks are running)
+# Liveness probe (HTTP 200 whenever the HTTP server answers; it does not inspect the supervisor tasks)
 curl http://localhost:8085/health/live
 
-# Readiness probe (HTTP 200 when DB connected and poller lag < 3x poll interval)
+# Readiness probe: 503 if the database is unreachable or the last successful poll is older than
+# 3x LOKI_POLL_INTERVAL_SECONDS; 200 {"status":"degraded"} after 3 consecutive model failures
+# (deterministic rules keep running); 200 {"status":"ready"} otherwise, including before the first poll
 curl http://localhost:8085/health/ready
 
 # Prometheus metrics
@@ -125,4 +127,4 @@ The test suite covers unit tests, PostgreSQL 16 integration tests, and full chil
 TEST_DATABASE_URL="postgresql://forti_intel:<password>@<db-host>:5432/forti_test" pytest -v tests/
 ```
 
-Refer to [docs/runbook.md](file:///opt/firewall-log-analysis-agent/docs/runbook.md) for backup/restore, reprocessing, and troubleshooting procedures, and [docs/data-dictionary.md](file:///opt/firewall-log-analysis-agent/docs/data-dictionary.md) for schema definitions.
+Refer to [docs/runbook.md](docs/runbook.md) for backup/restore, reprocessing, and troubleshooting procedures, and [docs/data-dictionary.md](docs/data-dictionary.md) for schema definitions. Phase reports are generated from a clean checkout with `scripts/make_phase_report.sh`.
