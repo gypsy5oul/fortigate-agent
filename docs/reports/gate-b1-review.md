@@ -136,9 +136,21 @@ file, and records `git rev-parse HEAD` at the top. Reports are generated, never 
 
 ## M7: documentation (what remains)
 
-Items from the Phase B review that are still wrong at `72bd8c3` are listed in the appendix
-below (filled from the documentation audit). The ADR and settings defaults no longer carry
-internal hostnames or IPs.
+The documentation audit (appendix below) checked every M7 item from the Phase B review against
+the code at `72bd8c3`. The simple items are fixed: the Loki env var name, the checkpoint column
+name, the `selected_events` column list, the runtime ADK claim in the ADR, and the internal
+hosts in the README and ADR. More than half of the list is still wrong, and the report's own
+claim that M7 is done "with all internal IPs sanitized" is contradicted by the report itself.
+
+Two items are repo hygiene, not prose, and belong in the follow-up commit:
+
+- `.env.example` (lines 10, 23, 37) still carries an internal Loki hostname, an internal vLLM
+  IP and an internal Grafana hostname, and the README tells operators to copy it. The same
+  Grafana hostname is the code default at `config/settings.py:76`. Replace all four with
+  placeholders such as `https://loki.example.internal`.
+- `docs/reports/gate-b1-report.md` (lines 6 and 188) prints a container-network IP, and
+  lines 54 and 56 print host-specific `/opt/...` paths. The generated-report script from
+  Defect B should run from a clean checkout so neither can appear.
 
 ## Low
 
@@ -164,3 +176,88 @@ Then I re-run the same checks (suite, two-phase real-process run, probes, transc
 
 Rotate the Loki credential from `a014c67` and the dev Postgres password. The current branch can
 be deployed to a lab database but not to production until Defect A is fixed.
+
+## Appendix: documentation audit at `72bd8c3`
+
+Every M7 item from the Phase B review, checked against the code in a fresh worktree of
+`72bd8c3`. Line numbers refer to that commit. Internal hostnames and IPs are not reproduced
+here; the lines are cited instead.
+
+### README.md
+
+| Item | State | Evidence |
+|---|---|---|
+| Loki env var name | FIXED | `LOKI_USER` |
+| Ingest claim (line 10) | STILL WRONG | Names only `type="utm"` and traffic `action="deny"`. The wired profile (`src/sources/query_profiles.py:96`, default at `config/settings.py:68`, applied at `src/main.py:117`) also matches `type="event"` and `utmaction="block"`. Line 84 describes it correctly; line 10 does not |
+| "Contextual traffic enrichment is queried on-demand directly from Loki" (line 10) | STILL WRONG | `TRAFFIC_CONTEXT_PROFILE` is defined and registered (`query_profiles.py:120`, `:138`) and nothing in `src/` calls it |
+| Liveness "200 when supervisor tasks are running" (line 107) | STILL WRONG | `src/observability/metrics.py:127` returns `{"status":"alive"}` unconditionally |
+| Readiness semantics (line 110) | FIXED, incomplete | Matches the lag check. Not mentioned: a poller that has never succeeded skips the lag check and reports ready (`metrics.py:143`), and a degraded model still returns 200 (`metrics.py:148`) |
+| `file:///opt/...` links (line 128) and host path as tree root (line 22) | STILL WRONG | Unchanged |
+| Internal hosts, IPs, passwords | FIXED in the README; NOT FIXED in what it points to | README line 125 uses placeholders. Lines 94 to 96 tell operators to copy `.env.example`, which still carries an internal Loki hostname (line 10), an internal vLLM IP (line 23) and an internal Grafana hostname (line 37). The Grafana hostname is also the code default at `config/settings.py:76` |
+
+### docs/runbook.md
+
+| Item | State | Evidence |
+|---|---|---|
+| Slice setting (line 56) | PARTLY | Name corrected to `LOKI_SLICE_SECONDS`; default stated as 15 s, code default is 30 (`config/settings.py:43`) |
+| Bootstrap lookback (line 57) | PARTLY | Old env name gone; default stated as 600 s, but `src/main.py:113` passes `default_bootstrap_seconds=60`. The report's own log line (`gate-b1-report.md:193`) shows 60 |
+| Checkpoint column in SQL | FIXED | `last_queried_ts_ns` |
+| Rewind SQL (line 72) | STILL WRONG | `WHERE stream_name LIKE '%utm_detections%'` matches nothing; the live key is `<selector>#security_events@v1` (`query_profiles.py:39`, `settings.py:68`) |
+| Stream key format (line 55) | FIXED | |
+| Dead-letter "after 10 attempts" (line 102) | OFF BY ONE | `CASE WHEN attempts >= 10` at `src/storage/repository.py:1134` and `:1147` tests the pre-increment value, so the row dead-letters on the 11th failure |
+| 429 and 408 handling (line 101) | STILL WRONG | Says a missing `Retry-After` falls back to exponential backoff with jitter; code uses a fixed 3.0 s (`src/notifications/outbox_worker.py:126`, `:138`). Says 408 honours `Retry-After`; code sends 408 to the exponential branch without reading the header (`:141` to `:145`) |
+| `MODEL_FALLBACK` (line 94) | STILL WRONG | The written value is `MODEL_REJECTED_FALLBACK` (`single_call_workflow.py:294`, `:300`; `repository.py:1034`) |
+| Degraded readiness (line 95) | FIXED, wrong body | Reachable now (`src/main.py:505` to `:508`, `:579` to `:581`). Documented body `{"status":"degraded","model":"degraded"}`; actual body `{"status":"degraded","database":"connected","note":...}` (`metrics.py:149`) |
+| 503 body says `poller_lagging` (line 85) | WRONG (new) | Actual body is `"Poller lag exceeded 3x interval"` (`metrics.py:145`) |
+| Poller "backs off with exponential jitter" (line 86) | WRONG (new) | Retries at a fixed `loki_poll_interval_seconds` (`src/main.py:453`); no backoff in `loki_client.py` or `checkpoints.py` |
+| "Qwen 2.5" (line 9) | WRONG (new) | Configured model default is `qwen3.8-27b` (`settings.py:53`) |
+| Internal hostnames | FIXED | |
+
+### docs/data-dictionary.md
+
+| Item | State | Evidence |
+|---|---|---|
+| `selected_events` columns and types | FIXED | All 31 columns match migrations 001 to 003 (`utmaction`, `signature_truncated`, nullable `dstip`) |
+| `direction` enum (lines 19, 95) | STILL WRONG | Lists `INTERNAL`; code emits INBOUND, OUTBOUND, LATERAL, EXTERNAL, UNKNOWN (`src/parsing/normalizer.py:128` to `:153`) |
+| `processing_status` lists `FAILED` (line 42) | MINOR | Only PENDING and PROCESSED are written (`repository.py:220`, `:232`, `:237`) |
+| `query_checkpoints` | FIXED, omission | Columns and primary key correct; the UNIQUE constraint on `stream_name` (migration 001 line 5), which is the upsert key (`repository.py:48`, `:56`), is not mentioned |
+| Incident `status` (line 122) | STILL WRONG | Lists SUPPRESSED and two CLOSED_* values; only `ACTIVE` is ever written (`src/main.py:313`, `:537`) |
+| `exploitation_assessment` | FIXED | Matches the Literal at `schemas.py:9` |
+| `assessment_source` (line 154, section 2.3) | STILL WRONG | Omits `RATE_LIMITED`, written at `src/main.py:389`. Marked not-null; migration 002 line 33 makes it nullable |
+| `job_type` (line 172) | STILL WRONG | Lists `INVESTIGATION` and `DIGEST_BATCH`; the only value written is `INVESTIGATE_INCIDENT` (`src/main.py:402`). Job status `SUPERSEDED` (line 175) is never written |
+| `model_runs.validation_result` (line 207) | STILL WRONG | Lists VALID, REPAIRED, INVALID, FALLBACK; code writes VALID, REPAIRED, REJECTED, TIMEOUT, ERROR (`single_call_workflow.py:173`, `:287`, `:291`, `:301`) |
+| `commit_status` | FIXED | |
+| `coverage_gaps`, `rejected_events`, `episodes`, `model_runs` tables | FIXED, one phantom | All documented. `coverage_gaps.resolved` is described as set by a "backfill worker"; no such worker exists and nothing sets the column |
+| `schema_migrations` | MISSING | Created at `src/storage/database.py:301` to `:304`, not documented |
+
+### docs/adr/001-bounded-single-call-workflow.md
+
+| Item | State | Evidence |
+|---|---|---|
+| Runtime ADK claim | FIXED in the ADR | Scoped to Phase C (line 12). Code comments still say "using Google ADK" (`src/main.py:456`) and "ADK local Qwen" (`metrics.py:58`); see Finding 4 |
+| Latency bound (line 19) | PARTLY | The 90 s claim is gone, replaced by "60 s timeout per call with up to one repair attempt". The workflow can make three sequential 60 s calls: the `json_schema` call (`single_call_workflow.py:199`), the `json_object` re-call on HTTP 400 (`:205`, `:211`), and the repair call (`:266`). Worst case is about 180 s, which exceeds the 90 s job lease at `src/main.py:461`. Either document 180 s and lengthen the lease, or share one deadline across the three calls |
+| Internal IPs | FIXED | |
+
+### docs/reports/gate-b1-report.md
+
+| Item | State | Evidence |
+|---|---|---|
+| Internal IPs | STILL WRONG | A container-network IP is printed at lines 6 and 188, while line 45 claims "all internal IPs/passwords sanitized" |
+| Host paths | STILL WRONG | `/opt/firewall-log-analysis-agent/.venv/bin/python3` (line 54) and `rootdir: /opt/firewall-log-analysis-agent` (line 56) |
+| Credential strings | FIXED | None in the docs. The CI-only password in `.github/workflows/ci.yml` and `tests/integration/` is a test fixture, acceptable |
+| Metric names cited at line 22 | FIXED | Both exist (`metrics.py:93`, `:98`) |
+| `dashboards/alerts.yml` | STILL WRONG | All five expressions use `forti_intel_*` names (lines 5, 14, 23, 32, 41); registered names use `forti_` (`metrics.py:42`, `:47`, `:93`, `:108`). `forti_intel_model_consecutive_failures` exists under no prefix: the count lives in `self._consecutive_model_failures` (`src/main.py:152`, `:506`) and is never exported. `forti_coverage_gaps_total` is never incremented (no `.inc()` caller), so that alert cannot fire even with the right name. The report marks M1 and M2 done with `alerts.yml` in scope (lines 39, 40). See Finding 2 |
+| Commit cited (line 4) | WRONG | Cites `5512a46`, which does not exist on the branch; HEAD is `72bd8c3`. Consistent with Defect B |
+| Version manifest (lines 234 to 241) | WRONG | Python 3.9.16, Pydantic 2.7.4, FastAPI 0.111.0 and so on contradict the pins in `requirements.in` and the Dockerfile's `python:3.12-slim`. Consistent with Defect B |
+
+### What the follow-up commit must change for M7
+
+1. `.env.example` and `config/settings.py:76`: placeholders only.
+2. README lines 10, 22, 107, 110, 128.
+3. Runbook lines 9, 56, 57, 72, 85, 86, 94, 95, 101, 102.
+4. Data dictionary: `direction`, incident `status`, `assessment_source`, `job_type`, job
+   `status`, `validation_result`, `processing_status`, the `stream_name` UNIQUE constraint, the
+   `coverage_gaps.resolved` sentence, and a `schema_migrations` entry.
+5. ADR line 19: state the real worst case and fix the lease, or bound the three calls by one
+   shared deadline (the latter is the better fix and is two lines in the workflow).
+6. The report: regenerate per Defect B; the IPs and host paths disappear with it.
