@@ -81,6 +81,12 @@ and cite this section.
 
 ---
 
+> **Status (2026-10-08).** Phase B.1 is complete on branch `claude/gifted-galileo-xx27sj`
+> (merge of `feature/gate-b1-fix-pack` at `72bd8c3` plus follow-up commit `6cf6cfa`; see
+> `docs/reports/gate-b1-review.md` and the generated `docs/reports/gate-b1-report.md`).
+> Phase C.0 branches from that branch, not from `feature/gate-b1-fix-pack`. Phase reports are
+> produced with `scripts/make_phase_report.sh`, never typed.
+
 ## 1. Phase B.1: fix pack (branch `feature/gate-b1-fix-pack`, based on `b552e02`)
 
 Each item: what is wrong, the fix, the acceptance test, and what proof the report must contain.

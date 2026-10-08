@@ -1,5 +1,11 @@
 # Phase B.1 review: `feature/gate-b1-fix-pack` (commit `72bd8c3`)
 
+> **Resolution (2026-10-08).** Every item below, including the documentation appendix, is
+> implemented in commit `6cf6cfa` on `claude/gifted-galileo-xx27sj` (a merge of `72bd8c3` plus
+> the follow-up). The generated verification report is `docs/reports/gate-b1-report.md`; the
+> three Defect A acceptance tests and the restart e2e all fail at `72bd8c3` and pass at
+> `6cf6cfa`. Phase C.0 starts from that branch.
+
 Reviewer: Claude (Fable 5.1), 2026-10-08. Branch is based on `b552e02` (Phase B). Plan reference:
 `docs/GEMINI-PHASE-B1-AND-PHASE-C-ADK-PLAN.md` section 1.
 
