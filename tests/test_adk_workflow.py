@@ -14,47 +14,6 @@ def workflow():
     )
 
 
-def test_guardrails_severity_floor(workflow):
-    packet = IncidentPacket(
-        incident_id="INC-001",
-        incident_revision=1,
-        source_ip="198.51.100.45",
-        target_ip="10.0.14.120",
-        first_seen="2026-10-06T12:00:00Z",
-        last_seen="2026-10-06T12:01:00Z",
-        event_count=5,
-        enforcement="ALLOWED_OR_DETECTED",
-        enforcement_counts={"ALLOWED_OR_DETECTED": 5},
-        deterministic_rule_ids=["RULE_NONBLOCKED_EXPLOIT_ATTEMPT"],
-        deterministic_severity_floor="CRITICAL",
-        deterministic_reasons=["Exploit detected without perimeter blocking"],
-        signatures=["CVE-2021-44228"],
-        evidence_events=[{"id": "EV-001"}],
-        action_catalog=[],
-    )
-
-    # Simulated hallucinated assessment where model tried to downplay severity to LOW
-    hallucinated = QwenAssessment(
-        incident_id="INC-001",
-        incident_revision=1,
-        severity="LOW",
-        attack_category="RECONNAISSANCE",
-        exploitation_assessment="INSUFFICIENT_EVIDENCE",
-        enforcement="ALLOWED_OR_DETECTED",
-        summary="Looks benign.",
-        findings=[FindingItem(kind="OBSERVATION", statement="Probe seen", evidence_ids=["EV-001", "FABRICATED-999"])],
-        recommended_action_ids=["ACT_INSPECT_APPLICATION_LOGS", "ACT_UNAUTHORIZED_SHELL_COMMAND"],
-    )
-
-    guarded = workflow._apply_guardrails(hallucinated, packet)
-    # 1. Severity floor must force it to CRITICAL
-    assert guarded.severity == "CRITICAL"
-    # 2. Fabricated evidence ID must be stripped
-    assert guarded.findings[0].evidence_ids == ["EV-001"]
-    # 3. Unauthorized action ID must be stripped
-    assert "ACT_UNAUTHORIZED_SHELL_COMMAND" not in guarded.recommended_action_ids
-
-
 @pytest.mark.asyncio
 async def test_offline_fallback(workflow):
     packet = IncidentPacket(

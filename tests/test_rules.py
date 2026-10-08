@@ -57,8 +57,9 @@ def test_scanner_digest_rule(rule_engine):
     ev = normalize_event(1791271940000000000, SAMPLE_TRAFFIC_DENY)
     episode = {
         "incident_id": "INC-TEST-003",
-        "source_ip": ev["srcip"],
-        "target_ip": ev["dstip"],
+        "source_ip": "198.51.100.5",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
         "enforcement": "BLOCKED",
         "event_count": 15,
         "signatures": [],
@@ -69,3 +70,147 @@ def test_scanner_digest_rule(rule_engine):
     assert "RULE_HIGH_FREQUENCY_SCANNER" in result["matched_rule_ids"]
     assert result["severity_floor"] == "MEDIUM"
     assert result["routing_outcome"] == "DIGEST"
+
+
+def test_dynamic_custom_rule_without_code_changes():
+    """Acceptance test B8: A completely new rule defined in YAML fires dynamically without code modifications."""
+    custom_rule = {
+        "id": "RULE_CUSTOM_OUTBOUND_EXFIL",
+        "name": "Custom Outbound Spike Rule",
+        "priority": "INVESTIGATE",
+        "min_severity": "HIGH",
+        "condition": {
+            "direction": "OUTBOUND",
+            "min_events": 5,
+        },
+        "reason_template": "Outbound exfiltration anomaly: {event_count} events from {source_ip}",
+    }
+    engine = RuleEngine(rules=[custom_rule])
+
+    # Positive episode
+    pos_ep = {
+        "incident_id": "INC-DYNAMIC-POS",
+        "source_ip": "10.0.1.25",
+        "target_ip": "203.0.113.88",
+        "direction": "OUTBOUND",
+        "event_count": 8,
+        "events": [{"srcip": "10.0.1.25", "dstip": "203.0.113.88"}] * 8,
+    }
+    pos_res = engine.evaluate_episode(pos_ep)
+    assert "RULE_CUSTOM_OUTBOUND_EXFIL" in pos_res["matched_rule_ids"]
+    assert pos_res["severity_floor"] == "HIGH"
+    assert pos_res["routing_outcome"] == "INVESTIGATE"
+    assert "8 events from 10.0.1.25" in pos_res["reasons"][0]
+
+    # Negative episode (inbound direction should not match)
+    neg_ep = {
+        "incident_id": "INC-DYNAMIC-NEG",
+        "source_ip": "203.0.113.88",
+        "target_ip": "10.0.1.25",
+        "direction": "INBOUND",
+        "event_count": 8,
+        "events": [],
+    }
+    neg_res = engine.evaluate_episode(neg_ep)
+    assert "RULE_CUSTOM_OUTBOUND_EXFIL" not in neg_res["matched_rule_ids"]
+
+
+def test_multi_service_port_scanner_rule(rule_engine):
+    """RULE_PORT_SCAN_MULTI_SERVICE matches when 3+ distinct ports/services are probed."""
+    # Positive case: 3 distinct ports
+    pos_ep = {
+        "incident_id": "INC-SCAN-POS",
+        "source_ip": "198.51.100.99",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
+        "event_count": 4,
+        "services": ["HTTP", "SSH", "RDP"],
+        "target_ports": [80, 22, 3389],
+        "events": [
+            {"srcip": "198.51.100.99", "dstip": "10.0.14.120", "dstport": 80, "service": "HTTP"},
+            {"srcip": "198.51.100.99", "dstip": "10.0.14.120", "dstport": 22, "service": "SSH"},
+            {"srcip": "198.51.100.99", "dstip": "10.0.14.120", "dstport": 3389, "service": "RDP"},
+        ],
+    }
+    res = rule_engine.evaluate_episode(pos_ep)
+    assert "RULE_PORT_SCAN_MULTI_SERVICE" in res["matched_rule_ids"]
+
+    # Negative case: only 1 port
+    neg_ep = {
+        "incident_id": "INC-SCAN-NEG",
+        "source_ip": "198.51.100.99",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
+        "event_count": 4,
+        "services": ["HTTP"],
+        "target_ports": [80],
+        "events": [{"srcip": "198.51.100.99", "dstip": "10.0.14.120", "dstport": 80, "service": "HTTP"}] * 4,
+    }
+    neg_res = rule_engine.evaluate_episode(neg_ep)
+    assert "RULE_PORT_SCAN_MULTI_SERVICE" not in neg_res["matched_rule_ids"]
+
+
+def test_antivirus_blocked_vs_allowed(rule_engine):
+    """RULE_ANTIVIRUS_DETECTION (CRITICAL/URGENT) vs RULE_ANTIVIRUS_BLOCKED (MEDIUM/DIGEST)."""
+    # Blocked AV
+    blocked_ev = {
+        "log_type": "utm",
+        "subtype": "virus",
+        "action_normalized": "BLOCKED",
+        "signature": "Eicar-Test-Signature",
+    }
+    blocked_ep = {
+        "incident_id": "INC-AV-BLOCKED",
+        "source_ip": "10.0.1.50",
+        "target_ip": "203.0.113.10",
+        "enforcement": "BLOCKED",
+        "event_count": 1,
+        "events": [blocked_ev],
+    }
+    res_b = rule_engine.evaluate_episode(blocked_ep)
+    assert "RULE_ANTIVIRUS_BLOCKED" in res_b["matched_rule_ids"]
+    assert "RULE_ANTIVIRUS_DETECTION" not in res_b["matched_rule_ids"]
+    assert res_b["severity_floor"] == "MEDIUM"
+    assert res_b["routing_outcome"] == "DIGEST"
+
+    # Allowed / detected AV
+    allowed_ev = {
+        "log_type": "utm",
+        "subtype": "virus",
+        "action_normalized": "ALLOWED_OR_DETECTED",
+        "signature": "W32/Stuxnet",
+    }
+    allowed_ep = {
+        "incident_id": "INC-AV-ALLOWED",
+        "source_ip": "198.51.100.77",
+        "target_ip": "10.0.14.120",
+        "enforcement": "ALLOWED_OR_DETECTED",
+        "event_count": 1,
+        "events": [allowed_ev],
+    }
+    res_a = rule_engine.evaluate_episode(allowed_ep)
+    assert "RULE_ANTIVIRUS_DETECTION" in res_a["matched_rule_ids"]
+    assert res_a["severity_floor"] == "CRITICAL"
+    assert res_a["routing_outcome"] == "URGENT_ALERT_AND_INVESTIGATE"
+
+
+def test_restored_episode_evaluation(rule_engine):
+    """Restored episodes without raw events in memory evaluate against signatures and enforcement_counts."""
+    restored_ep = {
+        "incident_id": "INC-RESTORED-001",
+        "source_ip": "198.51.100.45",
+        "target_ip": "10.0.14.120",
+        "direction": "INBOUND",
+        "enforcement": "ALLOWED_OR_DETECTED",
+        "enforcement_counts": {"ALLOWED_OR_DETECTED": 3},
+        "event_count": 3,
+        "signatures": ["CVE-2021-44228"],
+        "restored": True,
+        "events": [],  # No raw events in memory
+    }
+    res = rule_engine.evaluate_episode(restored_ep)
+    assert "RULE_NONBLOCKED_EXPLOIT_ATTEMPT" in res["matched_rule_ids"]
+    assert res["severity_floor"] == "CRITICAL"
+    assert res["routing_outcome"] == "URGENT_ALERT_AND_INVESTIGATE"
+    assert "CVE-2021-44228" in res["reasons"][0]
+

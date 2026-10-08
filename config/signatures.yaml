@@ -1,0 +1,36 @@
+version: "1.0.0"
+description: "Locally reviewed FortiGuard IPS and UTM signature metadata mapping signatures to grounded CVE IDs"
+
+signatures:
+  - signature: "Apache.Log4j.Error.Log.Remote.Code.Execution"
+    cve_ids:
+      - "CVE-2021-44228"
+    product: "Apache Log4j"
+    provenance: "https://www.fortiguard.com/encyclopedia/ips/51006"
+    reviewed_at: "2026-10-06"
+
+  - signature: "OpenSSL.Heartbleed.Information.Disclosure"
+    cve_ids:
+      - "CVE-2014-0160"
+    product: "OpenSSL"
+    provenance: "https://www.fortiguard.com/encyclopedia/ips/38383"
+    reviewed_at: "2026-10-06"
+
+  - signature: "FortiOS.SSL.VPN.Authentication.Bypass"
+    cve_ids:
+      - "CVE-2022-40684"
+    product: "Fortinet FortiOS"
+    provenance: "https://www.fortiguard.com/psirt/FG-IR-22-377"
+    reviewed_at: "2026-10-06"
+
+  - signature: "SQL.Injection.UNION.SELECT"
+    cve_ids: []
+    product: "Generic Web Application"
+    provenance: "FortiGuard WAF Database"
+    reviewed_at: "2026-10-06"
+
+  - signature: "Eicar-Test-Signature"
+    cve_ids: []
+    product: "Standard Anti-Virus Test"
+    provenance: "EICAR Standard"
+    reviewed_at: "2026-10-06"

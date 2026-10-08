@@ -9,9 +9,123 @@
   "panels": [
     {
       "collapsed": false,
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
       "id": 1,
-      "title": "Raw Logs Fetched vs Normalized Events Ingested",
+      "title": "Loki Poller Freshness",
+      "description": "Seconds since last successful Loki query batch. Critical if > 3x poll interval.",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "forti_loki_last_success_age_seconds",
+          "legendFormat": "Loki Age (s)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "red", "value": 60 }
+            ]
+          },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "title": "Model Inference Freshness",
+      "description": "Seconds since last successful Qwen structured investigation.",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "forti_model_last_success_age_seconds",
+          "legendFormat": "Model Age (s)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 180 },
+              { "color": "red", "value": 600 }
+            ]
+          },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "title": "Event Backlog (Pending)",
+      "description": "Normalized events currently awaiting episode correlation processing.",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "forti_backlog_pending_events",
+          "legendFormat": "Pending Events",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 500 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "title": "Dead-Letter Outbox Alerts",
+      "description": "Outbox notifications moved to DEAD_LETTER after permanent failure.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "forti_outbox_dead_letter_total",
+          "legendFormat": "Dead Letters",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
+      "id": 5,
+      "title": "Raw Logs Fetched vs Normalized Ingest Rate",
+      "description": "Rate of raw Loki log lines processed vs filtered security events inserted.",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
@@ -29,24 +143,26 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
-      "id": 2,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
+      "id": 6,
       "title": "Active Incident Episodes in Memory",
-      "type": "gauge",
+      "description": "Currently active security attack episodes maintained within correlation windows.",
+      "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
           "expr": "forti_incidents_active_count",
-          "legendFormat": "Active Incidents",
+          "legendFormat": "Active Episodes",
           "refId": "A"
         }
       ]
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
-      "id": 3,
-      "title": "Google Chat Outbox Delivery Status",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "id": 7,
+      "title": "Google Chat Outbox Delivery & Retry Status",
+      "description": "Delivery throughput vs webhook transmission errors.",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
@@ -64,34 +180,36 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "id": 4,
-      "title": "Loki Poller Query Duration (p95 / p50)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "id": 8,
+      "title": "Loki Poller Query Latency (p95 / p50)",
+      "description": "Distribution of LogQL poll query latencies against Loki read endpoint.",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum by (le) (rate(forti_poller_query_duration_seconds_bucket[5m])))",
-          "legendFormat": "p95 Duration",
+          "legendFormat": "p95 Duration (s)",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.50, sum by (le) (rate(forti_poller_query_duration_seconds_bucket[5m])))",
-          "legendFormat": "p50 Duration",
+          "legendFormat": "p50 Duration (s)",
           "refId": "B"
         }
       ]
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "id": 5,
-      "title": "Local Qwen Investigation Latency & Failures",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "id": 9,
+      "title": "Local Qwen Investigation Latency & Rate Limits",
+      "description": "Model inference duration and concurrency rate-limit / circuit breaker events.",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "rate(forti_model_inference_duration_seconds_sum[5m]) / rate(forti_model_inference_duration_seconds_count[5m])",
+          "expr": "rate(forti_model_inference_duration_seconds_sum[5m]) / clamp_min(rate(forti_model_inference_duration_seconds_count[5m]), 0.001)",
           "legendFormat": "Average Latency (s)",
           "refId": "A"
         },
@@ -99,6 +217,11 @@
           "expr": "rate(forti_model_failures_total[5m])",
           "legendFormat": "Inference Failures/sec",
           "refId": "B"
+        },
+        {
+          "expr": "rate(forti_investigations_rate_limited_total[5m])",
+          "legendFormat": "Rate Limited/sec",
+          "refId": "C"
         }
       ]
     }
@@ -119,5 +242,5 @@
   "time": { "from": "now-1h", "to": "now" },
   "title": "FortiGate Agent Operations & Telemetry",
   "uid": "fortigate-agent-operations",
-  "version": 1
+  "version": 2
 }

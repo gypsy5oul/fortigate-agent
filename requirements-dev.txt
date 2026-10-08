@@ -1,0 +1,5 @@
+# Development and testing dependencies
+-r requirements.txt
+pytest==8.4.2
+pytest-asyncio==1.2.0
+pip-tools==7.6.2
