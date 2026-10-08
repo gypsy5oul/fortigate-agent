@@ -20,6 +20,8 @@ OUT="${2:?usage: make_phase_report.sh <phase> <output.md> [notes.md]}"
 NOTES="${3:-}"
 : "${TEST_DATABASE_URL:?TEST_DATABASE_URL must point at a scratch PostgreSQL 16 database}"
 PYTHON="${PYTHON:-python3}"
+# Interpreter directory, masked in transcripts (pytest prints it in its header line).
+case "$PYTHON" in */*) PYTHON_DIR="$(cd "$(dirname "$PYTHON")" && pwd)" ;; *) PYTHON_DIR="/nonexistent-python-dir" ;; esac
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
@@ -48,6 +50,7 @@ redact() {
   sed -E \
     -e "s#$CHECKOUT#<checkout>#g" \
     -e "s#$REPO_ROOT#<repo>#g" \
+    -e "s#${PYTHON_DIR}#<python-bin>#g" \
     -e "s#(postgres(ql)?://)[^[:space:]'\"]+#\1<redacted>#g" \
     -e "s#\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b#<private-ip>#g" \
     -e "s#\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b#<private-ip>#g" \
