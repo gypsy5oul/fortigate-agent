@@ -134,11 +134,18 @@ class IntelligenceService:
         )
 
         # ADK investigator (ADR 005), imported only when a mode needs it: legacy never loads ADK.
+        # In shadow mode a broken agent set-up must not stop the service: it runs legacy-only and
+        # says so. In adk mode the agent is the investigator, so a broken set-up is fatal.
         self.agent_investigator = None
         if self.settings.investigator_mode in ("shadow", "adk"):
-            from src.investigation.agent.runtime import AgentInvestigator
+            try:
+                from src.investigation.agent.runtime import AgentInvestigator
 
-            self.agent_investigator = AgentInvestigator(self.settings, self.db, self.loki_client)
+                self.agent_investigator = AgentInvestigator(self.settings, self.db, self.loki_client)
+            except Exception as e:
+                if self.settings.investigator_mode == "adk":
+                    raise
+                logger.error("ADK investigator unavailable; shadow runs are disabled: %s", e)
         logger.info("Investigator mode: %s", self.settings.investigator_mode)
 
         self.outbox_worker = OutboxWorker(
@@ -630,7 +637,7 @@ class IntelligenceService:
                 )
                 logger.info("Investigation job %s completed and committed successfully", job_id)
 
-                if self.settings.investigator_mode == "shadow":
+                if self.settings.investigator_mode == "shadow" and self.agent_investigator is not None:
                     await self._run_shadow(packet, assessment)
 
             except Exception as e:

@@ -116,3 +116,20 @@ async def test_shadow_failure_never_fails_the_job_or_the_legacy_write(pg, monkey
     outbox = await pg.fetch_all("SELECT notification_type FROM notification_outbox WHERE incident_id = $1", inc_id)
     assert [o["notification_type"] for o in outbox] == ["INVESTIGATION_UPDATE"]
     assert await pg.fetch_all("SELECT id FROM shadow_assessments") == []
+
+
+def test_broken_agent_setup_disables_shadow_but_is_fatal_in_adk_mode(monkeypatch):
+    import src.investigation.agent.runtime as runtime
+    from src.main import IntelligenceService
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("no session store")
+
+    monkeypatch.setattr(runtime, "AgentInvestigator", broken)
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    monkeypatch.setenv("GCHAT_DRY_RUN", "true")
+    monkeypatch.setenv("INVESTIGATOR_MODE", "shadow")
+    assert IntelligenceService().agent_investigator is None
+    monkeypatch.setenv("INVESTIGATOR_MODE", "adk")
+    with pytest.raises(RuntimeError, match="no session store"):
+        IntelligenceService()

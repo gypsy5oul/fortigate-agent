@@ -117,7 +117,7 @@ docker compose restart app
 ### 5.1 Enabling shadow mode
 1. vLLM must serve the model with `--enable-auto-tool-choice --tool-call-parser hermes` (Qwen tool calling). Without it the specialists cannot call tools and shadow runs end `ERROR` or `SCHEMA_INVALID`; the legacy path is unaffected.
 2. Set `INVESTIGATOR_MODE=shadow` in `.env` (optionally `AGENT_MAX_LLM_CALLS`, default 8, and `AGENT_TIMEOUT_SECONDS`, default 120) and restart: `docker compose up -d app`.
-3. Check the start-up log for `Investigator mode: shadow` and that migration `006_agent_audit` is applied: `SELECT version FROM schema_migrations;`.
+3. Check the start-up log for `Investigator mode: shadow` and that migration `006_agent_audit` is applied: `SELECT version FROM schema_migrations;`. The error `ADK investigator unavailable; shadow runs are disabled` means the agent could not be set up; the service then runs legacy-only (in `adk` mode the same failure stops the service).
 
 Shadow runs happen in the investigation loop after the legacy revision is committed, so each investigated revision takes up to `AGENT_TIMEOUT_SECONDS` longer to clear from the queue (`forti_jobs_oldest_pending_seconds`). They never produce a revision, a card or an outbox row, and their failure never fails the job.
 

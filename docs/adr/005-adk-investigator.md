@@ -68,7 +68,7 @@ The fallback is the deterministic assessment the legacy path uses (`MODEL_REJECT
 - `shadow`: the legacy call writes the revision and the card through `record_incident_transition`; after that commit, the ADK pipeline runs and writes `agent_runs`, `agent_events` and one `shadow_assessments` row with the agreement fields (severity equal, action set equal, exploitation assessment equal, findings counts). No revision, no card. Any failure there is logged and never fails the job or the legacy write.
 - `adk`: the ADK result is the revision, committed through the same `record_incident_transition` with the same `expected_revision` CAS and job fence, with a `model_runs` row (`structured_output_mode=adk_json_schema`, `validation_result` = the run outcome) kept for backward compatibility.
 
-In shadow and adk modes a run in progress is abandoned when the service starts stopping, so the SIGTERM contract (exit 0 within the stop timeout) holds; in adk mode the job is then left to its lease and retried.
+If the ADK investigator cannot be set up at start-up, shadow mode logs `ADK investigator unavailable; shadow runs are disabled` and runs legacy-only, while adk mode refuses to start. In shadow and adk modes a run in progress is abandoned when the service starts stopping, so the SIGTERM contract (exit 0 within the stop timeout) holds; in adk mode the job is then left to its lease and retried.
 
 ## Consequences
 - Agents never write: enforced by `_select`, by the tool contract tests (a database spy records every statement and asserts none writes) and by the pipeline test (no service table changes during a run).

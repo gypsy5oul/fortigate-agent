@@ -1,8 +1,9 @@
 """Phase C.0: the scripted fake vLLM and steps 1 and 2 of the ADK spike, run through the real ADK.
 
 The fake-server contract tests need only FastAPI and run everywhere. The ADK tests are skipped
-(pytest.importorskip) where google-adk is not installed, which is the case for the runtime
-requirements and for CI until the C.1 dependency decision. Nothing here touches the network
+where google-adk or litellm is not installed. Since Phase C.1 the runtime requirements carry
+google-adk but not litellm (ADR 005), so CI skips them; tests/agent/test_agent_openai_model.py runs
+the same two steps through ADK's native OpenAILlm instead. Nothing here touches the network
 beyond 127.0.0.1 and nothing touches PostgreSQL: the ADK steps use InMemorySessionService.
 """
 
