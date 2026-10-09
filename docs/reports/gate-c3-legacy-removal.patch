@@ -19,6 +19,105 @@ index 3d812df..495e2c1 100644
  AGENT_MAX_LLM_CALLS=8
  AGENT_TIMEOUT_SECONDS=120
  # Leave unset to derive postgresql+asyncpg://... from DATABASE_URL (ADK tables in schema "adk").
+diff --git a/README.md b/README.md
+index fc4f46f..1635787 100644
+--- a/README.md
++++ b/README.md
+@@ -10,8 +10,8 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
+ - **Selective, Budgeted Ingest**: The `security_events` query profile (`LOKI_QUERY_PROFILE`) asks Loki only for UTM detections (`type="utm"`), FortiOS event logs (`type="event"`), perimeter denies (`action="deny"`) and UTM blocks (`utmaction="block"`). Routine accepted traffic (`action="accept"`, `action="close"`) is dropped at ingest and never mirrored to the database. A `traffic_context` profile serves on-demand enrichment: only the ADK investigator's read-only `query_traffic_context` tool calls it (shadow and adk modes, section 5).
+ - **Monotonic Query Checkpoints**: Loki log cursors advance monotonically in durable PostgreSQL storage only after events are successfully inserted.
+ - **Fail-Safe Deterministic Severity Floor**: High-impact non-blocked exploits (`action="detected"` or `"passthrough"`) immediately establish a critical severity floor. If the local LLM is offline, degraded, or times out, deterministic alerts are dispatched without disruption.
+-- **Bounded Structured Model Output**: Uses OpenAI-compatible `response_format={"type": "json_schema"}` with strict Pydantic schemas, defensive delimiters (`<<UNTRUSTED id=...>>`) against prompt injection, and complete audit persistence in `model_runs`. The default `legacy` investigator makes one bounded call with a single-repair retry; the ADK investigator asks a schema-bound writer for exactly one object and falls back to the deterministic assessment instead of repairing.
+-- **ADK Agent Investigator (shadow and adk modes)**: A Google ADK agent system (a master investigator, two specialist agents with read-only tools, and a schema-bound writer) runs beside the single call when `INVESTIGATOR_MODE=shadow`, audited in `agent_runs`, `agent_events` and `shadow_assessments` without producing any revision or card, or replaces it when `INVESTIGATOR_MODE=adk` (section 5, `docs/adr/005-adk-investigator.md`). The default stays `legacy`; promoting `adk` is a one-setting flip with a one-setting rollback, gated on lab evidence (runbook sections 5.5 to 5.7).
++- **Bounded Structured Model Output**: Uses OpenAI-compatible `response_format={"type": "json_schema"}` with strict Pydantic schemas, defensive delimiters (`<<UNTRUSTED id=...>>`) against prompt injection, and complete audit persistence in `model_runs`. The ADK investigator asks a schema-bound writer for exactly one object and falls back to the deterministic assessment instead of repairing.
++- **ADK Agent Investigator**: A Google ADK agent system (a master investigator, two specialist agents with read-only tools, and a schema-bound writer) investigates every urgent incident (`INVESTIGATOR_MODE=adk`, the only mode; the bounded single call it replaced and the shadow mode that compared with it were removed, ADR 005 section 10). Every run is audited in `agent_runs` and `agent_events` (section 5, `docs/adr/005-adk-investigator.md`).
+ - **Firewall-Only Evidence Boundary**: Strictly restricted to `visibility_scope=FIREWALL_ONLY`. Unsupported claims of application compromise are rejected and downgraded to `ATTEMPT_OBSERVED`.
+ - **Reliable Priority Outbox**: Google Chat Cards v2 alerts are delivered via an outbox worker honoring strict priority ordering (URGENT > INVESTIGATION_UPDATE > DIGEST), exponential backoff with jitter, `Retry-After` rate-limiting, and permanent 4xx dead-lettering.
+ 
+@@ -55,16 +55,14 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
+ │   │   └── engine.py               # Zero-code declarative condition evaluator
+ │   ├── investigation/
+ │   │   ├── schemas.py              # Pydantic schemas (IncidentPacket, QwenAssessment, WriterAssessment)
+-│   │   ├── prompts/                # Versioned prompt templates (legacy single call; removed by the C.3 patch)
+ │   │   ├── validator.py            # Security guardrails & CVE claim validator
+ │   │   ├── eligibility.py          # Perimeter action eligibility constraints
+-│   │   ├── single_call_workflow.py # Structured output LLM runner with repair loop (legacy mode; removed by the C.3 patch)
+-│   │   └── agent/                  # ADK investigator (shadow and adk modes, ADR 005)
++│   │   └── agent/                  # ADK investigator (ADR 005)
+ │   │       ├── agents.py           # Master, two specialists, writer; Workflow root
+ │   │       ├── tools.py            # Read-only tools bound to the incident in session state
+ │   │       ├── callbacks.py        # Bounds, redaction/delimiters, model-call ceiling, usage
+ │   │       ├── runtime.py          # Runner, sessions, budgets, outcome mapping, validator
+-│   │       ├── audit.py            # Per-run record; writer of agent_runs/agent_events/shadow_assessments
++│   │       ├── audit.py            # Per-run record; writer of agent_runs/agent_events
+ │   │       ├── evaluation.py       # adk eval / AgentEvaluator entry point (App, per-session run binding, tool fixtures)
+ │   │       └── instructions/       # Versioned agent instructions 1.1.0 (master, evidence, context, writer)
+ │   ├── notifications/
+@@ -82,7 +80,7 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
+ │   ├── lab/                        # Redacted real incidents (scripts/export_golden_incident.py; empty until exported)
+ │   └── test_config.json            # adk eval criteria (trajectory 1.0, response match 0.6)
+ ├── scripts/
+-│   ├── shadow_report.py            # Shadow comparison harness (agreement, rejects, latency, tokens, tools)
++│   ├── shadow_report.py            # Harness over the audit tables (outcomes, rejects, latency, tokens, tools; --mode live for the investigator; agreement for the shadow evidence of the past)
+ │   ├── export_golden_incident.py   # Redacted export of a real incident as a golden case
+ │   ├── build_golden_set.py         # Builds evals/golden from the e2e scenarios
+ │   ├── code_accounting.py          # Lines under src/investigation/ by bucket (legacy, agent runtime, shared, instructions) and the effect of a patch
+@@ -90,7 +88,7 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
+ ├── docs/
+ │   ├── runbook.md                  # Backup/restore, reprocessing, and recovery runbook
+ │   ├── data-dictionary.md          # Complete PostgreSQL schema and data dictionary
+-│   ├── reports/                    # Generated phase reports; gate-c3-legacy-removal.patch is the prepared, unapplied legacy removal
++│   ├── reports/                    # Generated phase reports; gate-c3-legacy-removal.patch is the legacy removal, as applied
+ │   └── adr/                        # Architectural Decision Records
+ └── tests/                          # Unit, PostgreSQL integration, agent (tests/agent) and real-process e2e tests
+ ```
+@@ -140,28 +138,28 @@ curl http://localhost:8085/metrics
+ 
+ ## 5. Investigator Modes
+ 
+-`INVESTIGATOR_MODE` selects who writes the investigation revision of an urgent incident. Detection, severity floors, URGENT cards, the outbox and checkpoints are the same in every mode.
++The ADK agent pipeline writes the investigation revision of every urgent incident. Detection, severity floors, URGENT cards, the outbox and checkpoints do not depend on it. `INVESTIGATOR_MODE` has one value:
+ 
+ | Mode | Investigation revision and card | ADK agent pipeline | Rows written by the agent path |
+ | :--- | :--- | :--- | :--- |
+-| `legacy` (default until an operator flips it) | one bounded structured call (`single_call_workflow.py`) | not loaded | none |
+-| `shadow` | the legacy call, unchanged | runs after the legacy revision is committed; never writes a revision or a card; a failure there never fails the job | `agent_runs`, `agent_events`, `shadow_assessments` |
+-| `adk` | the ADK pipeline's validated assessment (or the deterministic fallback), through the same `record_incident_transition` CAS and job fence | runs instead of the legacy call | `agent_runs`, `agent_events`, plus the usual `model_runs` row (`structured_output_mode` `adk_json_schema`; same `incident_id` and `revision` as its `agent_runs` row) |
++| `adk` (default) | the pipeline's validated assessment (or the deterministic fallback), through `record_incident_transition` with its `expected_revision` CAS and job fence | runs for every investigation job | `agent_runs`, `agent_events`, plus the usual `model_runs` row (`structured_output_mode` `adk_json_schema`; same `incident_id` and `revision` as its `agent_runs` row) |
+ 
+-The pipeline: `incident_investigator` calls `evidence_agent` (tools `get_incident_packet`, `query_traffic_context`) and then `context_agent` (`lookup_asset`, `lookup_signature`, `recent_incidents_for_source`, `get_action_catalog`) as tools, writes investigation notes, and `assessment_writer` turns them into a schema-bound assessment that passes the same validator as the legacy path. Every tool is read-only and bound to the incident in session state; every tool result is redacted and wrapped in `<<UNTRUSTED>>` delimiters. Settings:
++`legacy` (the bounded single call) and `shadow` (the pipeline beside it) were removed by `docs/reports/gate-c3-legacy-removal.patch`; a stale value in `.env` stops the service at start-up with a validation error. Going back to the single call is a `git revert` of that commit (runbook 5.6).
++
++The pipeline: `incident_investigator` calls `evidence_agent` (tools `get_incident_packet`, `query_traffic_context`) and then `context_agent` (`lookup_asset`, `lookup_signature`, `recent_incidents_for_source`, `get_action_catalog`) as tools, writes investigation notes, and `assessment_writer` turns them into a schema-bound assessment that passes the validator (identity, enforcement pin, severity floor, CVE grounding, action eligibility, forbidden claims). Every tool is read-only and bound to the incident in session state; every tool result is redacted and wrapped in `<<UNTRUSTED>>` delimiters. Settings:
+ 
+ | Variable | Default | Meaning |
+ | :--- | :--- | :--- |
+-| `INVESTIGATOR_MODE` | `legacy` | `legacy`, `shadow` or `adk`; flipping to `adk` and back is this one setting and a container recreate (`docker compose up -d app`) |
++| `INVESTIGATOR_MODE` | `adk` | the only accepted value; anything else is refused at start-up |
+ | `AGENT_MAX_LLM_CALLS` | `8` | model calls per investigation across all four agents; beyond it the run stops with `AGENT_BUDGET_EXHAUSTED` |
+ | `AGENT_TIMEOUT_SECONDS` | `120` | deadline for one whole investigation; beyond it `AGENT_TIMEOUT` |
+ | `ADK_SESSION_DB_URL` | derived | ADK session store; unset means `DATABASE_URL` as `postgresql+asyncpg://`, tables in schema `adk` (migration 006) |
+ 
+-The agents use `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT_SECONDS` (per model call), `LLM_MAX_INPUT_TOKENS` and `LLM_MAX_OUTPUT_TOKENS`. vLLM must run with `--enable-auto-tool-choice --tool-call-parser hermes` for Qwen tool calling. Shadow results are compared with the legacy call by `scripts/shadow_report.py` (in the image: `docker compose exec -T app python scripts/shadow_report.py --hours 24`). Operating the modes and the promotion evidence: [docs/runbook.md](docs/runbook.md) section 5.
++The agents use `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT_SECONDS` (per model call), `LLM_MAX_INPUT_TOKENS` and `LLM_MAX_OUTPUT_TOKENS`. vLLM must run with `--enable-auto-tool-choice --tool-call-parser hermes` for Qwen tool calling. The runs are read with `scripts/shadow_report.py --mode live` (in the image: `docker compose exec -T app python scripts/shadow_report.py --mode live --hours 24`); its default window, `shadow`, holds the evidence collected before the removal. Operating the investigator and the evidence behind a change: [docs/runbook.md](docs/runbook.md) section 5.
+ 
+-### Promotion path (Phase C.3)
++### History (Phase C.3)
+ 
+-The default becomes `adk` and the legacy single call goes only when the plan's C2.5 criteria hold on the golden set and on at least 50 real shadow runs against the lab model. That evidence cannot come from CI, so this repository ships the mechanics and leaves the decision to the operator: the gate table to fill in (runbook 5.5), the flip, the first-hour watch list and the rollback (5.7, 5.6), and `docs/reports/gate-c3-legacy-removal.patch`, a prepared and unapplied change that deletes the legacy workflow and its prompts, makes `adk` the only accepted value of `INVESTIGATOR_MODE` and updates the tests. Apply the patch only after the flip has soaked: from then on the way back is a `git revert`, not a setting. `python scripts/code_accounting.py --patch docs/reports/gate-c3-legacy-removal.patch` prints the lines it removes and adds under `src/investigation/`.
++The default became `adk` and the single call went after the plan's C2.5 criteria were met on the golden set and on real shadow runs against the lab model (the gate table of runbook 5.5 is the record). `python scripts/code_accounting.py` prints the lines under `src/investigation/` by bucket (agent runtime, shared, instruction files).
+ 
+ ---
+ 
+@@ -174,7 +172,7 @@ The test suite covers unit tests, PostgreSQL 16 integration tests, and full chil
+ TEST_DATABASE_URL="postgresql://forti_intel:<password>@<db-host>:5432/forti_test" pytest -v tests/
+ ```
+ 
+-The ADK investigator is tested without a live model: `tests/agent/` drives the real ADK with a scripted `BaseLlm` (`tests/agent/fake_llm.py`) and fake Loki, and the e2e suite runs the real process in `shadow` and `adk` modes against a fake vLLM that answers OpenAI-format `tool_calls`. The `adk` cases cover the committed revision with its `model_runs` and `agent_runs` rows and exactly one INVESTIGATION_UPDATE card, a revision taken by another writer mid-run (the CAS refuses it, the job is retried, nothing is written twice), a writer that answers garbage (the deterministic fallback with `AGENT_SCHEMA_INVALID`, the service carries on) and SIGTERM during a run (exit code 0, the job completed after the next start).
++The ADK investigator is tested without a live model: `tests/agent/` drives the real ADK with a scripted `BaseLlm` (`tests/agent/fake_llm.py`) and fake Loki, and the e2e suite runs the real process in the default mode against a fake vLLM that answers OpenAI-format `tool_calls`. The `adk` cases cover the committed revision with its `model_runs` and `agent_runs` rows and exactly one INVESTIGATION_UPDATE card, a revision taken by another writer mid-run (the CAS refuses it, the job is retried, nothing is written twice), a writer that answers garbage (the deterministic fallback with `AGENT_SCHEMA_INVALID`, the service carries on) and SIGTERM during a run (exit code 0, the job completed after the next start).
+ 
+ ### Golden set and `adk eval` (model lab, not CI)
+ 
 diff --git a/config/settings.py b/config/settings.py
 index b714d90..c41a1d3 100644
 --- a/config/settings.py
@@ -39,6 +138,242 @@ index b714d90..c41a1d3 100644
          ),
      )
      agent_max_llm_calls: int = Field(
+diff --git a/docs/adr/001-bounded-single-call-workflow.md b/docs/adr/001-bounded-single-call-workflow.md
+index d8d090e..e99e4e8 100644
+--- a/docs/adr/001-bounded-single-call-workflow.md
++++ b/docs/adr/001-bounded-single-call-workflow.md
+@@ -1,7 +1,7 @@
+ # ADR 001: Bounded Investigation Workflow & Structured Output
+ 
+ ## Status
+-Accepted (6 October 2026; updated Phase B, 7 October 2026)
++Accepted (6 October 2026; updated Phase B, 7 October 2026). Superseded for the investigation step by ADR 005 once the single call is removed (`docs/reports/gate-c3-legacy-removal.patch`): the bounded pipeline shape, the validator and the deterministic fallback stay; the single call and its repair loop do not.
+ 
+ ## Context
+ We need automated investigation of security incidents derived from FortiGate 200G firewall logs. Raw firewall volume is too high for direct LLM ingestion, and arbitrary agent autonomy (unconstrained swarms, shell execution, database manipulation) poses security and reliability risks. The runtime investigation model is a local Qwen3.8-27B served via vLLM (`http://vllm.internal:8000/v1`).
+diff --git a/docs/adr/005-adk-investigator.md b/docs/adr/005-adk-investigator.md
+index 6ecf94b..ac40baf 100644
+--- a/docs/adr/005-adk-investigator.md
++++ b/docs/adr/005-adk-investigator.md
+@@ -1,6 +1,8 @@
+ # ADR 005: ADK agent investigator, in shadow mode
+ 
+ ## Status
++Update: the legacy single call and shadow mode were removed by `docs/reports/gate-c3-legacy-removal.patch`; `adk` is the only investigator. Sections 8 and 10 describe the three modes as they were during the promotion and the removal; deviation 30 describes what C.3 did before the patch was applied.
++
+ Accepted for shadow mode (9 October 2026, Phase C.1; Phase C.2 the same day: instructions 1.1.0, golden set, evaluation entry point, comparison harness, metrics, section 9; Phase C.3 the same day: promotion readiness, section 10). `INVESTIGATOR_MODE=adk` exists and is proven end to end against a scripted model, including the revision CAS and job fence, a model that answers garbage, and SIGTERM during a run. The default is still `legacy` and the legacy single call is still in the tree: making `adk` the default and deleting the single call wait for the C.2 promotion criteria on the lab model. The golden-set criteria are met offline against the scripted fake; the 50 real shadow runs and the lab `adk eval` are still to be produced in the lab (runbook section 5.5). Phase C.3 delivers the flip and the rollback as one setting each, the gate table to fill in, and the removal as a prepared, unapplied patch. The plan (`docs/GEMINI-PHASE-B1-AND-PHASE-C-ADK-PLAN.md`) calls this record `002-adk-investigator.md`; ADRs 001 to 004 already exist, so it is 005.
+ 
+ ## Context
+diff --git a/docs/data-dictionary.md b/docs/data-dictionary.md
+index 8e34cdf..2ee6f7a 100644
+--- a/docs/data-dictionary.md
++++ b/docs/data-dictionary.md
+@@ -188,7 +188,7 @@ Asynchronous investigation work queue leased by worker loops.
+ ### 1.9 `model_runs`
+ Complete audit trail for every LLM interaction, token usage, validation result, and transactional outcome.
+ 
+-In `adk` mode every row (`structured_output_mode = 'adk_json_schema'`) has a matching `agent_runs` row (section 1.12) for the same `incident_id` and `revision`, with the same `model_id`, tokens and latency, and `validation_result` equal to that run's `outcome`. There is no foreign key between the two tables, so join on `incident_id` and `revision` (and `agent_runs.mode = 'live'`). A job that is retried adds a row to each table; a commit refused by the revision CAS (another writer took the revision first) leaves `commit_status = 'CONFLICT'` and the `agent_runs` row in place. Rows of the legacy single call have no `agent_runs` row.
++In `adk` mode every row (`structured_output_mode = 'adk_json_schema'`) has a matching `agent_runs` row (section 1.12) for the same `incident_id` and `revision`, with the same `model_id`, tokens and latency, and `validation_result` equal to that run's `outcome`. There is no foreign key between the two tables, so join on `incident_id` and `revision` (and `agent_runs.mode = 'live'`). A job that is retried adds a row to each table; a commit refused by the revision CAS (another writer took the revision first) leaves `commit_status = 'CONFLICT'` and the `agent_runs` row in place. Rows of the legacy single call, removed from the tree, have no `agent_runs` row.
+ 
+ | Column | Data Type | Nullable | Default | Description |
+ |---|---|---|---|---|
+@@ -206,7 +206,7 @@ In `adk` mode every row (`structured_output_mode = 'adk_json_schema'`) has a mat
+ | `input_tokens` | `INT` | No | `0` | Prompt token count consumed |
+ | `output_tokens` | `INT` | No | `0` | Completion tokens generated |
+ | `latency_ms` | `INT` | No | `0` | Model roundtrip latency in milliseconds |
+-| `structured_output_mode` | `VARCHAR(32)` | No | `'json_schema'` | Mode used (`json_schema` or `json_object` by the legacy single call; `adk_json_schema` for an ADK revision in `INVESTIGATOR_MODE=adk`) |
++| `structured_output_mode` | `VARCHAR(32)` | No | `'json_schema'` | Mode used (`adk_json_schema` for an ADK revision; `json_schema` or `json_object` on rows written by the legacy single call before its removal) |
+ | `validation_result` | `VARCHAR(32)` | No | - | Schema check result (`VALID`, `REPAIRED`, `REJECTED`, `TIMEOUT`, `ERROR`); an ADK revision writes its `agent_runs.outcome` here (`VALID`, `REJECTED`, `BUDGET_EXHAUSTED`, `TIMEOUT`, `SCHEMA_INVALID`, `ERROR`) |
+ | `reason_codes` | `TEXT[]` | Yes | `'{}'` | Guardrail rule violations or validator downgrade reasons |
+ | `commit_status` | `VARCHAR(32)` | No | `'COMMITTED'` | State of transaction (`PENDING`, `COMMITTED`, `CONFLICT`, `FAILED`) |
+@@ -253,7 +253,7 @@ One row per ADK investigation (migration 006, ADR 005), written by the runtime w
+ | `incident_id` | `VARCHAR(64)` | No | - | Incident investigated |
+ | `revision` | `INT` | No | - | Revision the run assessed (the revision the investigation produces or shadows) |
+ | `session_id` | `VARCHAR(160)` | No | - | ADK session id, `<incident_id>:<revision>` (`adk.sessions.id`) |
+-| `mode` | `VARCHAR(16)` | No | - | `shadow` (INVESTIGATOR_MODE=shadow) or `live` (INVESTIGATOR_MODE=adk) |
++| `mode` | `VARCHAR(16)` | No | - | `live` (the investigator; `INVESTIGATOR_MODE=adk`) or `shadow` (rows from the removed shadow mode) |
+ | `adk_version` | `VARCHAR(32)` | No | - | Installed `google-adk` version |
+ | `model_id` | `VARCHAR(128)` | No | - | Configured model (`LLM_MODEL`) |
+ | `prompt_versions` | `JSONB` | No | `'{}'` | `# Version:` of each instruction file, keyed by agent name |
+@@ -289,7 +289,7 @@ One row per model call or tool call of an ADK run, in order: the trail an analys
+ ---
+ 
+ ### 1.14 `shadow_assessments`
+-The ADK result of a `shadow` run next to its agreement with the legacy assessment of the same revision. Never shown to anyone: no revision and no card come from it.
++The ADK result of a `shadow` run next to its agreement with the legacy assessment of the same revision. Never shown to anyone: no revision and no card come from it. Shadow mode was removed with the legacy call, so nothing writes this table any more; it holds the evidence collected before the removal.
+ 
+ | Column | Data Type | Nullable | Default | Description |
+ |---|---|---|---|---|
+@@ -328,7 +328,7 @@ Created by migration 006 for ADK's `DatabaseSessionService`, which creates and o
+ ### 2.3 Assessment Sources
+ - `DETERMINISTIC`: Revision created directly from deterministic signature / threshold rule evaluations.
+ - `MODEL_VALIDATED`: Model investigation assessment validated on first pass against strict schema and guardrails.
+-- `MODEL_REPAIRED`: Model investigation assessment required single-repair bounded pass before acceptance. Written only by the legacy single call; the ADK path has no repair pass.
++- `MODEL_REPAIRED`: Model investigation assessment required single-repair bounded pass before acceptance. Written only by the legacy single call, which was removed: the ADK path has no repair pass, so only historical rows carry it.
+ - `MODEL_REJECTED_FALLBACK`: Model investigation rejected or failed; deterministic fallback values applied. In `adk` mode the cause is the run's outcome (`agent_runs.outcome`, `model_runs.validation_result`) and the `AGENT_*` reason code in the summary.
+ - `RATE_LIMITED`: Deterministic revision whose investigation job was not queued because the per-source or per-target hourly limit was reached.
+ 
+diff --git a/docs/runbook.md b/docs/runbook.md
+index 218a113..78bce7c 100644
+--- a/docs/runbook.md
++++ b/docs/runbook.md
+@@ -112,28 +112,28 @@ docker compose restart app
+ 
+ ## 5. Investigator Modes (ADK agent investigator)
+ 
+-`INVESTIGATOR_MODE` (`legacy` default, `shadow`, `adk`) selects who writes the investigation revision; see README section 5 and `docs/adr/005-adk-investigator.md`. Detection, URGENT cards, the outbox and checkpoints do not depend on it. `legacy` stays the default until an operator flips it: 5.5 is the evidence and the gate table, 5.7 the flip and the first hour, 5.6 the way back. The flip and the rollback are each one setting and a container recreate.
++The ADK agent investigator writes the investigation revision of every urgent incident. `INVESTIGATOR_MODE` is kept as a setting whose only value, and default, is `adk`: `legacy` and `shadow` went with the single call and stop the service at start-up with a validation error. See README section 5 and `docs/adr/005-adk-investigator.md`. Detection, URGENT cards, the outbox and checkpoints do not depend on it. 5.5 is the evidence to gather again after a change of model, instructions or vLLM flags (and the record template of the promotion), 5.6 the way back and 5.7 what to watch after a deploy.
+ 
+-### 5.1 Enabling shadow mode
+-1. vLLM must serve the model with `--enable-auto-tool-choice --tool-call-parser hermes` (Qwen tool calling). Without it the specialists cannot call tools and shadow runs end `ERROR` or `SCHEMA_INVALID`; the legacy path is unaffected.
+-2. Set `INVESTIGATOR_MODE=shadow` in `.env` (optionally `AGENT_MAX_LLM_CALLS`, default 8, and `AGENT_TIMEOUT_SECONDS`, default 120) and restart: `docker compose up -d app`.
+-3. Check the start-up log for `Investigator mode: shadow` and that migration `006_agent_audit` is applied: `SELECT version FROM schema_migrations;`. The error `ADK investigator unavailable; shadow runs are disabled` means the agent could not be set up; the service then runs legacy-only (in `adk` mode the same failure stops the service).
++### 5.1 Requirements
++1. vLLM must serve the model with `--enable-auto-tool-choice --tool-call-parser hermes` (Qwen tool calling). Without it the specialists cannot call tools and every run ends `ERROR` or `SCHEMA_INVALID`, so each urgent incident gets a deterministic fallback card.
++2. Check the start-up log for `Investigator mode: adk` and that migration `006_agent_audit` is applied: `SELECT version FROM schema_migrations;`. A broken agent set-up (an unusable session store, for example) stops the service at start-up.
++3. Optionally set `AGENT_MAX_LLM_CALLS` (default 8) and `AGENT_TIMEOUT_SECONDS` (default 120) in `.env` and recreate the container: `docker compose up -d app`.
+ 
+-Shadow runs happen in the investigation loop after the legacy revision is committed, so each investigated revision takes up to `AGENT_TIMEOUT_SECONDS` longer to clear from the queue (`forti_jobs_oldest_pending_seconds`). They never produce a revision, a card or an outbox row, and their failure never fails the job.
++Investigations run one at a time, so each investigated revision takes up to `AGENT_TIMEOUT_SECONDS` of queue time (`forti_jobs_oldest_pending_seconds`). A run in progress when the service stops is abandoned and its job is left to its lease.
+ 
+-### 5.2 Reading shadow results
++### 5.2 Reading results
+ The comparison harness reads the audit tables (read-only) and prints agreement with the legacy assessment, outcomes and the validator hard-reject rate, p50/p95 latency, tokens and model calls per run, tool calls and refusals, and the plan C2.5 criteria with what was measured:
+ ```bash
+ docker compose exec -T app python scripts/shadow_report.py --hours 24            # Markdown
+ docker compose exec -T app python scripts/shadow_report.py --since 2026-10-10T00:00:00Z --json
+ ```
+-`--check lab` (or `--check golden`) exits 1 when that criteria set is not met. The default window mode is `shadow`; the runs of `adk` mode are mode `live`, so after a flip read them with `--mode live` (5.7). A live run has no shadow comparison: the agreement table reads 0/0, and `--check golden` reads not met by construction. The outcome, hard-reject, latency, token, tool and refusal numbers are the live ones, and `--mode live --check lab` confirms the lab bars on the first 50 live runs. The same numbers as SQL:
++`--check lab` (or `--check golden`) exits 1 when that criteria set is not met. The agent's runs are mode `live`, so pass `--mode live`; the default window, `shadow`, holds only the shadow evidence collected before the legacy removal. A live run is compared with nothing: the agreement table reads 0/0 and `--check golden` reads not met by construction. The outcome, hard-reject, latency, token, tool and refusal numbers are the live ones, and `--mode live --check lab` checks the lab bars once there are 50 live runs. The same numbers as SQL:
+ ```sql
+ -- Outcomes of the last day
+ SELECT mode, outcome, COUNT(*), PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms
+ FROM agent_runs WHERE created_at > NOW() - INTERVAL '1 day' GROUP BY 1, 2 ORDER BY 1, 2;
+ 
+--- Agreement with the legacy assessment
++-- Agreement with the legacy assessment (shadow evidence collected before the removal; no new rows)
+ SELECT COUNT(*) AS runs,
+        AVG(severity_equal::int) AS severity_agreement,
+        AVG(action_set_equal::int) AS action_set_agreement,
+@@ -164,14 +164,14 @@ DELETE FROM adk.sessions WHERE app_name = 'forti-investigator' AND update_time <
+ ```
+ `agent_runs` and `agent_events` are the audit record and are not touched by this statement.
+ 
+-### 5.5 Promotion evidence (plan C2.5)
+-Phase C.3 ships the flip as a setting; it does not make `adk` the default. The default flips (and the legacy code goes, 5.7) only when the C2.5 criteria hold on the golden set and on at least 50 real shadow runs. The offline part runs in CI (`tests/agent/test_golden_set.py`, `tests/e2e/test_service_e2e.py::test_e2e_offline_shadow_run_over_the_golden_scenarios`, and the adk-mode cases beside it). In the lab:
++### 5.5 Evidence for a change of model or instructions (plan C2.5)
++The investigator was promoted to `adk` on this evidence, and it is what to gather again after a change of model, instructions or vLLM flags. The offline part runs in CI (`tests/agent/test_golden_set.py`, `tests/e2e/test_service_e2e.py::test_e2e_offline_adk_run_over_the_golden_scenarios`, and the adk-mode cases beside it). In the lab:
+ 
+-1. Collect: run in shadow mode (5.1) until at least 50 incidents have been investigated, then
++1. Collect: let the changed service investigate at least 50 incidents, then
+    ```bash
+-   docker compose exec -T app python scripts/shadow_report.py --since <shadow start, ISO 8601> --check lab
++   docker compose exec -T app python scripts/shadow_report.py --mode live --since <time of the change, ISO 8601> --check lab
+    ```
+-   exit status 0 means: at least 50 shadow runs, hard-reject rate under 5%, p95 latency under 90 s, budget exhaustion under 2%, no `lookup_asset` refusal.
++   exit status 0 means: at least 50 runs, hard-reject rate under 5%, p95 latency under 90 s, budget exhaustion under 2%, no `lookup_asset` refusal.
+ 2. Evaluate the golden set against the lab model from a checkout with `requirements-dev.txt` plus `google-adk[eval]==2.11.0` (README section 6):
+    ```bash
+    RUN_LAB_EVALS=1 LLM_BASE_URL=http://<vllm-host>:8000/v1 LLM_MODEL=<served-model> \
+@@ -181,7 +181,9 @@ Phase C.3 ships the flip as a setting; it does not make `adk` the default. The d
+ 
+ Evaluation reads tool data from the evalset only (no Loki, no database) and writes nothing.
+ 
+-#### Gate table (copy it into the change ticket; one copy per promotion attempt)
++#### Gate table (the record template of the promotion; copy it into the change ticket of a model or instruction change)
++Shadow mode no longer exists, so rows 1 to 3 (agreement with the legacy call) and the shadow window of the sign-off can no longer be measured; use rows 4 to 11 with `--mode live`. The "Offline" column is what CI proved for the promotion.
++
+ Fill the last two columns. Every row must read `yes` before the flip; a row that does not is an exception the reviewer signs for by name, with the reason. The "Offline" column is what CI proves against the scripted fake at the commit being deployed (it says nothing about the real model); only the "Lab" column counts.
+ 
+ | # | Criterion (plan) | Bar | Where it is measured | Offline (CI, scripted fake) | Lab (measured) | Met |
+@@ -189,12 +191,12 @@ Fill the last two columns. Every row must read `yes` before the flip; a row that
+ | 1 | Golden set: validator hard rejects (C2.5) | 0 | `shadow_report.py --check golden` (note a) | 0 of 4 shadow runs; 7 of 7 golden cases VALID through the investigator | | |
+ | 2 | Golden set: severity agreement (C2.5) | 100% | same command | 4 of 4 | | |
+ | 3 | Golden set: action-set agreement (C2.5) | at least 90% | same command | 4 of 4 | | |
+-| 4 | Real shadow runs (C2.5) | at least 50 | `shadow_report.py --since <shadow start> --check lab` | not applicable | | |
++| 4 | Real shadow runs (C2.5) | at least 50 | `shadow_report.py --mode live --since <start> --check lab` | not applicable | | |
+ | 5 | Hard-reject rate over those runs (C2.5) | under 5% | same command | 0% of 4 | | |
+ | 6 | p95 latency over those runs (C2.5) | under 90 s | same command | not comparable (fake) | | |
+ | 7 | Budget exhaustion over those runs (C2.5) | under 2% | same command | 0% of 4 | | |
+ | 8 | `lookup_asset` refusals over those runs (C2.5) | 0 | same command | 0 | | |
+-| 9 | No tool ever issued a write (C2.5) | none | CI at the commit to deploy: `tests/agent/test_agent_tools.py`, the repository spy in `test_e2e_offline_shadow_run_over_the_golden_scenarios` | pass | CI run of the deployed commit: | |
++| 9 | No tool ever issued a write (C2.5) | none | CI at the commit to deploy: `tests/agent/test_agent_tools.py`, the repository spy in `test_e2e_offline_adk_run_over_the_golden_scenarios` | pass | CI run of the deployed commit: | |
+ | 10 | Golden set against the lab model: trajectory and response match (C2.2) | trajectory 1.0, response match 0.6 (`evals/test_config.json`) | `RUN_LAB_EVALS=1 pytest -m lab tests/agent/test_golden_eval_lab.py` | trajectory 1.0 on 7 of 7; response match 0.514 to 0.621 (scripted prose) | | |
+ | 11 | Two real redacted incidents in `evals/lab/` (C2.2) | 2 reviewed files | step 3 above | placeholder only | | |
+ 
+@@ -214,62 +216,28 @@ Sign-off (the same fields Phase D records for a promotion in `mode_promotions`,
+ | Date and time of the flip (UTC) | |
+ 
+ ### 5.6 Rolling back
+-Rollback is one setting and a container recreate, and it loses no data.
+-1. In `.env` set `INVESTIGATOR_MODE=legacy` (or `shadow`, to keep collecting evidence while the legacy call writes the revisions).
+-2. `docker compose up -d app`. `docker compose restart` does not re-read `.env`; recreating the container does.
+-
+-What happens to work in flight: the container gets SIGTERM, the service abandons an ADK run in progress, exits with code 0 within 5 s and leaves that job leased. After its 90 s lease runs out the restarted service leases it again and the legacy call completes it; that counts as one more attempt of the job's three. Nothing is migrated or deleted: the revisions and cards the ADK path wrote stay as incident history (tell them apart with `model_runs.structured_output_mode = 'adk_json_schema'`; the legacy call writes `json_schema` or `json_object`), `agent_runs`, `agent_events`, `shadow_assessments` and the `adk` schema stay as the audit record, and migration 006 stays applied (it only adds tables). Legacy mode does not load ADK at all.
+-
+-Check afterwards: the start-up log reads `Investigator mode: legacy`, `forti_agent_runs_total` stops increasing, and the next investigated revision has a `model_runs` row with `structured_output_mode` `json_schema`.
+-
+-Limit: the setting can only go back while the legacy code exists. After the removal patch (5.7, step 8) the service accepts only `INVESTIGATOR_MODE=adk` and refuses to start with anything else, rather than silently running the agent. The way back from there is `git revert` of the removal commit, `docker compose up -d --build app` and then the setting above.
+-
+-### 5.7 Promoting the investigator
+-The sequence, with the gate table of 5.5 as its input. Steps 1 to 3 are in shadow mode and change nothing a human sees; step 4 is the only change to behaviour; step 8 is a separate, later change.
+-
+-**1. Preconditions.** vLLM serves the model with `--enable-auto-tool-choice --tool-call-parser hermes` (5.1). Migration `006_agent_audit` is applied (`SELECT version FROM schema_migrations;`). `dashboards/alerts.yml` is loaded, with `FortiGateAgentHardRejectRate`, `FortiGateAgentBudgetExhaustion` and `FortiGateModelDegraded`. A backup exists (2.1). Nobody is changing vLLM, Loki or Chat in the same window.
+-
+-**2. Collect.** Shadow mode for as long as it takes to investigate 50 real incidents (5.1, 5.5 step 1). Keep the start time: it is `--since` in every later command.
+-
+-**3. Decide.** Run the commands of 5.5, fill the gate table, get the reviewer's name on it. If any row is `no`, stop here; fix the instructions or the model server and collect again. Nothing is promoted on an offline number.
+-
+-**4. Flip.** Exactly one change to `.env`, then recreate the container:
++There is no setting to go back to the single call: it is gone from the tree. To return to it, revert the removal commit and rebuild the image, which brings back the single-call workflow, shadow mode, their tests and the default `legacy`:
+ ```bash
+-date -u +%Y-%m-%dT%H:%M:%SZ                 # FLIP_TIME: write it in the ticket, it is --since below
+-docker compose exec -T app python scripts/shadow_report.py --hours 24 > shadow_before_flip.md
+-# .env:   INVESTIGATOR_MODE=shadow   ->   INVESTIGATOR_MODE=adk
+-docker compose up -d app
+-docker compose logs --tail 100 app | grep -E "Investigator mode|Traceback"   # expect: Investigator mode: adk
+-curl -s http://localhost:8085/health/ready                                   # expect HTTP 200 {"status":"ready",...}
++git revert <removal commit>
++docker compose up -d --build app      # recreating the container is what reads .env; `restart` does not
+ ```
+-`AGENT_MAX_LLM_CALLS` (8) and `AGENT_TIMEOUT_SECONDS` (120) stay as shadow ran them; change them only with the evidence of `shadow_report.py`. In `adk` mode a broken agent set-up stops the service at start-up (shadow mode would only disable the shadow runs), so a crash loop right after the flip is the first rollback trigger.
++A run in progress when the old container stops is abandoned (exit code 0 within 5 s) and its job is completed by the new container after the 90 s lease. The revisions and cards the ADK path wrote stay as incident history (`model_runs.structured_output_mode = 'adk_json_schema'`; the single call wrote `json_schema` or `json_object`), and `agent_runs`, `agent_events`, `shadow_assessments`, the `adk` schema and migration 006 stay as they are.
+ 
+-**5. Watch the first hour.** Ports are the compose defaults (`METRICS_PORT` 8085). `FLIP_TIME` is the timestamp from step 4.
++### 5.7 Watching the investigator after a deploy
++After a deploy, or a change of model, instructions or vLLM flags, watch the first hour. Ports are the compose defaults (`METRICS_PORT` 8085). `SINCE` is the time of the change, ISO 8601 in UTC.
+ 
+ | Look at | How | Healthy | Roll back if |
+ |---|---|---|---|
+ | Readiness | `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8085/health/ready` and the body | 200 `ready` | 503, or `degraded` for 15 minutes (3 consecutive fallbacks or failures) |
+-| Run outcomes | `docker compose exec -T app python scripts/shadow_report.py --mode live --since $FLIP_TIME`; or `curl -s localhost:8085/metrics \| grep '^forti_agent_runs_total'` | `VALID` is nearly every row; the `live` counters move once per investigated revision | `REJECTED`, `TIMEOUT`, `SCHEMA_INVALID` or `ERROR` is more than 1 in 20 after the first 20 runs; `FortiGateAgentHardRejectRate` fires |
++| Run outcomes | `docker compose exec -T app python scripts/shadow_report.py --mode live --since $SINCE`; or `curl -s localhost:8085/metrics \| grep '^forti_agent_runs_total'` | `VALID` is nearly every row; the `live` counters move once per investigated revision | `REJECTED`, `TIMEOUT`, `SCHEMA_INVALID` or `ERROR` is more than 1 in 20 after the first 20 runs; `FortiGateAgentHardRejectRate` fires |
+ | Latency | `shadow_report.py` p95 row, or `histogram_quantile(0.95, sum by (le) (rate(forti_agent_run_duration_seconds_bucket[1h])))` | p95 under 90 s | p95 over 90 s |
+ | Budget | `forti_agent_budget_exhausted_total`, `BUDGET_EXHAUSTED` row | 0 | more than 1 in 50 runs (`FortiGateAgentBudgetExhaustion`) |
+ | Guessed addresses | `forti_agent_tool_calls_total{tool="lookup_asset",outcome="refused"}`; the refusal line of the report | 0 | any (the agent is inventing IPs; read the instructions first) |
+ | Model failures | `forti_model_consecutive_failures`, `forti_model_failures_total` | 0, occasionally 1 or 2 | reaches 3 and stays there (`FortiGateModelDegraded`) |
+ | Queue | `forti_jobs_oldest_pending_seconds` | flat or falling; investigations are serial, a run takes up to `AGENT_TIMEOUT_SECONDS` | climbs steadily, i.e. runs are slower than incidents arrive |
+-| What analysts see | the first INVESTIGATION_UPDATE cards in Chat; `SELECT r.revision, r.assessment_source, m.structured_output_mode, m.validation_result, m.commit_status FROM incident_revisions r LEFT JOIN model_runs m ON m.incident_id = r.incident_id AND m.revision = r.revision WHERE r.created_at > '<FLIP_TIME>' ORDER BY r.created_at;` | `MODEL_VALIDATED` with `adk_json_schema` and `COMMITTED` | cards that are wrong, empty or unsafe to act on; many `MODEL_REJECTED_FALLBACK`; `CONFLICT` rows (another writer took the revision first; the job retries) beyond the odd one |
++| What analysts see | the first INVESTIGATION_UPDATE cards in Chat; `SELECT r.revision, r.assessment_source, m.structured_output_mode, m.validation_result, m.commit_status FROM incident_revisions r LEFT JOIN model_runs m ON m.incident_id = r.incident_id AND m.revision = r.revision WHERE r.created_at > '<SINCE>' ORDER BY r.created_at;` | `MODEL_VALIDATED` with `adk_json_schema` and `COMMITTED` | cards that are wrong, empty or unsafe to act on; many `MODEL_REJECTED_FALLBACK`; `CONFLICT` rows (another writer took the revision first; the job retries) beyond the odd one |
+ | One run in detail | `SELECT seq, agent_name, kind, tool_name, refused, latency_ms FROM agent_events WHERE run_id = (SELECT MAX(id) FROM agent_runs) ORDER BY seq;` | all four agents appear, the two specialists are called through the master, the model calls stay within `AGENT_MAX_LLM_CALLS`, no row is refused | a run that stops early, repeats one tool, or has refused rows |
+ 
+-Detection, severity floors and URGENT cards do not depend on the agent, so nothing here delays or suppresses an alert: the worst case of a bad investigation is a deterministic fallback card (`MODEL_REJECTED_FALLBACK`) in place of an agent-written one.
+-
+-**6. Roll back** on any trigger above: 5.6. It takes one setting and about a minute; do not wait for a second occurrence of a crash loop or an unsafe card.
++Detection, severity floors and URGENT cards do not depend on the agent, so nothing here delays or suppresses an alert: the worst case of a bad investigation is a deterministic fallback card (`MODEL_REJECTED_FALLBACK`) in place of an agent-written one. Roll the change back (5.6 for the removal itself; the previous model, instruction version or flags otherwise) on any trigger, and do not wait for a second occurrence of a crash loop or an unsafe card.
+ 
+-**7. After the first hour.** Repeat the report at the end of the first day (`--mode live --hours 24`) and, once there are 50 live runs, `--mode live --check lab`: exit 0 means the lab bars hold on the live runs too. Keep the report with the ticket.
+-
+-**8. Remove the legacy code (a later, separate change).** `docs/reports/gate-c3-legacy-removal.patch` deletes the single-call workflow and its prompts, makes `adk` the only accepted value (and so the default) of `INVESTIGATOR_MODE`, removes the shadow plumbing that needed the legacy assessment (`shadow_assessments` and `scripts/shadow_report.py` stay, to read the evidence already collected; read the live runs with `--mode live` from then on), and updates the tests. It is not applied by this repository: apply it only after the flip has soaked for as long as the ticket says, because from then on 5.6 is a `git revert` and an image rebuild instead of a setting.
+-```bash
+-git switch -c chore/remove-legacy-investigator
+-git apply --check docs/reports/gate-c3-legacy-removal.patch && git apply docs/reports/gate-c3-legacy-removal.patch
+-TEST_DATABASE_URL=postgresql://<user>:<password>@<db-host>:5432/<scratch-db> pytest -v tests/    # must be green
+-git add -A && git commit -m "feat: remove the legacy single-call investigator"
+-docker compose up -d --build app                                                    # the image carries the code
+-```
+-The patch was generated against the commit that carries it, and the Phase C.3 report records that it applies and that the whole suite passes on the patched tree; `git apply --check` tells you if the tree has moved since. `scripts/code_accounting.py --patch docs/reports/gate-c3-legacy-removal.patch` prints what it removes and adds.
++The promotion that made `adk` the only investigator, its evidence and the removal are recorded in ADR 005 section 10 and in the Phase C.3 report; the patch that removed the legacy code is `docs/reports/gate-c3-legacy-removal.patch`.
 diff --git a/scripts/export_golden_incident.py b/scripts/export_golden_incident.py
 index 387417b..1346898 100644
 --- a/scripts/export_golden_incident.py
