@@ -205,6 +205,61 @@ CREATE TABLE IF NOT EXISTS episodes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_episodes_open ON episodes(status, vdom, direction, source_ip, target_ip);
+
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    adk_version TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    prompt_versions TEXT NOT NULL DEFAULT '{}',
+    total_llm_calls INTEGER NOT NULL DEFAULT 0,
+    total_tool_calls INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL,
+    reason_codes TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_inc_rev ON agent_runs(incident_id, revision);
+
+CREATE TABLE IF NOT EXISTS agent_events (
+    run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    agent_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    tool_name TEXT,
+    args_json TEXT,
+    response_bytes INTEGER NOT NULL DEFAULT 0,
+    refused INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    request_hash TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    run_id INTEGER REFERENCES agent_runs(id) ON DELETE SET NULL,
+    assessment_json TEXT NOT NULL,
+    assessment_source TEXT NOT NULL,
+    validation_reason_codes TEXT NOT NULL DEFAULT '[]',
+    severity_equal INTEGER NOT NULL,
+    action_set_equal INTEGER NOT NULL,
+    exploitation_equal INTEGER NOT NULL,
+    findings_count INTEGER NOT NULL,
+    legacy_findings_count INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_assessments_inc_rev ON shadow_assessments(incident_id, revision);
 """
 
 

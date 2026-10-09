@@ -100,7 +100,7 @@ jobs:
             -t -A -c "SELECT version FROM schema_migrations;")
           echo "Applied schema migrations:"
           echo "${MIGRATIONS}"
-          echo "${MIGRATIONS}" | grep -q "005_episode_utm_subtypes"
+          echo "${MIGRATIONS}" | grep -q "006_agent_audit"
 
           docker stop -t 10 forti-agent
           EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' forti-agent)
