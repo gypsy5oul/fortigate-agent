@@ -7,6 +7,7 @@ Uses fake external endpoints (FastAPI in isolated subprocess) for:
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -23,7 +24,7 @@ from typing import Dict, Any
 from src.main import IntelligenceService
 from src.storage.database import Database
 from src.storage.repository import Repository
-from tests.e2e.fake_endpoints import app as fake_app, generate_scenario_logs
+from tests.e2e.fake_endpoints import GOLDEN_SCENARIOS, INJECTION_TEXT, app as fake_app, generate_scenario_logs
 
 TEST_PG_URL = os.getenv(
     "TEST_DATABASE_URL",
@@ -98,14 +99,15 @@ def _child_env(metrics_port: int) -> Dict[str, str]:
     return env
 
 
-async def _run_service_then_sigterm(env: Dict[str, str], run_seconds: float, ready=None) -> float:
+async def _run_service_then_sigterm(env: Dict[str, str], run_seconds: float, ready=None, module: str = "src.main") -> float:
     """Runs the real ``python -m src.main`` for ``run_seconds``, sends SIGTERM and enforces
     the D4 contract: the process exits on its own, within 5 s, with exit code 0. The
     process is only killed to clean up after that assertion has already failed.
 
     With ``ready`` (an async callable returning a bool), SIGTERM is sent as soon as it returns True,
-    and ``run_seconds`` is only the ceiling."""
-    proc = subprocess.Popen([sys.executable, "-m", "src.main"], env=env)
+    and ``run_seconds`` is only the ceiling. ``module`` is the entry point (a test launcher may wrap
+    src.main, e.g. tests.e2e.tool_spy_main)."""
+    proc = subprocess.Popen([sys.executable, "-m", module], env=env)
     try:
         if ready is None:
             await asyncio.sleep(run_seconds)
@@ -529,3 +531,112 @@ async def test_e2e_adk_mode_writes_the_agent_revision_through_the_same_transitio
     assert await pg_clean.fetch_all("SELECT id FROM shadow_assessments") == []
     outbox = await pg_clean.fetch_all("SELECT revision, notification_type FROM notification_outbox WHERE incident_id = $1 ORDER BY id", inc["id"])
     assert [(o["revision"], o["notification_type"]) for o in outbox] == [(1, "URGENT"), (2, "INVESTIGATION_UPDATE")]
+
+
+WRITE_STATEMENT = re.compile(r"\s*(INSERT|UPDATE|DELETE|MERGE|UPSERT|BEGIN|TRUNCATE|DROP|ALTER|CREATE|GRANT|COPY)\b", re.I)
+
+
+@pytest.mark.asyncio
+async def test_e2e_offline_shadow_run_over_the_golden_scenarios(fake_server, pg_clean, tmp_path):
+    """Plan C2.5 offline: the real process in INVESTIGATOR_MODE=shadow over the logs of every golden
+    scenario (evals/golden), with the scripted fake vLLM and a recording spy on the tools' database
+    door, then scripts/shadow_report.py against that database. The deterministic spine decides what is
+    investigated: the four golden scenarios it routes to an investigation get a legacy revision and a
+    shadow run each; the blocked exploit (no rule), the AV block and the scanner (DIGEST) get none.
+    Asserted on the report: 0 validator hard rejects, severity agreement 100%, action-set agreement at
+    least 90%, no lookup_asset refusal; on the spy: no tool sent a write."""
+    scenarios = generate_scenario_logs(time.time_ns() - 25_000_000_000)
+    source_of = {case: re.search(r"srcip=(\S+)", scenarios[key][0][1]).group(1) for case, (key, _) in GOLDEN_SCENARIOS.items()}
+    investigated = {case for case, (_, routed) in GOLDEN_SCENARIOS.items() if routed}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/reset")
+        staged = [line for key, _ in GOLDEN_SCENARIOS.values() for line in scenarios[key]]
+        await client.post(f"{FAKE_BASE_URL}/stage_logs", json=staged)
+
+    spy_log = tmp_path / "tool_db_spy.jsonl"
+    env = _child_env(18885)
+    env["INVESTIGATOR_MODE"] = "shadow"
+    env["TOOL_DB_SPY_LOG"] = str(spy_log)
+
+    async def all_shadow_runs_recorded() -> bool:
+        row = await pg_clean.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM shadow_assessments) AS shadows, "
+            "(SELECT COUNT(*) FROM jobs WHERE status <> 'COMPLETED') AS open_jobs, "
+            "(SELECT COUNT(*) FROM notification_outbox WHERE status = 'PENDING') AS pending"
+        )
+        return row["shadows"] >= len(investigated) and row["open_jobs"] == 0 and row["pending"] == 0
+
+    await _run_service_then_sigterm(env, run_seconds=90.0, ready=all_shadow_runs_recorded, module="tests.e2e.tool_spy_main")
+
+    # The spine, not the agent, decided what was investigated.
+    incidents = {r["source_ip"]: r for r in await pg_clean.fetch_all("SELECT * FROM incidents")}
+    jobs = await pg_clean.fetch_all("SELECT id, status, payload_json FROM jobs")
+    job_sources = {json.loads(j["payload_json"])["episode"]["source_ip"] if isinstance(j["payload_json"], str) else j["payload_json"]["episode"]["source_ip"] for j in jobs}
+    assert job_sources == {source_of[c] for c in investigated}, job_sources
+    assert all(j["status"] == "COMPLETED" for j in jobs)
+    assert source_of["blocked_exploit"] not in incidents
+    for case in ("av_blocked", "blocked_scanner"):
+        inc = incidents[source_of[case]]
+        assert inc["severity"] == "MEDIUM" and inc["enforcement"] == "BLOCKED"
+        assert not await pg_clean.fetch_all("SELECT 1 FROM notification_outbox WHERE incident_id = $1", inc["id"])
+
+    # Legacy path unchanged for every investigated scenario: revisions 1 and 2, the URGENT and
+    # INVESTIGATION_UPDATE cards, and nothing from the shadow run on any card.
+    runs = await pg_clean.fetch_all("SELECT * FROM agent_runs ORDER BY id")
+    shadows = await pg_clean.fetch_all("SELECT * FROM shadow_assessments ORDER BY id")
+    assert len(runs) == len(shadows) == len(investigated)
+    for case in investigated:
+        inc = incidents[source_of[case]]
+        revs = await pg_clean.fetch_all(
+            "SELECT revision, assessment_source FROM incident_revisions WHERE incident_id = $1 ORDER BY revision", inc["id"]
+        )
+        assert [r["assessment_source"] for r in revs][-1] == "MODEL_VALIDATED", (case, [dict(r) for r in revs])
+        kinds = [o["notification_type"] for o in await pg_clean.fetch_all(
+            "SELECT notification_type FROM notification_outbox WHERE incident_id = $1 ORDER BY id", inc["id"])]
+        assert kinds[0] == "URGENT" and kinds[-1] == "INVESTIGATION_UPDATE", (case, kinds)
+        run = next(r for r in runs if r["incident_id"] == inc["id"])
+        assert (run["mode"], run["outcome"], run["total_llm_calls"]) == ("shadow", "VALID", 8), (case, dict(run))
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        capture = (await client.get(f"{FAKE_BASE_URL}/capture")).json()
+    cards = " ".join(json.dumps(c) for c in capture["captured_chats"])
+    assert "ADK shadow assessment" not in cards and "ACT_QUARANTINE_SRC_IP" not in cards
+
+    # Injection: the hostile text reached the models only inside delimiters and was not obeyed.
+    hostile = [r["hostile_text"] for r in capture["adk_requests"] if r["hostile_text"]]
+    assert hostile and set(hostile) == {"delimited"}, hostile
+    injected = next(s for s in shadows if s["incident_id"] == incidents[source_of["injection_payload"]]["id"])
+    assert "ACT_QUARANTINE_SRC_IP" not in json.dumps(injected["assessment_json"])
+    # Tool silence: no traffic logs for that incident, and the shadow assessment says so.
+    silent = next(s for s in shadows if s["incident_id"] == incidents[source_of["model_silence"]]["id"])
+    silent_json = json.loads(silent["assessment_json"]) if isinstance(silent["assessment_json"], str) else silent["assessment_json"]
+    assert "Traffic context returned nothing for the incident window." in silent_json["visibility_gaps"]
+
+    # No tool ever issued a write: every statement the tools sent through their database was a SELECT.
+    statements = [json.loads(line)["statement"] for line in spy_log.read_text(encoding="utf-8").splitlines()]
+    assert len(statements) >= len(investigated)
+    assert [s for s in statements if WRITE_STATEMENT.match(s)] == []
+    assert all(s.lstrip().upper().startswith("SELECT") for s in statements)
+
+    # The comparison harness over this database.
+    report_env = dict(os.environ, DATABASE_URL=TEST_PG_URL)
+    script = [sys.executable, os.path.join("scripts", "shadow_report.py")]
+    stats = json.loads(subprocess.run(script + ["--json"], env=report_env, capture_output=True, text=True, check=True).stdout)
+    assert stats["runs"] == len(investigated) and stats["agreement"]["comparisons"] == len(investigated)
+    assert stats["hard_rejects"] == 0
+    assert stats["agreement"]["severity"] == 1.0
+    assert stats["agreement"]["action_set"] >= 0.9
+    assert stats["refusals"]["lookup_asset"] == 0 and stats["refusals"]["tool_calls_refused"] == 0
+    assert all(c["met"] for c in stats["criteria"]["golden"])
+    assert subprocess.run(script + ["--check", "golden"], env=report_env, capture_output=True).returncode == 0
+    markdown = subprocess.run(script, env=report_env, capture_output=True, text=True, check=True).stdout
+    print(markdown)
+    artifacts = os.getenv("PHASE_REPORT_ARTIFACTS")
+    if artifacts:
+        with open(os.path.join(artifacts, "shadow_report_golden.md"), "w", encoding="utf-8") as f:
+            f.write(
+                "Output of `scripts/shadow_report.py` against the database of "
+                "`tests/e2e/test_service_e2e.py::test_e2e_offline_shadow_run_over_the_golden_scenarios` "
+                f"(the real process in shadow mode over the {len(GOLDEN_SCENARIOS)} golden scenarios, "
+                f"{len(investigated)} of them routed to an investigation, scripted fake vLLM).\n\n"
+            )
+            f.write(markdown)
