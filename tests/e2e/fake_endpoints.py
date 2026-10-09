@@ -22,6 +22,11 @@ class FakeEndpointsState:
         self.chat_response_mode: str = "valid"  # valid, invalid_json, schema_invalid, injection_obeying, timeout
         self.loki_response_mode: str = "valid"  # valid, error
         self.adk_requests: List[Dict[str, Any]] = []  # what the ADK agents sent, and what was answered
+        # What the scripted assessment_writer does (ADK path only): "valid", "garbage" (text that is not
+        # JSON) or "schema_invalid" (JSON that breaks the WriterAssessment schema), after an optional delay.
+        self.adk_writer_response: str = "valid"
+        self.adk_writer_delay_seconds: float = 0.0
+        self.single_call_requests: int = 0  # chat completions that were not ADK agent turns
 
     def reset(self):
         self.staged_logs.clear()
@@ -29,6 +34,9 @@ class FakeEndpointsState:
         self.adk_requests.clear()
         self.chat_response_mode = "valid"
         self.loki_response_mode = "valid"
+        self.adk_writer_response = "valid"
+        self.adk_writer_delay_seconds = 0.0
+        self.single_call_requests = 0
 
 
 state = FakeEndpointsState()
@@ -227,18 +235,33 @@ def _hostile_text(messages: List[Dict[str, Any]]) -> Optional[str]:
     return seen
 
 
+def _writer_failure(message: Dict[str, Any]) -> Dict[str, Any]:
+    """The assessment_writer's scripted answer replaced by output the service must reject."""
+    if state.adk_writer_response == "garbage":
+        message = dict(message, content="This is raw text without valid JSON formatting {broken: True")
+    elif state.adk_writer_response == "schema_invalid":
+        message = dict(message, content=json.dumps({"unknown_forbidden_key": "violates extra=forbid"}))
+    return message
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body_peek = await request.json()
     adk_agent = _adk_agent(body_peek)
     if adk_agent is not None and state.chat_response_mode == "valid":
         message = _adk_answer(adk_agent, body_peek.get("messages") or [])
+        if adk_agent == "assessment_writer":
+            message = _writer_failure(message)
         state.adk_requests.append({
             "agent": adk_agent,
             "tools": [(t.get("function") or {}).get("name") for t in body_peek.get("tools") or []],
             "answered_with": [c["function"]["name"] for c in message.get("tool_calls", [])] or "text",
             "hostile_text": _hostile_text(body_peek.get("messages") or []),
         })
+        # The request is recorded before the wait, so a test can tell the writer is in flight, and a
+        # handler that outlives its test adds nothing to a later one.
+        if adk_agent == "assessment_writer" and state.adk_writer_delay_seconds > 0:
+            await asyncio.sleep(state.adk_writer_delay_seconds)
         return {
             "id": f"chatcmpl-adk-{len(state.adk_requests)}",
             "object": "chat.completion",
@@ -246,6 +269,8 @@ async def chat_completions(request: Request):
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
             "usage": {"prompt_tokens": 150, "completion_tokens": 40, "total_tokens": 190},
         }
+
+    state.single_call_requests += 1
 
     if state.chat_response_mode == "timeout":
         await asyncio.sleep(15.0)
@@ -385,6 +410,7 @@ async def get_capture():
         "captured_chats": state.captured_chats,
         "staged_logs_count": len(state.staged_logs),
         "adk_requests": state.adk_requests,
+        "single_call_requests": state.single_call_requests,
     }
 
 
@@ -409,9 +435,15 @@ async def set_mode_endpoint(request: Request):
         state.chat_response_mode = body["chat_response_mode"]
     if "loki_response_mode" in body:
         state.loki_response_mode = body["loki_response_mode"]
+    if "adk_writer_response" in body:
+        state.adk_writer_response = body["adk_writer_response"]
+    if "adk_writer_delay_seconds" in body:
+        state.adk_writer_delay_seconds = float(body["adk_writer_delay_seconds"])
     return {
         "chat_response_mode": state.chat_response_mode,
         "loki_response_mode": state.loki_response_mode,
+        "adk_writer_response": state.adk_writer_response,
+        "adk_writer_delay_seconds": state.adk_writer_delay_seconds,
     }
 
 

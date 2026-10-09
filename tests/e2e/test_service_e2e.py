@@ -99,15 +99,22 @@ def _child_env(metrics_port: int) -> Dict[str, str]:
     return env
 
 
-async def _run_service_then_sigterm(env: Dict[str, str], run_seconds: float, ready=None, module: str = "src.main") -> float:
+async def _run_service_then_sigterm(
+    env: Dict[str, str], run_seconds: float, ready=None, module: str = "src.main", log_path=None
+) -> float:
     """Runs the real ``python -m src.main`` for ``run_seconds``, sends SIGTERM and enforces
     the D4 contract: the process exits on its own, within 5 s, with exit code 0. The
     process is only killed to clean up after that assertion has already failed.
 
     With ``ready`` (an async callable returning a bool), SIGTERM is sent as soon as it returns True,
     and ``run_seconds`` is only the ceiling. ``module`` is the entry point (a test launcher may wrap
-    src.main, e.g. tests.e2e.tool_spy_main)."""
-    proc = subprocess.Popen([sys.executable, "-m", module], env=env)
+    src.main, e.g. tests.e2e.tool_spy_main). With ``log_path`` the process's stdout and stderr (its
+    log) are written to that file so a test can assert on it."""
+    log_file = open(log_path, "wb") if log_path is not None else None
+    proc = subprocess.Popen(
+        [sys.executable, "-m", module], env=env,
+        stdout=log_file, stderr=subprocess.STDOUT if log_file is not None else None,
+    )
     try:
         if ready is None:
             await asyncio.sleep(run_seconds)
@@ -124,9 +131,32 @@ async def _run_service_then_sigterm(env: Dict[str, str], run_seconds: float, rea
             proc.kill()
             proc.wait(timeout=2.0)
             pytest.fail("service did not exit within 5 s of SIGTERM")
+        finally:
+            if log_file is not None:
+                log_file.close()
         shutdown_seconds = time.monotonic() - t0
     assert proc.returncode == 0, f"service exited with code {proc.returncode} after SIGTERM"
     return shutdown_seconds
+
+
+async def _fake_capture() -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        return (await client.get(f"{FAKE_BASE_URL}/capture")).json()
+
+
+async def _fake_set_mode(**modes: Any) -> None:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/set_mode", json=modes)
+
+
+async def _scrape(metrics_port: int, path: str = "/metrics") -> str:
+    """Body of an endpoint of the service under test, or "" while it is not (yet) answering."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"http://127.0.0.1:{metrics_port}{path}")
+        return resp.text if resp.status_code == 200 else ""
+    except httpx.HTTPError:
+        return ""
 
 
 @pytest.mark.asyncio
@@ -486,18 +516,32 @@ async def test_e2e_shadow_mode_records_agent_runs_and_never_a_card(fake_server, 
     assert not any("ADK shadow assessment" in json.dumps(o["payload_json"]) for o in outbox)
 
 
+ADK_AGENTS = {"incident_investigator", "evidence_agent", "context_agent", "assessment_writer"}
+
+
+async def _stage(scenario_key: str, seconds_ago: int = 25) -> Dict[str, Any]:
+    """Stages one scenario's logs on the fake Loki, stamped ``seconds_ago`` in the past."""
+    scenarios = generate_scenario_logs(time.time_ns() - seconds_ago * 1_000_000_000)
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/stage_logs", json=scenarios[scenario_key])
+    return scenarios
+
+
 @pytest.mark.asyncio
-async def test_e2e_adk_mode_writes_the_agent_revision_through_the_same_transition(fake_server, pg_clean):
-    """INVESTIGATOR_MODE=adk: the ADK result is revision 2, committed through record_incident_transition
-    with the same CAS and job fence, with a model_runs row kept for backward compatibility and the
-    run audited as mode live. Nothing goes to shadow_assessments."""
+async def test_e2e_adk_mode_writes_the_agent_revision_through_the_same_transition(fake_server, pg_clean, tmp_path):
+    """Phase C.3, deliverable 1: INVESTIGATOR_MODE=adk over the exploit scenario, real process, scripted
+    fake vLLM. The ADK result is revision 2, committed through record_incident_transition with the
+    same CAS and job fence as the legacy path, with a model_runs row kept for backward compatibility
+    and an agent_runs row for the same revision (mode live), exactly one INVESTIGATION_UPDATE card,
+    nothing in shadow_assessments, no request to the single-call path, and the SIGTERM contract (exit
+    code 0 within 5 s, "Service terminated gracefully." in the log, no traceback)."""
     async with httpx.AsyncClient(timeout=5.0) as client:
         await client.post(f"{FAKE_BASE_URL}/reset")
-        scenarios = generate_scenario_logs(time.time_ns() - 25_000_000_000)
-        await client.post(f"{FAKE_BASE_URL}/stage_logs", json=scenarios["scenario_2_nonblocked_ips"])
+    await _stage("scenario_2_nonblocked_ips")
 
     env = _child_env(18884)
     env["INVESTIGATOR_MODE"] = "adk"
+    scraped: Dict[str, str] = {}
 
     async def revision_committed() -> bool:
         row = await pg_clean.fetch_one(
@@ -505,32 +549,319 @@ async def test_e2e_adk_mode_writes_the_agent_revision_through_the_same_transitio
             "(SELECT COUNT(*) FROM jobs WHERE status = 'COMPLETED') AS done, "
             "(SELECT COUNT(*) FROM notification_outbox WHERE status = 'PENDING') AS pending"
         )
-        return row["runs"] >= 1 and row["done"] >= 1 and row["pending"] == 0
+        if not (row["runs"] >= 1 and row["done"] >= 1 and row["pending"] == 0):
+            return False
+        # The 24 h gauges behind the dashboard's live-mode panels are set by the metrics updater (5 s).
+        scraped["metrics"] = await _scrape(18884)
+        return 'forti_agent_runs_24h{mode="live",outcome="VALID"} 1.0' in scraped["metrics"]
 
-    await _run_service_then_sigterm(env, run_seconds=30.0, ready=revision_committed)
+    log_path = str(tmp_path / "service.log")
+    await _run_service_then_sigterm(env, run_seconds=40.0, ready=revision_committed, log_path=log_path)
 
+    # The revision: written by the agent runtime (its scripted writer's text, assessment_source set by
+    # the runtime), revision 2 on top of the deterministic revision 1, severity at the floor.
     inc = await pg_clean.fetch_one("SELECT * FROM incidents WHERE source_ip = '198.51.100.45'")
     assert inc is not None and inc["current_revision"] == 2 and inc["severity"] == "CRITICAL"
     assert inc["summary"].startswith("ADK shadow assessment")  # the agent's summary (scripted text)
     revs = await pg_clean.fetch_all(
-        "SELECT revision, assessment_source, assessment_json FROM incident_revisions WHERE incident_id = $1 ORDER BY revision", inc["id"]
+        "SELECT revision, assessment_source, assessment_json, model_name FROM incident_revisions "
+        "WHERE incident_id = $1 ORDER BY revision", inc["id"]
     )
     assert [(r["revision"], r["assessment_source"]) for r in revs] == [(1, "DETERMINISTIC"), (2, "MODEL_VALIDATED")]
     rev2 = json.loads(revs[1]["assessment_json"])
     assert rev2["summary"].startswith("ADK shadow assessment") and rev2["recommended_action_ids"] == ["ACT_INSPECT_APPLICATION_LOGS"]
+    assert rev2["visibility_scope"] == "FIREWALL_ONLY" and rev2["severity"] == "CRITICAL"
+    assert revs[1]["model_name"] == "qwen3.8-27b"
+
+    # The same CAS and fence as legacy: one attempt, job completed in the revision's transaction.
     job = await pg_clean.fetch_one("SELECT status, attempts FROM jobs WHERE id = $1", f"JOB-{inc['id']}-1")
     assert (job["status"], job["attempts"]) == ("COMPLETED", 1)
-    mr = await pg_clean.fetch_all(
-        "SELECT revision, structured_output_mode, validation_result, commit_status FROM model_runs WHERE incident_id = $1", inc["id"]
+
+    # Backward compatibility: one model_runs row, and the agent_runs row of the same incident revision
+    # (the two tables share incident_id and revision; neither has a foreign key to the other) with the
+    # same outcome, tokens and latency.
+    linked = await pg_clean.fetch_all(
+        "SELECT m.id AS model_run_id, a.id AS agent_run_id, m.structured_output_mode, m.validation_result, "
+        "m.commit_status, m.model_id, m.input_tokens, m.output_tokens, m.latency_ms, "
+        "a.mode, a.outcome, a.model_id AS agent_model_id, a.input_tokens AS a_in, a.output_tokens AS a_out, "
+        "a.latency_ms AS a_latency, a.session_id "
+        "FROM model_runs m JOIN agent_runs a ON a.incident_id = m.incident_id AND a.revision = m.revision "
+        "WHERE m.incident_id = $1", inc["id"],
     )
-    assert [(m["revision"], m["structured_output_mode"], m["validation_result"], m["commit_status"]) for m in mr] == [
-        (2, "adk_json_schema", "VALID", "COMMITTED")
-    ]
-    runs = await pg_clean.fetch_all("SELECT mode, outcome, revision FROM agent_runs WHERE incident_id = $1", inc["id"])
-    assert [(r["mode"], r["outcome"], r["revision"]) for r in runs] == [("live", "VALID", 2)]
+    assert len(linked) == 1, [dict(r) for r in linked]
+    link = linked[0]
+    assert (link["structured_output_mode"], link["validation_result"], link["commit_status"]) == ("adk_json_schema", "VALID", "COMMITTED")
+    assert (link["mode"], link["outcome"], link["session_id"]) == ("live", "VALID", f"{inc['id']}:2")
+    assert (link["model_id"], link["input_tokens"], link["output_tokens"], link["latency_ms"]) == (
+        link["agent_model_id"], link["a_in"], link["a_out"], link["a_latency"]
+    )
+    assert len(await pg_clean.fetch_all("SELECT id FROM model_runs WHERE incident_id = $1", inc["id"])) == 1
+    assert len(await pg_clean.fetch_all("SELECT id FROM agent_runs WHERE incident_id = $1", inc["id"])) == 1
     assert await pg_clean.fetch_all("SELECT id FROM shadow_assessments") == []
-    outbox = await pg_clean.fetch_all("SELECT revision, notification_type FROM notification_outbox WHERE incident_id = $1 ORDER BY id", inc["id"])
+
+    # Exactly one INVESTIGATION_UPDATE card, queued and delivered; the URGENT card is the other one.
+    outbox = await pg_clean.fetch_all(
+        "SELECT revision, notification_type, status FROM notification_outbox WHERE incident_id = $1 ORDER BY id", inc["id"]
+    )
     assert [(o["revision"], o["notification_type"]) for o in outbox] == [(1, "URGENT"), (2, "INVESTIGATION_UPDATE")]
+    capture = await _fake_capture()
+    chats = [json.dumps(c) for c in capture["captured_chats"]]
+    assert len(chats) == 2
+    assert sum("ADK shadow assessment" in c for c in chats) == 1
+
+    # The single-call path never ran; all four agents talked to the model and some answered with tool calls.
+    assert capture["single_call_requests"] == 0
+    assert {r["agent"] for r in capture["adk_requests"]} == ADK_AGENTS
+    assert any(r["answered_with"] != "text" for r in capture["adk_requests"])
+
+    # Dashboard series for adk mode: the run counter and the 24 h gauges say one live VALID run.
+    assert 'forti_agent_runs_total{mode="live",outcome="VALID"} 1.0' in scraped["metrics"]
+    assert 'forti_agent_runs_24h{mode="live",outcome="VALID"} 1.0' in scraped["metrics"]
+    assert 'forti_agent_runs_24h{mode="shadow",outcome="VALID"} 0.0' in scraped["metrics"]
+    assert "forti_model_consecutive_failures 0.0" in scraped["metrics"]
+
+    log = open(log_path, encoding="utf-8", errors="replace").read()
+    assert "Investigator mode: adk" in log and "Service terminated gracefully." in log
+    assert "Traceback" not in log
+
+
+@pytest.mark.asyncio
+async def test_e2e_adk_mode_concurrent_revision_bump_retries_the_job_and_never_double_writes(fake_server, pg_clean):
+    """The CAS and the job fence in adk mode, through the real process. While the writer is still
+    answering (the fake holds its answer for 4 s) another writer takes revision 2 of the incident.
+    The agent's revision must not land: record_incident_transition refuses it (expected revision 1,
+    current 2), the model_runs row says CONFLICT, no card is queued, the other writer's revision is
+    untouched, and the job is released for a retry with a backoff instead of being completed. Fast-
+    forwarding the backoff runs the retry, which meets the same bumped revision (the job payload still
+    names revision 1) and also writes nothing."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/reset")
+    await _fake_set_mode(adk_writer_delay_seconds=4.0)
+    await _stage("scenario_2_nonblocked_ips")
+
+    env = _child_env(18886)
+    env["INVESTIGATOR_MODE"] = "adk"
+    repo = Repository(pg_clean)
+    progress: Dict[str, Any] = {"phase": "wait_for_run"}
+
+    async def job_and_conflicts():
+        job = await pg_clean.fetch_one("SELECT id, status, attempts FROM jobs")
+        conflicts = await pg_clean.fetch_one("SELECT COUNT(*) AS n FROM model_runs WHERE commit_status = 'CONFLICT'")
+        return job, conflicts["n"]
+
+    async def drive() -> bool:
+        phase = progress["phase"]
+        job, conflicts = await job_and_conflicts()
+        if phase == "wait_for_run":
+            # The job is leased and the writer's request is in the fake: the ADK run is in flight.
+            capture = await _fake_capture()
+            in_flight = any(r["agent"] == "assessment_writer" for r in capture["adk_requests"])
+            if job is not None and job["status"] == "LEASED" and in_flight:
+                inc = await pg_clean.fetch_one("SELECT id, current_revision FROM incidents WHERE source_ip = '198.51.100.45'")
+                assert inc["current_revision"] == 1
+                # Another writer takes revision 2 (what a poller escalation does), in the repository's own way.
+                await repo.add_incident_revision({
+                    "incident_id": inc["id"], "revision": 2, "rule_ids": ["RULE_NONBLOCKED_EXPLOIT_ATTEMPT"],
+                    "severity": "CRITICAL", "enforcement": "ALLOWED_OR_DETECTED",
+                    "assessment_json": {"summary": "Concurrent writer."}, "model_name": None,
+                    "reasoning_summary": "Concurrent writer.", "evidence_ids": [], "assessment_source": "DETERMINISTIC",
+                })
+                await pg_clean.execute(
+                    "UPDATE incidents SET current_revision = 2, summary = 'Concurrent writer.' WHERE id = $1", inc["id"]
+                )
+                progress["phase"] = "wait_for_conflict"
+            return False
+        if phase == "wait_for_conflict":
+            if job["status"] == "PENDING" and conflicts == 1:
+                # Retry now: no more delay, and the backoff (60 s) is fast-forwarded.
+                assert job["attempts"] == 1
+                progress["first_attempt"] = dict(job)
+                await _fake_set_mode(adk_writer_delay_seconds=0.0)
+                await pg_clean.execute("UPDATE jobs SET next_run_at = NOW() - INTERVAL '1 second' WHERE id = $1", job["id"])
+                progress["phase"] = "wait_for_retry"
+            return False
+        return job["status"] == "PENDING" and job["attempts"] == 2 and conflicts == 2
+
+    await _run_service_then_sigterm(env, run_seconds=60.0, ready=drive)
+    assert progress["phase"] == "wait_for_retry", "the concurrent bump never happened while the ADK run was in flight"
+
+    inc = await pg_clean.fetch_one("SELECT * FROM incidents WHERE source_ip = '198.51.100.45'")
+    assert inc["current_revision"] == 2 and inc["summary"] == "Concurrent writer."  # not overwritten by the agent
+    revs = await pg_clean.fetch_all(
+        "SELECT revision, assessment_source, assessment_json FROM incident_revisions WHERE incident_id = $1 ORDER BY revision", inc["id"]
+    )
+    assert [(r["revision"], r["assessment_source"]) for r in revs] == [(1, "DETERMINISTIC"), (2, "DETERMINISTIC")]
+    assert json.loads(revs[1]["assessment_json"])["summary"] == "Concurrent writer."
+
+    # No second write of any kind: only the URGENT card exists, and Chat received only that.
+    outbox = await pg_clean.fetch_all("SELECT revision, notification_type FROM notification_outbox WHERE incident_id = $1", inc["id"])
+    assert [(o["revision"], o["notification_type"]) for o in outbox] == [(1, "URGENT")]
+    assert len((await _fake_capture())["captured_chats"]) == 1
+
+    # The job was released, not completed: pending, two attempts, the next one backed off into the future.
+    job = await pg_clean.fetch_one("SELECT status, attempts, next_run_at > NOW() AS backed_off FROM jobs")
+    assert (job["status"], job["attempts"], job["backed_off"]) == ("PENDING", 2, True)
+
+    # Both attempts did their model work (agent_runs, mode live) and both commits were refused.
+    runs = await pg_clean.fetch_all("SELECT mode, outcome, revision FROM agent_runs WHERE incident_id = $1 ORDER BY id", inc["id"])
+    assert [(r["mode"], r["outcome"], r["revision"]) for r in runs] == [("live", "VALID", 2)] * 2
+    model_runs = await pg_clean.fetch_all(
+        "SELECT revision, structured_output_mode, commit_status FROM model_runs WHERE incident_id = $1 ORDER BY id", inc["id"]
+    )
+    assert [(m["revision"], m["structured_output_mode"], m["commit_status"]) for m in model_runs] == [(2, "adk_json_schema", "CONFLICT")] * 2
+
+
+@pytest.mark.asyncio
+async def test_e2e_adk_mode_garbage_from_the_model_writes_the_fallback_and_the_service_keeps_running(fake_server, pg_clean, tmp_path):
+    """Failure path of adk mode: the scripted writer returns text that is not JSON. The ADK path ends
+    SCHEMA_INVALID and writes MODEL_REJECTED_FALLBACK with AGENT_SCHEMA_INVALID (deterministic severity,
+    one INVESTIGATION_UPDATE card, job completed, model_runs and agent_runs audited). The service is not
+    affected: /health/ready still answers ready, and an incident that arrives afterwards, once the
+    model answers properly again, is investigated normally. The SIGTERM contract holds at the end."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/reset")
+    await _fake_set_mode(adk_writer_response="garbage")
+    await _stage("scenario_2_nonblocked_ips")
+
+    env = _child_env(18887)
+    env["INVESTIGATOR_MODE"] = "adk"
+    progress: Dict[str, Any] = {"phase": "garbage"}
+    log_path = str(tmp_path / "service.log")
+
+    async def drive() -> bool:
+        row = await pg_clean.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM agent_runs) AS runs, "
+            "(SELECT COUNT(*) FROM jobs WHERE status = 'COMPLETED') AS done, "
+            "(SELECT COUNT(*) FROM notification_outbox WHERE status = 'PENDING') AS pending"
+        )
+        if progress["phase"] == "garbage":
+            if row["runs"] >= 1 and row["done"] >= 1 and row["pending"] == 0:
+                progress["ready_after_failure"] = await _scrape(18887, "/health/ready")
+                progress["metrics_after_failure"] = await _scrape(18887)
+                # The model recovers; a second, different exploit arrives while the service is up.
+                await _fake_set_mode(adk_writer_response="valid")
+                await _stage("scenario_6_mixed_escalation", seconds_ago=20)
+                progress["phase"] = "recovered"
+            return False
+        return row["runs"] >= 2 and row["done"] >= 2 and row["pending"] == 0
+
+    await _run_service_then_sigterm(env, run_seconds=75.0, ready=drive, log_path=log_path)
+    assert progress["phase"] == "recovered", "the failing investigation never completed"
+
+    # First incident: the fallback revision, written by the ADK path, with the reason code.
+    first = await pg_clean.fetch_one("SELECT * FROM incidents WHERE source_ip = '198.51.100.45'")
+    assert first["current_revision"] == 2 and first["severity"] == "CRITICAL"  # deterministic floor
+    revs = await pg_clean.fetch_all(
+        "SELECT revision, assessment_source, assessment_json, reasoning_summary FROM incident_revisions "
+        "WHERE incident_id = $1 ORDER BY revision", first["id"]
+    )
+    assert [(r["revision"], r["assessment_source"]) for r in revs] == [(1, "DETERMINISTIC"), (2, "MODEL_REJECTED_FALLBACK")]
+    fallback = json.loads(revs[1]["assessment_json"])
+    assert "AGENT_SCHEMA_INVALID" in fallback["summary"] and fallback["severity"] == "CRITICAL"
+    assert fallback["recommended_action_ids"] == ["ACT_INSPECT_APPLICATION_LOGS"]
+    job = await pg_clean.fetch_one("SELECT status, attempts FROM jobs WHERE id = $1", f"JOB-{first['id']}-1")
+    assert (job["status"], job["attempts"]) == ("COMPLETED", 1)
+    run = await pg_clean.fetch_one("SELECT mode, outcome, reason_codes FROM agent_runs WHERE incident_id = $1", first["id"])
+    assert (run["mode"], run["outcome"], list(run["reason_codes"])) == ("live", "SCHEMA_INVALID", ["AGENT_SCHEMA_INVALID"])
+    model_run = await pg_clean.fetch_one(
+        "SELECT revision, structured_output_mode, validation_result, reason_codes, commit_status FROM model_runs WHERE incident_id = $1",
+        first["id"],
+    )
+    assert (model_run["revision"], model_run["structured_output_mode"], model_run["validation_result"], model_run["commit_status"]) == (
+        2, "adk_json_schema", "SCHEMA_INVALID", "COMMITTED"
+    )
+    assert list(model_run["reason_codes"]) == ["AGENT_SCHEMA_INVALID"]
+    cards = await pg_clean.fetch_all(
+        "SELECT revision, notification_type FROM notification_outbox WHERE incident_id = $1 ORDER BY id", first["id"]
+    )
+    assert [(c["revision"], c["notification_type"]) for c in cards] == [(1, "URGENT"), (2, "INVESTIGATION_UPDATE")]
+
+    # The service stayed up and answering: ready after the failure (one failure is not degraded), and the
+    # failed run is counted as a live SCHEMA_INVALID run.
+    assert '"status":"ready"' in progress["ready_after_failure"].replace(" ", "")
+    assert 'forti_agent_runs_total{mode="live",outcome="SCHEMA_INVALID"} 1.0' in progress["metrics_after_failure"]
+    assert "forti_model_consecutive_failures 1.0" in progress["metrics_after_failure"]
+
+    # Second incident: investigated normally after the model recovered; the failure counter is cleared.
+    second = await pg_clean.fetch_one("SELECT * FROM incidents WHERE source_ip = '198.51.100.47'")
+    assert second is not None
+    second_revs = await pg_clean.fetch_all(
+        "SELECT revision, assessment_source FROM incident_revisions WHERE incident_id = $1 ORDER BY revision", second["id"]
+    )
+    assert second_revs[-1]["assessment_source"] == "MODEL_VALIDATED", [dict(r) for r in second_revs]
+    runs = await pg_clean.fetch_all("SELECT incident_id, outcome FROM agent_runs ORDER BY id")
+    assert [(r["incident_id"], r["outcome"]) for r in runs] == [(first["id"], "SCHEMA_INVALID"), (second["id"], "VALID")]
+    assert (await _fake_capture())["single_call_requests"] == 0
+
+    # The log: ADK itself reports the writer's unparseable output (a traceback from its node runner
+    # and the runner's one-line summary) and those are the only ERROR records. The service's own
+    # loops log none, and the process terminated gracefully.
+    log = open(log_path, encoding="utf-8", errors="replace").read()
+    errors = [line for line in log.splitlines() if "[ERROR]" in line]
+    assert errors and all("[google_adk." in line for line in errors), errors
+    assert "Error in investigation worker loop" not in log
+    assert "Service terminated gracefully." in log
+
+
+@pytest.mark.asyncio
+async def test_e2e_adk_mode_sigterm_during_a_run_exits_zero_and_the_job_is_retried_after_its_lease(fake_server, pg_clean, tmp_path):
+    """SIGTERM while an ADK investigation is in flight (the fake holds the writer's answer for 30 s):
+    the service abandons the run and exits with code 0 within 5 s, writes nothing (no revision, no
+    card, no model_runs or agent_runs row), and leaves the job leased (ADR 005 section 8). After its
+    lease has expired, a restart on the same database leases it again and completes the investigation
+    with revision 2 written by the ADK path."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/reset")
+    await _fake_set_mode(adk_writer_delay_seconds=30.0)
+    await _stage("scenario_2_nonblocked_ips")
+
+    env = _child_env(18888)
+    env["INVESTIGATOR_MODE"] = "adk"
+    log_path = str(tmp_path / "service_first_run.log")
+
+    async def run_in_flight() -> bool:
+        job = await pg_clean.fetch_one("SELECT status FROM jobs")
+        capture = await _fake_capture()
+        return bool(job) and job["status"] == "LEASED" and any(r["agent"] == "assessment_writer" for r in capture["adk_requests"])
+
+    shutdown_seconds = await _run_service_then_sigterm(env, run_seconds=45.0, ready=run_in_flight, log_path=log_path)
+    assert shutdown_seconds < 5.0
+
+    log = open(log_path, encoding="utf-8", errors="replace").read()
+    assert "is left to its lease" in log and "Service terminated gracefully." in log
+    assert "Traceback" not in log
+    inc = await pg_clean.fetch_one("SELECT * FROM incidents WHERE source_ip = '198.51.100.45'")
+    assert inc["current_revision"] == 1
+    job = await pg_clean.fetch_one("SELECT status, attempts FROM jobs WHERE id = $1", f"JOB-{inc['id']}-1")
+    assert (job["status"], job["attempts"]) == ("LEASED", 1)
+    outbox = await pg_clean.fetch_all("SELECT notification_type FROM notification_outbox WHERE incident_id = $1", inc["id"])
+    assert [o["notification_type"] for o in outbox] == ["URGENT"]
+    assert await pg_clean.fetch_all("SELECT id FROM model_runs") == []
+    assert await pg_clean.fetch_all("SELECT id FROM agent_runs") == []
+
+    # The lease runs out, the model answers at once, and the restarted service finishes the job.
+    await _fake_set_mode(adk_writer_delay_seconds=0.0)
+    await pg_clean.execute("UPDATE jobs SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1", f"JOB-{inc['id']}-1")
+
+    async def finished() -> bool:
+        row = await pg_clean.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM jobs WHERE status = 'COMPLETED') AS done, "
+            "(SELECT COUNT(*) FROM notification_outbox WHERE status = 'PENDING') AS pending"
+        )
+        return row["done"] >= 1 and row["pending"] == 0
+
+    await _run_service_then_sigterm(env, run_seconds=45.0, ready=finished)
+    job = await pg_clean.fetch_one("SELECT status, attempts FROM jobs WHERE id = $1", f"JOB-{inc['id']}-1")
+    assert (job["status"], job["attempts"]) == ("COMPLETED", 2)
+    revs = await pg_clean.fetch_all(
+        "SELECT revision, assessment_source, assessment_json FROM incident_revisions WHERE incident_id = $1 ORDER BY revision", inc["id"]
+    )
+    assert [(r["revision"], r["assessment_source"]) for r in revs] == [(1, "DETERMINISTIC"), (2, "MODEL_VALIDATED")]
+    assert json.loads(revs[1]["assessment_json"])["summary"].startswith("ADK shadow assessment")
+    cards = await pg_clean.fetch_all("SELECT notification_type FROM notification_outbox WHERE incident_id = $1 ORDER BY id", inc["id"])
+    assert [c["notification_type"] for c in cards] == ["URGENT", "INVESTIGATION_UPDATE"]
+    runs = await pg_clean.fetch_all("SELECT mode, outcome FROM agent_runs")
+    assert [(r["mode"], r["outcome"]) for r in runs] == [("live", "VALID")]
 
 
 WRITE_STATEMENT = re.compile(r"\s*(INSERT|UPDATE|DELETE|MERGE|UPSERT|BEGIN|TRUNCATE|DROP|ALTER|CREATE|GRANT|COPY)\b", re.I)
