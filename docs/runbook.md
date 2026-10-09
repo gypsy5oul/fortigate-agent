@@ -122,6 +122,12 @@ docker compose restart app
 Shadow runs happen in the investigation loop after the legacy revision is committed, so each investigated revision takes up to `AGENT_TIMEOUT_SECONDS` longer to clear from the queue (`forti_jobs_oldest_pending_seconds`). They never produce a revision, a card or an outbox row, and their failure never fails the job.
 
 ### 5.2 Reading shadow results
+The comparison harness reads the audit tables (read-only) and prints agreement with the legacy assessment, outcomes and the validator hard-reject rate, p50/p95 latency, tokens and model calls per run, tool calls and refusals, and the plan C2.5 criteria with what was measured:
+```bash
+docker compose exec -T app python scripts/shadow_report.py --hours 24            # Markdown
+docker compose exec -T app python scripts/shadow_report.py --since 2026-10-10T00:00:00Z --json
+```
+`--check lab` (or `--check golden`) exits 1 when that criteria set is not met. The same numbers as SQL:
 ```sql
 -- Outcomes of the last day
 SELECT mode, outcome, COUNT(*), PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms
@@ -139,7 +145,7 @@ FROM shadow_assessments WHERE created_at > NOW() - INTERVAL '1 day';
 SELECT seq, agent_name, kind, tool_name, args_json, refused, latency_ms, tokens
 FROM agent_events WHERE run_id = <agent_runs.id> ORDER BY seq;
 ```
-Metrics: `forti_agent_runs_total{mode,outcome}`, `forti_agent_llm_calls_total{agent}`, `forti_agent_tool_calls_total{tool,outcome}`, `forti_agent_run_duration_seconds`, `forti_agent_tokens_total{direction}`, `forti_agent_budget_exhausted_total` (Grafana row "ADK Agent Investigator" of `dashboards/agent_operations.json`). Repeated `lookup_asset` refusals mean the agent is guessing IPs; review the instructions before anything else.
+Metrics: `forti_agent_runs_total{mode,outcome}`, `forti_agent_llm_calls_total{agent}`, `forti_agent_tool_calls_total{tool,outcome}`, `forti_agent_run_duration_seconds`, `forti_agent_tokens_total{direction}`, `forti_agent_budget_exhausted_total` (incremented after each run; Grafana row "ADK Agent Investigator" of `dashboards/agent_operations.json`), and the last-24-hour gauges `forti_agent_runs_24h{mode,outcome}`, `forti_agent_shadow_comparisons_24h` and `forti_agent_shadow_agreeing_24h{field}`, which the operational metrics updater sets from the audit tables every 5 s in every mode (row "ADK Shadow Comparison"). Alerts: `FortiGateAgentHardRejectRate` (more than 5% of the last 24 h's runs hard-rejected) and `FortiGateAgentBudgetExhaustion` (more than 2% stopped by the budget), both only once there are at least 20 runs in the window. Repeated `lookup_asset` refusals mean the agent is guessing IPs; review the instructions before anything else.
 
 ### 5.3 Run outcomes
 | `agent_runs.outcome` | Meaning | What to check |
@@ -158,5 +164,22 @@ DELETE FROM adk.sessions WHERE app_name = 'forti-investigator' AND update_time <
 ```
 `agent_runs` and `agent_events` are the audit record and are not touched by this statement.
 
-### 5.5 Rolling back and `adk` mode
+### 5.5 Promotion evidence (plan C2.5)
+Phase C.3 promotes `adk` mode only when the C2.5 criteria hold on the golden set and on at least 50 real shadow runs. The offline part runs in CI (`tests/agent/test_golden_set.py`, `tests/e2e/test_service_e2e.py::test_e2e_offline_shadow_run_over_the_golden_scenarios`). In the lab:
+
+1. Collect: run in shadow mode (5.1) until at least 50 incidents have been investigated, then
+   ```bash
+   docker compose exec -T app python scripts/shadow_report.py --since <shadow start, ISO 8601> --check lab
+   ```
+   exit status 0 means: at least 50 shadow runs, hard-reject rate under 5%, p95 latency under 90 s, budget exhaustion under 2%, no `lookup_asset` refusal.
+2. Evaluate the golden set against the lab model from a checkout with `requirements-dev.txt` plus `google-adk[eval]==2.11.0` (README section 6):
+   ```bash
+   RUN_LAB_EVALS=1 LLM_BASE_URL=http://<vllm-host>:8000/v1 LLM_MODEL=<served-model> \
+     pytest -m lab -v tests/agent/test_golden_eval_lab.py
+   ```
+3. Add two reviewed real incidents to the golden set: `docker compose exec -T app python scripts/export_golden_incident.py <incident_id> <revision> > evals/lab/<name>.test.json`, review the file (`evals/lab/README.md`), commit it, and repeat step 2.
+
+Evaluation reads tool data from the evalset only (no Loki, no database) and writes nothing.
+
+### 5.6 Rolling back and `adk` mode
 Rollback is `INVESTIGATOR_MODE=legacy` and a restart; legacy mode does not load ADK at all, and the audit tables stay as a record. `INVESTIGATOR_MODE=adk` makes the agent's validated assessment (or the deterministic fallback) the investigation revision and card, committed through the same CAS and job fence, with a `model_runs` row (`structured_output_mode = adk_json_schema`). It is promoted to default only in Phase C.3, after the C.2 shadow criteria are met; do not enable it in production before that.

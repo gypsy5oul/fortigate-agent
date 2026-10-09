@@ -65,7 +65,8 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 │   │       ├── callbacks.py        # Bounds, redaction/delimiters, model-call ceiling, usage
 │   │       ├── runtime.py          # Runner, sessions, budgets, outcome mapping, validator
 │   │       ├── audit.py            # Per-run record; writer of agent_runs/agent_events/shadow_assessments
-│   │       └── instructions/       # Versioned agent instructions (master, evidence, context, writer)
+│   │       ├── evaluation.py       # adk eval / AgentEvaluator entry point (App, per-session run binding, tool fixtures)
+│   │       └── instructions/       # Versioned agent instructions 1.1.0 (master, evidence, context, writer)
 │   ├── notifications/
 │   │   ├── gchat_cards.py          # Cards v2 builder with thread keys & digest cards
 │   │   └── outbox_worker.py        # Priority outbox worker with retry backoff
@@ -76,6 +77,15 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 │   ├── alerts.yml                  # Prometheus alert rules for operational health
 │   ├── firewall_threat_overview.json # Grafana Dashboard A: Threat Overview (logfmt)
 │   └── agent_operations.json         # Grafana Dashboard B: Agent Telemetry & Freshness
+├── evals/
+│   ├── golden/                     # ADK EvalSets of the golden scenarios (scripts/build_golden_set.py)
+│   ├── lab/                        # Redacted real incidents (scripts/export_golden_incident.py; empty until exported)
+│   └── test_config.json            # adk eval criteria (trajectory 1.0, response match 0.6)
+├── scripts/
+│   ├── shadow_report.py            # Shadow comparison harness (agreement, rejects, latency, tokens, tools)
+│   ├── export_golden_incident.py   # Redacted export of a real incident as a golden case
+│   ├── build_golden_set.py         # Builds evals/golden from the e2e scenarios
+│   └── make_phase_report.sh        # Phase report generator (real output only)
 ├── docs/
 │   ├── runbook.md                  # Backup/restore, reprocessing, and recovery runbook
 │   ├── data-dictionary.md          # Complete PostgreSQL schema and data dictionary
@@ -145,7 +155,7 @@ The pipeline: `incident_investigator` calls `evidence_agent` (tools `get_inciden
 | `AGENT_TIMEOUT_SECONDS` | `120` | deadline for one whole investigation; beyond it `AGENT_TIMEOUT` |
 | `ADK_SESSION_DB_URL` | derived | ADK session store; unset means `DATABASE_URL` as `postgresql+asyncpg://`, tables in schema `adk` (migration 006) |
 
-The agents use `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT_SECONDS` (per model call), `LLM_MAX_INPUT_TOKENS` and `LLM_MAX_OUTPUT_TOKENS`. vLLM must run with `--enable-auto-tool-choice --tool-call-parser hermes` for Qwen tool calling. Operating the modes: [docs/runbook.md](docs/runbook.md) section 5.
+The agents use `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT_SECONDS` (per model call), `LLM_MAX_INPUT_TOKENS` and `LLM_MAX_OUTPUT_TOKENS`. vLLM must run with `--enable-auto-tool-choice --tool-call-parser hermes` for Qwen tool calling. Shadow results are compared with the legacy call by `scripts/shadow_report.py` (in the image: `docker compose exec -T app python scripts/shadow_report.py --hours 24`). Operating the modes and the promotion evidence: [docs/runbook.md](docs/runbook.md) section 5.
 
 ---
 
