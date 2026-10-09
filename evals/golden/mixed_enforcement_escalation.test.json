@@ -1,0 +1,202 @@
+{
+  "eval_set_id": "golden_mixed_enforcement_escalation",
+  "name": "golden mixed_enforcement_escalation",
+  "description": "Golden case mixed_enforcement_escalation from e2e scenario scenario_6_mixed_escalation; investigated by the service. Built by scripts/build_golden_set.py; do not edit by hand.",
+  "eval_cases": [
+    {
+      "eval_id": "mixed_enforcement_escalation",
+      "conversation": [
+        {
+          "invocation_id": "golden-mixed_enforcement_escalation",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Investigate the incident bound to this session."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "{\"incident_id\":\"INC-855D8E26237B\",\"incident_revision\":2,\"severity\":\"CRITICAL\",\"attack_category\":\"EXPLOITATION_ATTEMPT\",\"exploitation_assessment\":\"ATTEMPT_OBSERVED\",\"enforcement\":\"MIXED\",\"summary\":\"The source probed SSH, RDP and HTTP-ALT, all denied, then sent a SQL injection request that the WAF passed in monitor mode.\",\"findings\":[{\"kind\":\"OBSERVATION\",\"statement\":\"Three connection attempts on distinct services were denied by policy.\",\"evidence_ids\":[\"77b0d89bd6c47c4c5404490ec1af54abbb2f44dfd7fa4d886112cce2542cd1bc\",\"20e5c154a5d4844228743bafb7868985ae583bb0e30f9783a771452ae84c4c26\",\"7f1f6d0b1f6deb52c9bb8f351ae0a82047ded33d8209066a59113847e827e2b4\"]},{\"kind\":\"OBSERVATION\",\"statement\":\"The WAF detected a SQL injection request on HTTPS and passed it.\",\"evidence_ids\":[\"be773455fe8a7526e7179e968d4437d265b02b386a0bd3907329c133622e36b3\"]}],\"cve_references\":[],\"visibility_gaps\":[\"Firewall logs cannot show the application's response to the injected query.\"],\"recommended_action_ids\":[\"ACT_INSPECT_APPLICATION_LOGS\"],\"analyst_follow_up\":[\"Check the application and database logs for the injected query.\"]}"
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "evidence_agent",
+                "args": {}
+              },
+              {
+                "name": "context_agent",
+                "args": {}
+              }
+            ],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "forti-investigator",
+        "user_id": "system",
+        "state": {
+          "incident_id": "INC-855D8E26237B",
+          "revision": 2,
+          "source_ip": "198.51.100.47",
+          "target_ip": "10.0.14.120",
+          "window_start_ns": 1791271947000000000,
+          "window_end_ns": 1791271947500000000,
+          "packet": {
+            "incident_id": "INC-855D8E26237B",
+            "incident_revision": 2,
+            "visibility_scope": "FIREWALL_ONLY",
+            "source_ip": "198.51.100.47",
+            "target_ip": "10.0.14.120",
+            "target_app": "SSH",
+            "first_seen": "2026-10-06 07:32:27+00:00",
+            "last_seen": "2026-10-06 07:32:27.500000+00:00",
+            "event_count": 4,
+            "enforcement": "MIXED",
+            "enforcement_counts": {
+              "BLOCKED": 3,
+              "ALLOWED": 0,
+              "ALLOWED_OR_DETECTED": 1,
+              "SESSION_CLOSED": 0,
+              "UNKNOWN": 0
+            },
+            "deterministic_rule_ids": [
+              "RULE_NONBLOCKED_EXPLOIT_ATTEMPT",
+              "RULE_MIXED_ENFORCEMENT_SEQUENCE",
+              "RULE_PORT_SCAN_MULTI_SERVICE"
+            ],
+            "deterministic_severity_floor": "CRITICAL",
+            "deterministic_reasons": [
+              "FortiGate DPI detected high-impact attack payload (exploit) reaching application without perimeter blocking.",
+              "Mixed enforcement sequence detected across UTM events (4 events; mixed enforcement, not proven bypass).",
+              "Source IP probed multiple distinct network services (4 events across multiple ports)."
+            ],
+            "signatures": [],
+            "evidence_events": [
+              {
+                "id": "77b0d89bd6c47c4c5404490ec1af54abbb2f44dfd7fa4d886112cce2542cd1bc",
+                "loki_ts_ns": 1791271947000000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 47000,
+                "dstport": 22,
+                "proto": 6,
+                "service": "SSH",
+                "policyid": 0,
+                "sessionid": 210001,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "20e5c154a5d4844228743bafb7868985ae583bb0e30f9783a771452ae84c4c26",
+                "loki_ts_ns": 1791271947100000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 47001,
+                "dstport": 3389,
+                "proto": 6,
+                "service": "RDP",
+                "policyid": 0,
+                "sessionid": 210002,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "7f1f6d0b1f6deb52c9bb8f351ae0a82047ded33d8209066a59113847e827e2b4",
+                "loki_ts_ns": 1791271947200000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 47002,
+                "dstport": 8080,
+                "proto": 6,
+                "service": "HTTP-ALT",
+                "policyid": 0,
+                "sessionid": 210003,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "be773455fe8a7526e7179e968d4437d265b02b386a0bd3907329c133622e36b3",
+                "loki_ts_ns": 1791271947500000000,
+                "log_type": "utm",
+                "subtype": "waf",
+                "action_normalized": "ALLOWED_OR_DETECTED",
+                "action_raw": "passthrough",
+                "direction": "INBOUND",
+                "srcport": 47010,
+                "dstport": 443,
+                "proto": 6,
+                "service": "HTTPS",
+                "policyid": 10,
+                "sessionid": 210010,
+                "url": "/api/users?id=<redacted>",
+                "http_method": "GET",
+                "severity_raw": "alert"
+              }
+            ],
+            "action_catalog": [
+              {
+                "id": "ACT_SWITCH_IPS_TO_BLOCK",
+                "name": "Switch IPS Profile from Monitor to Protect",
+                "category": "PROFILE_TUNING",
+                "description": "Tune policy security profile to actively drop matching exploit signatures rather than monitor/passthrough.",
+                "risk_level": "MEDIUM",
+                "requires_approval": true
+              },
+              {
+                "id": "ACT_INSPECT_APPLICATION_LOGS",
+                "name": "Inspect Backend Web Application Logs",
+                "category": "INVESTIGATION_STEP",
+                "description": "Correlate FortiGate DPI timestamp with application access logs to verify backend HTTP response code.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              },
+              {
+                "id": "ACT_MONITOR_AND_DIGEST",
+                "name": "Log and Monitor in Weekly Threat Digest",
+                "category": "OBSERVATION",
+                "description": "No perimeter changes required; signature was contained by existing firewall drop rules.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              }
+            ]
+          },
+          "eval_fixture": {
+            "traffic_lines": [
+              [
+                1791271947000000000,
+                "date=2026-10-06 time=12:00:07 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=210001 srcip=198.51.100.47 srcport=47000 dstip=10.0.14.120 dstport=22 proto=6 service=\"SSH\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271947100000000,
+                "date=2026-10-06 time=12:00:07 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=210002 srcip=198.51.100.47 srcport=47001 dstip=10.0.14.120 dstport=3389 proto=6 service=\"RDP\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271947200000000,
+                "date=2026-10-06 time=12:00:07 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=210003 srcip=198.51.100.47 srcport=47002 dstip=10.0.14.120 dstport=8080 proto=6 service=\"HTTP-ALT\" action=\"deny\" policyid=0"
+              ]
+            ],
+            "recent_incidents": []
+          }
+        }
+      },
+      "creation_timestamp": 0.0
+    }
+  ],
+  "creation_timestamp": 0.0
+}

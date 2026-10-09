@@ -160,4 +160,20 @@ TEST_DATABASE_URL="postgresql://forti_intel:<password>@<db-host>:5432/forti_test
 
 The ADK investigator is tested without a live model: `tests/agent/` drives the real ADK with a scripted `BaseLlm` (`tests/agent/fake_llm.py`) and fake Loki, and the e2e suite runs the real process in `shadow` and `adk` modes against a fake vLLM that answers OpenAI-format `tool_calls`.
 
+### Golden set and `adk eval` (model lab, not CI)
+
+`evals/golden/*.test.json` are ADK EvalSets, one per golden case (non-blocked IPS exploit, blocked exploit, mixed enforcement escalation, AV blocked, scanner, injection payload, tool silence), built by `scripts/build_golden_set.py` from the e2e scenarios through the real normalizer, aggregator, rules and eligibility; `tests/agent/test_golden_set.py` fails if a committed file differs from what the script builds. Each case holds the packet the investigator would receive, the tool data the read-only tools may see during evaluation (`eval_fixture`; evaluation never reads Loki or the database and writes nothing), the expected trajectory (`evidence_agent`, then `context_agent`) and a reviewed reference assessment. `evals/test_config.json` sets `tool_trajectory_avg_score` 1.0 (exact order, arguments ignored because they are free text) and `response_match_score` 0.6. CI runs every golden case through the investigator against the scripted fake vLLM (`tests/agent/test_golden_set.py`); the lab runs them against the real model. That needs ADK's eval extras on top of `requirements-dev.txt` (`pip install "google-adk[eval]==2.11.0"`, not part of the image):
+
+```bash
+# From the repository root, with the lab vLLM serving the model:
+PYTHONPATH=. LLM_BASE_URL=http://<vllm-host>:8000/v1 LLM_MODEL=<served-model> \
+  adk eval src/investigation/agent evals/golden/*.test.json \
+  --config_file_path evals/test_config.json --print_detailed_results
+# Same criteria as a pass/fail pytest run (adk eval itself exits 0 even when cases fail):
+RUN_LAB_EVALS=1 LLM_BASE_URL=http://<vllm-host>:8000/v1 LLM_MODEL=<served-model> \
+  pytest -m lab -v tests/agent/test_golden_eval_lab.py
+```
+
+Add `evals/lab/*.test.json` to the `adk eval` file list once real incidents have been exported there (`evals/lab/README.md`); the pytest run picks them up by itself. `adk eval` writes its results under `src/investigation/agent/.adk/` (ignored by git).
+
 Refer to [docs/runbook.md](docs/runbook.md) for backup/restore, reprocessing, and troubleshooting procedures, and [docs/data-dictionary.md](docs/data-dictionary.md) for schema definitions. Phase reports are generated from a clean checkout with `scripts/make_phase_report.sh`.
