@@ -1,0 +1,46 @@
+# Phase C.0 ADK spike pins. NOT installed in the runtime image: requirements.in, requirements.txt,
+# requirements.lock and the Dockerfile are unchanged. Whether these go into the image, and in which
+# form, is the C.1 size decision (see docs/reports/gate-c0-spike-report.md). Resolved on Python 3.13
+# on 2026-10-09; every pin below is the version the spike and tests/test_adk_spike_fake.py ran with.
+#
+# This file is self-contained because google-adk 2.11.0 and litellm 1.104.2 do not resolve against
+# requirements.in (see "moved" below), so it cannot be combined with that file. Install it into a
+# scratch environment only, then add the test tools:
+#   python -m pip install -r requirements-agent.in
+#   python -m pip install pytest==8.4.2 pytest-asyncio==1.2.0
+
+# Agent layer
+google-adk[extensions]==2.11.0
+litellm==1.104.2
+sqlalchemy==2.1.4
+openai==2.54.0
+google-genai==2.29.0
+# new with google-adk, which caps them at <=1.42.1 (neither is in requirements.txt)
+opentelemetry-api==1.42.1
+opentelemetry-sdk==1.42.1
+
+# Runtime pins from requirements.in that had to move
+#   fastapi           0.128.8 -> 0.141.1   google-adk requires fastapi>=0.133,<1
+#   pydantic-settings 2.11.0  -> 2.15.0    litellm requires pydantic-settings>=2.14.1,<3
+#   starlette         0.52.1  -> 1.7.0     google-adk requires starlette>=1.3.1,<2 (transitive in the runtime lock)
+#   pydantic          2.12.5  -> 2.14.0    moved only by the [extensions] extra; the slim set keeps 2.12.5
+#   pydantic-core     2.41.5  -> 2.50.0    follows pydantic
+fastapi==0.141.1
+pydantic-settings==2.15.0
+starlette==1.7.0
+pydantic==2.14.0
+pydantic-core==2.50.0
+
+# Runtime pins from requirements.in, unchanged
+pyyaml==6.0.3
+httpx==0.28.1
+asyncpg==0.31.0
+aiosqlite==0.22.1
+prometheus-client==0.26.0
+uvicorn==0.39.0
+python-dotenv==1.0.1
+
+# Slimmer alternative that was also run end to end (all 57 assertions of scripts/adk_spike.py passed):
+# use "google-adk==2.11.0" and "sqlalchemy[asyncio]==2.1.4" instead of the [extensions] line and the
+# plain sqlalchemy line, keep pydantic==2.12.5 and pydantic-core==2.41.5 from requirements.in, and
+# drop the two pydantic lines above. Site-packages grows by about 381 MiB instead of about 870 MiB.
