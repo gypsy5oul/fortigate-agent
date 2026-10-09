@@ -10,8 +10,8 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 - **Selective, Budgeted Ingest**: The `security_events` query profile (`LOKI_QUERY_PROFILE`) asks Loki only for UTM detections (`type="utm"`), FortiOS event logs (`type="event"`), perimeter denies (`action="deny"`) and UTM blocks (`utmaction="block"`). Routine accepted traffic (`action="accept"`, `action="close"`) is dropped at ingest and never mirrored to the database. A `traffic_context` profile serves on-demand enrichment: only the ADK investigator's read-only `query_traffic_context` tool calls it (shadow and adk modes, section 5).
 - **Monotonic Query Checkpoints**: Loki log cursors advance monotonically in durable PostgreSQL storage only after events are successfully inserted.
 - **Fail-Safe Deterministic Severity Floor**: High-impact non-blocked exploits (`action="detected"` or `"passthrough"`) immediately establish a critical severity floor. If the local LLM is offline, degraded, or times out, deterministic alerts are dispatched without disruption.
-- **Bounded Structured Model Output**: Uses OpenAI-compatible `response_format={"type": "json_schema"}` with strict Pydantic schemas, defensive delimiters (`<<UNTRUSTED id=...>>`) against prompt injection, a single-repair retry loop, and complete audit persistence in `model_runs`.
-- **ADK Agent Investigator (shadow mode)**: A Google ADK agent system (a master investigator, two specialist agents with read-only tools, and a schema-bound writer) runs beside the single call when `INVESTIGATOR_MODE=shadow` and is audited in `agent_runs`, `agent_events` and `shadow_assessments` without producing any revision or card (section 5, `docs/adr/005-adk-investigator.md`).
+- **Bounded Structured Model Output**: Uses OpenAI-compatible `response_format={"type": "json_schema"}` with strict Pydantic schemas, defensive delimiters (`<<UNTRUSTED id=...>>`) against prompt injection, and complete audit persistence in `model_runs`. The default `legacy` investigator makes one bounded call with a single-repair retry; the ADK investigator asks a schema-bound writer for exactly one object and falls back to the deterministic assessment instead of repairing.
+- **ADK Agent Investigator (shadow and adk modes)**: A Google ADK agent system (a master investigator, two specialist agents with read-only tools, and a schema-bound writer) runs beside the single call when `INVESTIGATOR_MODE=shadow`, audited in `agent_runs`, `agent_events` and `shadow_assessments` without producing any revision or card, or replaces it when `INVESTIGATOR_MODE=adk` (section 5, `docs/adr/005-adk-investigator.md`). The default stays `legacy`; promoting `adk` is a one-setting flip with a one-setting rollback, gated on lab evidence (runbook sections 5.5 to 5.7).
 - **Firewall-Only Evidence Boundary**: Strictly restricted to `visibility_scope=FIREWALL_ONLY`. Unsupported claims of application compromise are rejected and downgraded to `ATTEMPT_OBSERVED`.
 - **Reliable Priority Outbox**: Google Chat Cards v2 alerts are delivered via an outbox worker honoring strict priority ordering (URGENT > INVESTIGATION_UPDATE > DIGEST), exponential backoff with jitter, `Retry-After` rate-limiting, and permanent 4xx dead-lettering.
 
@@ -55,10 +55,10 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 │   │   └── engine.py               # Zero-code declarative condition evaluator
 │   ├── investigation/
 │   │   ├── schemas.py              # Pydantic schemas (IncidentPacket, QwenAssessment, WriterAssessment)
-│   │   ├── prompts/                # Versioned prompt templates (legacy single call)
+│   │   ├── prompts/                # Versioned prompt templates (legacy single call; removed by the C.3 patch)
 │   │   ├── validator.py            # Security guardrails & CVE claim validator
 │   │   ├── eligibility.py          # Perimeter action eligibility constraints
-│   │   ├── single_call_workflow.py # Structured output LLM runner with repair loop (legacy mode)
+│   │   ├── single_call_workflow.py # Structured output LLM runner with repair loop (legacy mode; removed by the C.3 patch)
 │   │   └── agent/                  # ADK investigator (shadow and adk modes, ADR 005)
 │   │       ├── agents.py           # Master, two specialists, writer; Workflow root
 │   │       ├── tools.py            # Read-only tools bound to the incident in session state
@@ -85,10 +85,12 @@ A resilient, containerized security service that monitors Grafana Loki for Forti
 │   ├── shadow_report.py            # Shadow comparison harness (agreement, rejects, latency, tokens, tools)
 │   ├── export_golden_incident.py   # Redacted export of a real incident as a golden case
 │   ├── build_golden_set.py         # Builds evals/golden from the e2e scenarios
+│   ├── code_accounting.py          # Lines under src/investigation/ by bucket (legacy, agent runtime, shared, instructions) and the effect of a patch
 │   └── make_phase_report.sh        # Phase report generator (real output only)
 ├── docs/
 │   ├── runbook.md                  # Backup/restore, reprocessing, and recovery runbook
 │   ├── data-dictionary.md          # Complete PostgreSQL schema and data dictionary
+│   ├── reports/                    # Generated phase reports; gate-c3-legacy-removal.patch is the prepared, unapplied legacy removal
 │   └── adr/                        # Architectural Decision Records
 └── tests/                          # Unit, PostgreSQL integration, agent (tests/agent) and real-process e2e tests
 ```
@@ -142,20 +144,24 @@ curl http://localhost:8085/metrics
 
 | Mode | Investigation revision and card | ADK agent pipeline | Rows written by the agent path |
 | :--- | :--- | :--- | :--- |
-| `legacy` (default) | one bounded structured call (`single_call_workflow.py`) | not loaded | none |
+| `legacy` (default until an operator flips it) | one bounded structured call (`single_call_workflow.py`) | not loaded | none |
 | `shadow` | the legacy call, unchanged | runs after the legacy revision is committed; never writes a revision or a card; a failure there never fails the job | `agent_runs`, `agent_events`, `shadow_assessments` |
-| `adk` | the ADK pipeline's validated assessment (or the deterministic fallback), through the same `record_incident_transition` CAS and job fence | runs instead of the legacy call | `agent_runs`, `agent_events`, plus the usual `model_runs` row |
+| `adk` | the ADK pipeline's validated assessment (or the deterministic fallback), through the same `record_incident_transition` CAS and job fence | runs instead of the legacy call | `agent_runs`, `agent_events`, plus the usual `model_runs` row (`structured_output_mode` `adk_json_schema`; same `incident_id` and `revision` as its `agent_runs` row) |
 
 The pipeline: `incident_investigator` calls `evidence_agent` (tools `get_incident_packet`, `query_traffic_context`) and then `context_agent` (`lookup_asset`, `lookup_signature`, `recent_incidents_for_source`, `get_action_catalog`) as tools, writes investigation notes, and `assessment_writer` turns them into a schema-bound assessment that passes the same validator as the legacy path. Every tool is read-only and bound to the incident in session state; every tool result is redacted and wrapped in `<<UNTRUSTED>>` delimiters. Settings:
 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
-| `INVESTIGATOR_MODE` | `legacy` | `legacy`, `shadow` or `adk` |
+| `INVESTIGATOR_MODE` | `legacy` | `legacy`, `shadow` or `adk`; flipping to `adk` and back is this one setting and a container recreate (`docker compose up -d app`) |
 | `AGENT_MAX_LLM_CALLS` | `8` | model calls per investigation across all four agents; beyond it the run stops with `AGENT_BUDGET_EXHAUSTED` |
 | `AGENT_TIMEOUT_SECONDS` | `120` | deadline for one whole investigation; beyond it `AGENT_TIMEOUT` |
 | `ADK_SESSION_DB_URL` | derived | ADK session store; unset means `DATABASE_URL` as `postgresql+asyncpg://`, tables in schema `adk` (migration 006) |
 
 The agents use `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT_SECONDS` (per model call), `LLM_MAX_INPUT_TOKENS` and `LLM_MAX_OUTPUT_TOKENS`. vLLM must run with `--enable-auto-tool-choice --tool-call-parser hermes` for Qwen tool calling. Shadow results are compared with the legacy call by `scripts/shadow_report.py` (in the image: `docker compose exec -T app python scripts/shadow_report.py --hours 24`). Operating the modes and the promotion evidence: [docs/runbook.md](docs/runbook.md) section 5.
+
+### Promotion path (Phase C.3)
+
+The default becomes `adk` and the legacy single call goes only when the plan's C2.5 criteria hold on the golden set and on at least 50 real shadow runs against the lab model. That evidence cannot come from CI, so this repository ships the mechanics and leaves the decision to the operator: the gate table to fill in (runbook 5.5), the flip, the first-hour watch list and the rollback (5.7, 5.6), and `docs/reports/gate-c3-legacy-removal.patch`, a prepared and unapplied change that deletes the legacy workflow and its prompts, makes `adk` the only accepted value of `INVESTIGATOR_MODE` and updates the tests. Apply the patch only after the flip has soaked: from then on the way back is a `git revert`, not a setting. `python scripts/code_accounting.py --patch docs/reports/gate-c3-legacy-removal.patch` prints the lines it removes and adds under `src/investigation/`.
 
 ---
 
@@ -168,7 +174,7 @@ The test suite covers unit tests, PostgreSQL 16 integration tests, and full chil
 TEST_DATABASE_URL="postgresql://forti_intel:<password>@<db-host>:5432/forti_test" pytest -v tests/
 ```
 
-The ADK investigator is tested without a live model: `tests/agent/` drives the real ADK with a scripted `BaseLlm` (`tests/agent/fake_llm.py`) and fake Loki, and the e2e suite runs the real process in `shadow` and `adk` modes against a fake vLLM that answers OpenAI-format `tool_calls`.
+The ADK investigator is tested without a live model: `tests/agent/` drives the real ADK with a scripted `BaseLlm` (`tests/agent/fake_llm.py`) and fake Loki, and the e2e suite runs the real process in `shadow` and `adk` modes against a fake vLLM that answers OpenAI-format `tool_calls`. The `adk` cases cover the committed revision with its `model_runs` and `agent_runs` rows and exactly one INVESTIGATION_UPDATE card, a revision taken by another writer mid-run (the CAS refuses it, the job is retried, nothing is written twice), a writer that answers garbage (the deterministic fallback with `AGENT_SCHEMA_INVALID`, the service carries on) and SIGTERM during a run (exit code 0, the job completed after the next start).
 
 ### Golden set and `adk eval` (model lab, not CI)
 

@@ -264,7 +264,7 @@ Detection, severity floors and URGENT cards do not depend on the agent, so nothi
 
 **7. After the first hour.** Repeat the report at the end of the first day (`--mode live --hours 24`) and, once there are 50 live runs, `--mode live --check lab`: exit 0 means the lab bars hold on the live runs too. Keep the report with the ticket.
 
-**8. Remove the legacy code (a later, separate change).** `docs/reports/gate-c3-legacy-removal.patch` deletes the single-call workflow and its prompts, makes `adk` the only accepted value (and so the default) of `INVESTIGATOR_MODE`, removes the shadow plumbing that needed the legacy assessment, and updates the tests. It is not applied by this repository: apply it only after the flip has soaked for as long as the ticket says, because from then on 5.6 is a `git revert` and an image rebuild instead of a setting.
+**8. Remove the legacy code (a later, separate change).** `docs/reports/gate-c3-legacy-removal.patch` deletes the single-call workflow and its prompts, makes `adk` the only accepted value (and so the default) of `INVESTIGATOR_MODE`, removes the shadow plumbing that needed the legacy assessment (`shadow_assessments` and `scripts/shadow_report.py` stay, to read the evidence already collected; read the live runs with `--mode live` from then on), and updates the tests. It is not applied by this repository: apply it only after the flip has soaked for as long as the ticket says, because from then on 5.6 is a `git revert` and an image rebuild instead of a setting.
 ```bash
 git switch -c chore/remove-legacy-investigator
 git apply --check docs/reports/gate-c3-legacy-removal.patch && git apply docs/reports/gate-c3-legacy-removal.patch
@@ -272,4 +272,4 @@ TEST_DATABASE_URL=postgresql://<user>:<password>@<db-host>:5432/<scratch-db> pyt
 git add -A && git commit -m "feat: remove the legacy single-call investigator"
 docker compose up -d --build app                                                    # the image carries the code
 ```
-The patch was generated against the commit that carries it and its suite result is recorded in `docs/reports/gate-c3-report.md`; `git apply --check` tells you if the tree has moved since. `scripts/code_accounting.py --patch docs/reports/gate-c3-legacy-removal.patch` prints what it removes and adds.
+The patch was generated against the commit that carries it, and the Phase C.3 report records that it applies and that the whole suite passes on the patched tree; `git apply --check` tells you if the tree has moved since. `scripts/code_accounting.py --patch docs/reports/gate-c3-legacy-removal.patch` prints what it removes and adds.

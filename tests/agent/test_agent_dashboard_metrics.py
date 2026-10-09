@@ -54,3 +54,31 @@ def test_agent_dashboard_series_are_exported():
 def test_metric_outcomes_are_the_runtime_outcomes():
     outcomes = {getattr(runtime, n) for n in dir(runtime) if n.startswith("OUTCOME_")}
     assert set(AGENT_RUN_OUTCOMES) == outcomes
+
+
+def test_dashboard_has_adk_mode_outcome_panels():
+    """Phase C.3: the dashboard answers "how is adk mode doing" without the shadow tables: live-mode
+    run counts, the fallback rate, outcomes (24 h and as a rate), the failure counter that turns
+    /health/ready degraded, and the investigation queue age."""
+    panels = {p["id"]: p for p in json.loads(DASHBOARD.read_text())["panels"]}
+    live = [p for p in panels.values() if any('mode="live"' in t["expr"] for t in p.get("targets", []))]
+    assert {p["title"] for p in live} >= {
+        "Live Runs (24 h)", "Live Fallback Rate (24 h)", "Live Outcomes (24 h)", "Live Runs by Outcome (15 min)",
+    }
+    exprs = " ".join(t["expr"] for p in panels.values() for t in p.get("targets", []))
+    assert "forti_model_consecutive_failures" in exprs and "forti_jobs_oldest_pending_seconds" in exprs
+    assert 'forti_agent_runs_24h{mode="live",outcome!="VALID"}' in exprs and 'forti_agent_runs_total{mode="live"}' in exprs
+    titles = [p["title"] for p in panels.values()]
+    assert len(titles) == len(set(titles)) and len(panels) == len({p["id"] for p in panels.values()})
+
+
+def test_every_forti_series_on_the_dashboard_is_a_registered_metric():
+    """Plan rule 8 for the whole dashboard: a series nothing registers would stay empty for ever."""
+    from prometheus_client import REGISTRY
+
+    families = {family.name for family in REGISTRY.collect()}
+    exprs = [t["expr"] for p in json.loads(DASHBOARD.read_text())["panels"] for t in p.get("targets", [])]
+    referenced = {m for e in exprs for m in re.findall(r"\bforti_[a-z0-9_]+", e)}
+    # A counter's family drops "_total"; a histogram's samples add "_bucket", "_sum" and "_count".
+    unregistered = sorted(m for m in referenced if m not in families and re.sub(r"_(total|bucket|sum|count)$", "", m) not in families)
+    assert not unregistered, f"dashboard series no metric registers: {unregistered}"

@@ -188,6 +188,8 @@ Asynchronous investigation work queue leased by worker loops.
 ### 1.9 `model_runs`
 Complete audit trail for every LLM interaction, token usage, validation result, and transactional outcome.
 
+In `adk` mode every row (`structured_output_mode = 'adk_json_schema'`) has a matching `agent_runs` row (section 1.12) for the same `incident_id` and `revision`, with the same `model_id`, tokens and latency, and `validation_result` equal to that run's `outcome`. There is no foreign key between the two tables, so join on `incident_id` and `revision` (and `agent_runs.mode = 'live'`). A job that is retried adds a row to each table; a commit refused by the revision CAS (another writer took the revision first) leaves `commit_status = 'CONFLICT'` and the `agent_runs` row in place. Rows of the legacy single call have no `agent_runs` row.
+
 | Column | Data Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | `SERIAL` | No | - | Surrogate primary key |
@@ -243,7 +245,7 @@ Records which SQL files under `migrations/` have been applied; `Database.connect
 ---
 
 ### 1.12 `agent_runs`
-One row per ADK investigation (migration 006, ADR 005), written by the runtime wrapper (`src/investigation/agent/audit.py`) after the run, whatever its outcome. In `shadow` mode this is the only record of the run besides `agent_events` and `shadow_assessments`; in `adk` mode the same run also produces the revision and a `model_runs` row.
+One row per ADK investigation (migration 006, ADR 005), written by the runtime wrapper (`src/investigation/agent/audit.py`) after the run, whatever its outcome. In `shadow` mode this is the only record of the run besides `agent_events` and `shadow_assessments`; in `adk` mode the same run also produces the revision and, through the commit, a `model_runs` row for the same incident revision (section 1.9). A run abandoned because the service was stopped mid-run leaves no `agent_runs` row, and its job is retried.
 
 | Column | Data Type | Nullable | Default | Description |
 |---|---|---|---|---|
@@ -326,8 +328,8 @@ Created by migration 006 for ADK's `DatabaseSessionService`, which creates and o
 ### 2.3 Assessment Sources
 - `DETERMINISTIC`: Revision created directly from deterministic signature / threshold rule evaluations.
 - `MODEL_VALIDATED`: Model investigation assessment validated on first pass against strict schema and guardrails.
-- `MODEL_REPAIRED`: Model investigation assessment required single-repair bounded pass before acceptance.
-- `MODEL_REJECTED_FALLBACK`: Model investigation rejected or failed; deterministic fallback values applied.
+- `MODEL_REPAIRED`: Model investigation assessment required single-repair bounded pass before acceptance. Written only by the legacy single call; the ADK path has no repair pass.
+- `MODEL_REJECTED_FALLBACK`: Model investigation rejected or failed; deterministic fallback values applied. In `adk` mode the cause is the run's outcome (`agent_runs.outcome`, `model_runs.validation_result`) and the `AGENT_*` reason code in the summary.
 - `RATE_LIMITED`: Deterministic revision whose investigation job was not queued because the per-source or per-target hourly limit was reached.
 
 ### 2.4 Model Run Commit Status
