@@ -7,8 +7,8 @@ vips:
     criticality: "HIGH"
     owner: "DevOps Team"
 
-  - public_ip: "10.0.20.150"
-    application: "Loki / Observability Cluster"
+  - public_ip: "192.0.2.150"
+    application: "Example observability cluster (replace with your VIP; keep site addresses out of git)"
     environment: "infrastructure"
     criticality: "CRITICAL"
     owner: "Infra Team"
