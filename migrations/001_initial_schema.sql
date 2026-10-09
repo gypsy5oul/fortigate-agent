@@ -1,4 +1,4 @@
--- PostgreSQL schema for FortiGate Firewall Intelligence Service
+-- PostgreSQL initial schema for FortiGate Firewall Intelligence Service
 
 CREATE TABLE IF NOT EXISTS query_checkpoints (
     id SERIAL PRIMARY KEY,
@@ -19,10 +19,14 @@ CREATE TABLE IF NOT EXISTS coverage_gaps (
 );
 
 CREATE TABLE IF NOT EXISTS selected_events (
-    id VARCHAR(64) PRIMARY KEY, -- SHA-256 deduplication fingerprint
+    id VARCHAR(64) PRIMARY KEY,
     loki_ts_ns BIGINT NOT NULL,
     eventtime_ns BIGINT,
     devid VARCHAR(64),
+    vd VARCHAR(64) DEFAULT 'root',
+    direction VARCHAR(16) DEFAULT 'UNKNOWN',
+    srcintfrole VARCHAR(32),
+    dstintfrole VARCHAR(32),
     logid VARCHAR(64),
     log_type VARCHAR(32) NOT NULL,
     subtype VARCHAR(32),
@@ -41,12 +45,15 @@ CREATE TABLE IF NOT EXISTS selected_events (
     http_method VARCHAR(16),
     severity_raw VARCHAR(32),
     raw_message TEXT NOT NULL,
+    processing_status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+    processed_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_srcip_ts ON selected_events(srcip, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_dstip_ts ON selected_events(dstip, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_loki_ts ON selected_events(loki_ts_ns);
+CREATE INDEX IF NOT EXISTS idx_events_pending ON selected_events(processing_status, loki_ts_ns);
 
 CREATE TABLE IF NOT EXISTS incidents (
     id VARCHAR(64) PRIMARY KEY,
@@ -55,8 +62,12 @@ CREATE TABLE IF NOT EXISTS incidents (
     severity VARCHAR(16) NOT NULL,
     enforcement VARCHAR(32) NOT NULL,
     exploitation_assessment VARCHAR(32) NOT NULL DEFAULT 'INSUFFICIENT_EVIDENCE',
+    vd VARCHAR(64) DEFAULT 'root',
+    direction VARCHAR(16) DEFAULT 'INBOUND',
     source_ip VARCHAR(64) NOT NULL,
     target_ip VARCHAR(64) NOT NULL,
+    target_port INT,
+    target_service VARCHAR(64),
     target_app VARCHAR(128),
     first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
     last_seen TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -105,9 +116,9 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     id SERIAL PRIMARY KEY,
     incident_id VARCHAR(64) NOT NULL,
     revision INT NOT NULL,
-    notification_type VARCHAR(32) NOT NULL, -- 'URGENT', 'INVESTIGATION_UPDATE', 'DIGEST'
+    notification_type VARCHAR(32) NOT NULL,
     payload_json JSONB NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'SENT', 'FAILED', 'DEAD_LETTER'
+    status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
     attempts INT NOT NULL DEFAULT 0,
     last_error TEXT,
     sent_at TIMESTAMP WITH TIME ZONE,

@@ -11,12 +11,13 @@
       "collapsed": false,
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "id": 1,
-      "title": "UTM Security Events by Subtype (FortiGate 200G)",
+      "title": "UTM Security Detections by Subtype (FortiGate 200G)",
+      "description": "Counts individual UTM security detections per second extracted via logfmt (ips, virus, webfilter, waf, ssl). Does not count routine traffic logs.",
       "type": "timeseries",
       "datasource": { "type": "loki", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum by (subtype) (rate({service_name=\"forticlient\"} |= `type=\"utm\"` [1m]))",
+          "expr": "sum by (subtype) (rate({service_name=~\"$service_name\"} |= `type=\"utm\"` | logfmt [1m]))",
           "legendFormat": "{{subtype}}",
           "refId": "A"
         }
@@ -26,12 +27,13 @@
       "collapsed": false,
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "id": 2,
-      "title": "Blocked vs Allowed/Detected Security Actions",
+      "title": "Security Enforcement Actions Distribution",
+      "description": "Counts distinct FortiOS security enforcement actions (blocked, dropped, detected, passthrough, monitored) on UTM threat streams.",
       "type": "timeseries",
       "datasource": { "type": "loki", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum by (action) (rate({service_name=\"forticlient\"} |= `type=\"utm\"` [1m]))",
+          "expr": "sum by (action) (rate({service_name=~\"$service_name\"} |= `type=\"utm\"` | logfmt [1m]))",
           "legendFormat": "{{action}}",
           "refId": "A"
         }
@@ -41,12 +43,13 @@
       "collapsed": false,
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
       "id": 3,
-      "title": "Top Source IPs (Blocked Port Scans / Denies)",
+      "title": "Top Blocked Source IPs (Deny Records)",
+      "description": "Counts total perimeter traffic deny records per source IP over 15-minute sliding windows.",
       "type": "barchart",
       "datasource": { "type": "loki", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "topk(10, sum by (srcip) (count_over_time({service_name=\"forticlient\"} |= `action=\"deny\"` [15m])))",
+          "expr": "topk(10, sum by (srcip) (count_over_time({service_name=~\"$service_name\"} |= `action=\"deny\"` | logfmt [15m])))",
           "legendFormat": "{{srcip}}",
           "refId": "A"
         }
@@ -56,12 +59,13 @@
       "collapsed": false,
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
       "id": 4,
-      "title": "Top Targeted Destination VIPs",
+      "title": "Top Targeted Destination VIPs (UTM Records)",
+      "description": "Counts UTM attack detections directed against protected internal VIPs / destination IP addresses.",
       "type": "barchart",
       "datasource": { "type": "loki", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "topk(10, sum by (dstip) (count_over_time({service_name=\"forticlient\"} |= `type=\"utm\"` [15m])))",
+          "expr": "topk(10, sum by (dstip) (count_over_time({service_name=~\"$service_name\"} |= `type=\"utm\"` | logfmt [15m])))",
           "legendFormat": "{{dstip}}",
           "refId": "A"
         }
@@ -72,11 +76,12 @@
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
       "id": 5,
       "title": "Top Triggered Attack / Web Signatures",
+      "description": "Counts attack signature trigger events across IPS, App-Control, and Antivirus inspections.",
       "type": "barchart",
       "datasource": { "type": "loki", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "topk(10, sum by (attack) (count_over_time({service_name=\"forticlient\"} |= `attack=\"` [15m])))",
+          "expr": "topk(10, sum by (attack) (count_over_time({service_name=~\"$service_name\"} |= `attack=\"` | logfmt [15m])))",
           "legendFormat": "{{attack}}",
           "refId": "A"
         }
@@ -84,14 +89,26 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 16 },
       "id": 6,
+      "title": "Pipeline Telemetry Scope & Collection Boundaries",
+      "description": "Operational scope of telemetry ingested versus filtered at perimeter edge.",
+      "type": "markdown",
+      "options": {
+        "content": "### Scope & Collection Boundaries\n- **Collected Threat Streams**: FortiOS UTM Security Profiles (`type=\"utm\"` — IPS, Antivirus, WAF, SSL Anomaly) and Perimeter Denies (`type=\"traffic\" action=\"deny\"`).\n- **Not Collected / Filtered at Ingest**: Forward traffic session accept/close (`type=\"traffic\" action=\"accept\"`) are explicitly dropped at normalization to conserve database bandwidth and avoid false positive noise. Contextual traffic enrichment is queried on-demand directly from Loki.\n- **Endpoint Telemetry**: Pure endpoint agent logs without perimeter firewall correlation are not ingested."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 22 },
+      "id": 7,
       "title": "Live FortiGate UTM & Security Log Stream",
+      "description": "Raw live security log stream filtered by active service selector.",
       "type": "logs",
       "datasource": { "type": "loki", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "{service_name=\"forticlient\"} |= `type=\"utm\"`",
+          "expr": "{service_name=~\"$service_name\"} |= `type=\"utm\"`",
           "refId": "A"
         }
       ]
@@ -107,11 +124,20 @@
         "type": "datasource",
         "query": "loki",
         "label": "Loki Data Source"
+      },
+      {
+        "current": { "selected": true, "text": "forticlient", "value": "forticlient" },
+        "name": "service_name",
+        "type": "custom",
+        "query": "forticlient, alloy, forti_syslog",
+        "label": "Stream / Service Name",
+        "includeAll": false,
+        "multi": false
       }
     ]
   },
   "time": { "from": "now-1h", "to": "now" },
   "title": "FortiGate 200G - Perimeter Threat Overview",
   "uid": "fortigate-threat-overview",
-  "version": 1
+  "version": 2
 }

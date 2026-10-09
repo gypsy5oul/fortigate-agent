@@ -1,0 +1,12 @@
+# Production runtime dependencies for FortiGate Firewall Intelligence Service
+# Dropped range specs and unused dependencies (google-adk deferred to Phase C)
+pydantic==2.12.5
+pydantic-settings==2.11.0
+pyyaml==6.0.3
+httpx==0.28.1
+asyncpg==0.31.0
+aiosqlite==0.22.1
+prometheus-client==0.26.0
+fastapi==0.128.8
+uvicorn==0.39.0
+python-dotenv==1.0.1

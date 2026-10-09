@@ -9,17 +9,19 @@ rules:
       type: "utm"
       subtypes: ["ips", "waf"]
       enforcement: ["ALLOWED_OR_DETECTED", "MIXED"]
+      required_evidence: "utm"
     reason_template: "FortiGate DPI detected high-impact attack payload ({signature}) reaching application without perimeter blocking."
 
   - id: "RULE_MIXED_ENFORCEMENT_SEQUENCE"
     name: "Mixed Enforcement Attack Sequence"
     description: "Source IP exhibits both blocked probes and allowed connections within the same episode."
-    priority: "URGENT_ALERT_AND_INVESTIGATE"
+    priority: "INVESTIGATE"
     min_severity: "HIGH"
     condition:
       enforcement: ["MIXED"]
       min_events: 2
-    reason_template: "Attacker observed probing with blocked requests followed by accepted application flows."
+      required_evidence: "utm"
+    reason_template: "Mixed enforcement sequence detected across UTM events ({event_count} events; mixed enforcement, not proven bypass)."
 
   - id: "RULE_HIGH_FREQUENCY_SCANNER"
     name: "High Frequency Perimeter Scanner"
@@ -28,8 +30,22 @@ rules:
     min_severity: "MEDIUM"
     condition:
       enforcement: ["BLOCKED"]
+      direction: "INBOUND"
+      source_not_in: "trusted_networks"
       min_events: 10
     reason_template: "Persistent external automated scanner detected ({event_count} blocked attempts)."
+
+  - id: "RULE_PORT_SCAN_MULTI_SERVICE"
+    name: "Horizontal Port Scanner Across Multiple Services"
+    description: "Single external source targeting multiple distinct services or ports."
+    priority: "DIGEST"
+    min_severity: "MEDIUM"
+    condition:
+      direction: "INBOUND"
+      source_not_in: "trusted_networks"
+      min_distinct_services: 3
+      min_events: 3
+    reason_template: "Source IP probed multiple distinct network services ({event_count} events across multiple ports)."
 
   - id: "RULE_SSL_INSPECTION_ANOMALY"
     name: "Deep Inspection SSL Evasion Attempt"
@@ -40,14 +56,41 @@ rules:
       type: "utm"
       subtypes: ["ssl"]
       status_not: ["success"]
+      required_evidence: "utm"
     reason_template: "Inbound deep SSL inspection failure or evasion anomaly detected: {reason}"
 
   - id: "RULE_ANTIVIRUS_DETECTION"
     name: "Malicious Payload / Virus Detected"
-    description: "FortiGate Antivirus profile matched a malicious file transfer."
+    description: "FortiGate Antivirus profile matched a malicious file transfer without perimeter blocking."
     priority: "URGENT_ALERT_AND_INVESTIGATE"
     min_severity: "CRITICAL"
     condition:
       type: "utm"
       subtypes: ["virus"]
-    reason_template: "Antivirus inspection detected malware signature: {signature}"
+      enforcement: ["ALLOWED_OR_DETECTED"]
+      required_evidence: "utm"
+    reason_template: "Antivirus inspection detected unblocked malware payload: {signature}"
+
+  - id: "RULE_ANTIVIRUS_BLOCKED"
+    name: "Malicious Payload / Virus Blocked"
+    description: "FortiGate Antivirus blocked a file download."
+    priority: "DIGEST"
+    min_severity: "MEDIUM"
+    condition:
+      type: "utm"
+      subtypes: ["virus"]
+      enforcement: ["BLOCKED"]
+      required_evidence: "utm"
+    reason_template: "Antivirus inspection blocked malware transfer: {signature}"
+
+  - id: "RULE_UNKNOWN_ACTION_MAPPING"
+    name: "Unknown Log Action Visibility Gap"
+    description: "One or more events carried unmapped FortiOS action values."
+    priority: "DIGEST"
+    min_severity: "LOW"
+    routing_outcome: "RETAIN_WITH_VISIBILITY_GAP"
+    condition:
+      action_normalized: "UNKNOWN"
+    reason_template: "Unmapped FortiOS action observed in log stream requiring configuration review."
+
+

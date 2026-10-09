@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-forti_intel}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-forti_secret_pw_2026}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: ${POSTGRES_DB:-forti_intelligence}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -27,25 +27,42 @@ services:
       dockerfile: Dockerfile
     container_name: forti-intel-agent
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /app/data:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
     depends_on:
       postgres:
         condition: service_healthy
     env_file:
       - .env
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-forti_intel}:${POSTGRES_PASSWORD:-forti_secret_pw_2026}@postgres:5432/${POSTGRES_DB:-forti_intelligence}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-forti_intel}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:-forti_intelligence}
       - METRICS_PORT=8000
       - SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-    extra_hosts:
-      # Map internal gateway hosts to their corporate IPs
-      - "loki-readonly.6dcorp.internal:10.0.20.150"
-      - "grafana.6dcorp.internal:10.0.20.150"
+    # If the Loki or Grafana gateways are not resolvable from inside the container,
+    # map them here. Hostnames and addresses are site-specific: set them in a local
+    # compose override, not in git.
+    # extra_hosts:
+    #   - "loki.example.internal:192.0.2.10"
+    #   - "grafana.example.internal:192.0.2.10"
     ports:
       - "${METRICS_PORT:-8085}:8000"
     volumes:
       - ./config:/app/config:ro
       - ./src:/app/src:ro
-      - /etc/pki/tls/certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+      - ./migrations:/app/migrations:ro
+      - ${CA_BUNDLE_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
     networks:
       - forti_net
 

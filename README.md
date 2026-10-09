@@ -1,139 +1,130 @@
 # FortiGate 200G Firewall Intelligence Service
 
-A resilient, containerized AI agent service that monitors Grafana Loki for FortiGate 200G firewall and Deep Packet Inspection (DPI) logs, correlates attack sessions, enforces deterministic SOC rule severity floors, conducts bounded investigation using a local **Qwen3.8-27B** model via **Google ADK**, and dispatches actionable incident cards to **Google Chat**.
+A resilient, containerized security service that monitors Grafana Loki for FortiGate 200G firewall and Deep Packet Inspection (DPI) logs, correlates attack sessions across 30-minute campaign windows, enforces deterministic SOC rule severity floors, conducts bounded single-pass investigation using a local **Qwen3.8-27B** model with structured JSON schemas, and dispatches actionable incident cards to **Google Chat**.
 
 ---
 
-## 1. Architectural Highlights
+## 1. Architectural Principles
 
-- **100% Containerized Runtime**: Operates solely within Docker containers (`docker-compose.yml`), deploying the Python intelligence agent alongside an isolated `postgres:16-alpine` database.
-- **Upstream Ingestion Preserved**: Bounded consumer of Grafana Loki (`service_name="forticlient"`). No secondary log collectors or mirror databases.
-- **Fail-Safe Deterministic Severity Floor**: High-impact non-blocked exploits (`action="detected"` or `"passthrough"`) immediately enqueue critical alerts before model analysis. If the local LLM is offline or times out, deterministic alerts still deliver.
-- **Google ADK + Local Qwen 27B**: Employs Google Agent Development Kit (`google-adk`) to execute bounded, single-pass investigations against local vLLM (`http://10.0.6.31:8000/v1`), preventing hallucinations, unconstrained agent swarms, or unauthorized tool executions.
-- **Firewall-Only Evidence Boundary**: Strictly restricted to `visibility_scope=FIREWALL_ONLY`. The agent will never falsely claim verified endpoint compromise without backend telemetry.
-- **Transactional Outbox & Cards v2**: Google Chat alerts use Cards v2 format with incident threading, rate-limiting, and deep drill-down links to Grafana Explore.
+- **Containerized Hardened Runtime**: Operates in isolated Docker containers (`docker-compose.yml`) deploying the Python intelligence agent with a read-only root filesystem, dropped Linux capabilities (`cap_drop: [ALL]`), `no-new-privileges:true`, and resource limits alongside PostgreSQL 16.
+- **Selective, Budgeted Ingest**: The `security_events` query profile (`LOKI_QUERY_PROFILE`) asks Loki only for UTM detections (`type="utm"`), FortiOS event logs (`type="event"`), perimeter denies (`action="deny"`) and UTM blocks (`utmaction="block"`). Routine accepted traffic (`action="accept"`, `action="close"`) is dropped at ingest and never mirrored to the database. A `traffic_context` profile is defined for on-demand enrichment but is not called by the Phase B.1 runtime; Phase C wires it to the investigation agent.
+- **Monotonic Query Checkpoints**: Loki log cursors advance monotonically in durable PostgreSQL storage only after events are successfully inserted.
+- **Fail-Safe Deterministic Severity Floor**: High-impact non-blocked exploits (`action="detected"` or `"passthrough"`) immediately establish a critical severity floor. If the local LLM is offline, degraded, or times out, deterministic alerts are dispatched without disruption.
+- **Bounded Structured Model Output**: Uses OpenAI-compatible `response_format={"type": "json_schema"}` with strict Pydantic schemas, defensive delimiters (`<<UNTRUSTED id=...>>`) against prompt injection, a single-repair retry loop, and complete audit persistence in `model_runs`.
+- **Firewall-Only Evidence Boundary**: Strictly restricted to `visibility_scope=FIREWALL_ONLY`. Unsupported claims of application compromise are rejected and downgraded to `ATTEMPT_OBSERVED`.
+- **Reliable Priority Outbox**: Google Chat Cards v2 alerts are delivered via an outbox worker honoring strict priority ordering (URGENT > INVESTIGATION_UPDATE > DIGEST), exponential backoff with jitter, `Retry-After` rate-limiting, and permanent 4xx dead-lettering.
 
 ---
 
 ## 2. Directory Structure
 
 ```
-/opt/firewall-log-analysis-agent/
-├── docker-compose.yml              # Container orchestration (App + PostgreSQL 16)
-├── Dockerfile                      # Hardened multi-stage non-root Python 3.12 image
-├── .env.example                    # Configuration template
-├── requirements.txt                # Pinned dependencies
+<repository root>/
+├── docker-compose.yml              # Hardened orchestration (App + PostgreSQL 16)
+├── Dockerfile                      # Multi-stage non-root container with --require-hashes
+├── requirements.lock               # Cryptographically pinned dependencies with SHA256 hashes
+├── requirements.in                 # Direct runtime dependency declarations
+├── requirements.txt                # Pinned production runtime requirements
+├── requirements-dev.txt            # Development and testing requirements
 ├── config/
-│   ├── settings.py                 # Pydantic Settings
-│   ├── rules.yaml                  # Deterministic security rules & severity floors
+│   ├── settings.py                 # Pydantic configuration settings
+│   ├── rules.yaml                  # Declarative dynamic SOC rules & routing
+│   ├── action_map.yaml             # FortiOS action to enforcement mapping
 │   ├── action_catalog.yaml         # Allowlisted remediation recommendations
-│   └── assets.yaml                 # VIP-to-application mapping
+│   ├── assets.yaml                 # Internal VIPs, trusted subnets, scanners
+│   └── signatures.yaml             # Local signature metadata and CVE mappings
 ├── src/
 │   ├── sources/
-│   │   ├── loki_client.py          # Bounded LogQL range poller with interval bisection
-│   │   └── checkpoints.py          # Checkpoint tracker with overlap deduplication
+│   │   ├── loki_client.py          # Bounded LogQL range poller
+│   │   ├── query_profiles.py       # Named versioned query profiles with line filters
+│   │   └── checkpoints.py          # Monotonic checkpoint cursor management
 │   ├── parsing/
 │   │   ├── fortios_parser.py       # FortiOS syslog key=value lexer and parser
-│   │   └── normalizer.py           # Normalization & SHA-256 fingerprint generator
+│   │   ├── normalizer.py           # Normalization & accepted traffic filter
+│   │   └── redaction.py            # Redaction & untrusted delimiter wrappers
+│   ├── context/
+│   │   ├── assets.py               # Asset catalog loader & CIDR matcher
+│   │   └── signatures.py           # Signature metadata & CVE grounded verifier
 │   ├── storage/
-│   │   ├── schema.sql              # PostgreSQL DDL
-│   │   ├── database.py             # Database connector (PostgreSQL / SQLite)
-│   │   └── repository.py           # Async repository (leased queue & outbox)
+│   │   ├── database.py             # Database pool connector (PostgreSQL / SQLite)
+│   │   └── repository.py           # Repository for events, episodes, revisions, outbox
 │   ├── correlator/
-│   │   └── session_aggregator.py   # Sliding window episode aggregator
+│   │   └── session_aggregator.py   # Campaign & session episode aggregator (30m window)
 │   ├── rules/
-│   │   └── engine.py               # Deterministic rule evaluation engine
+│   │   └── engine.py               # Zero-code declarative condition evaluator
 │   ├── investigation/
 │   │   ├── schemas.py              # Pydantic schemas (IncidentPacket & QwenAssessment)
-│   │   ├── prompts.py              # Defensive analyst system prompt
-│   │   └── adk_workflow.py         # Google ADK agent with local Qwen connector
+│   │   ├── prompts/                # Versioned prompt templates
+│   │   ├── validator.py            # Security guardrails & CVE claim validator
+│   │   ├── eligibility.py          # Perimeter action eligibility constraints
+│   │   └── single_call_workflow.py # Structured output LLM runner with repair loop
 │   ├── notifications/
-│   │   ├── gchat_cards.py          # Cards v2 builder with thread keys
-│   │   └── outbox_worker.py        # Rate-limited outbox dispatcher (dry-run safe)
+│   │   ├── gchat_cards.py          # Cards v2 builder with thread keys & digest cards
+│   │   └── outbox_worker.py        # Priority outbox worker with retry backoff
 │   ├── observability/
-│   │   └── metrics.py              # Prometheus metrics & FastAPI health probes
+│   │   └── metrics.py              # Prometheus metrics & /health/ready probes
 │   └── main.py                     # Asynchronous supervisor entrypoint
 ├── dashboards/
-│   ├── firewall_threat_overview.json # Grafana Dashboard A: Threat Overview
-│   └── agent_operations.json         # Grafana Dashboard B: Agent Telemetry
-├── tests/                          # 19 comprehensive unit & integration tests
-│   ├── fixtures/fortios_logs.py
-│   ├── test_parser.py
-│   ├── test_rules.py
-│   ├── test_correlator.py
-│   ├── test_storage.py
-│   ├── test_adk_workflow.py
-│   └── test_outbox.py
-└── replay.py                       # CLI benchmark & load testing harness
+│   ├── alerts.yml                  # Prometheus alert rules for operational health
+│   ├── firewall_threat_overview.json # Grafana Dashboard A: Threat Overview (logfmt)
+│   └── agent_operations.json         # Grafana Dashboard B: Agent Telemetry & Freshness
+├── docs/
+│   ├── runbook.md                  # Backup/restore, reprocessing, and recovery runbook
+│   ├── data-dictionary.md          # Complete PostgreSQL schema and data dictionary
+│   └── adr/                        # Architectural Decision Records
+└── tests/                          # Comprehensive test suite (116 tests)
 ```
 
 ---
 
-## 3. Verified Environment Endpoints
+## 3. Verified Endpoints & Configuration
 
-| Component | Target URL | Verified Credentials / Settings |
+| Component | Target URL | Settings & Credentials |
 | :--- | :--- | :--- |
-| **Grafana Loki** | `https://loki-readonly.6dcorp.internal/loki/api/v1/query_range` | User: `ai-agent` (Basic Auth)<br>IP: `10.0.20.150:443`<br>Selector: `{service_name="forticlient"}` |
-| **Local Qwen 27B** | `http://10.0.6.31:8000/v1` | Runtime: vLLM OpenAI API<br>Model ID: `qwen3.8-27b` |
-| **PostgreSQL** | `postgres:5432` | DB: `forti_intelligence`, User: `forti_intel` |
-| **Google Chat** | Webhook URL configured via `GCHAT_WEBHOOK_URL` | Set `GCHAT_DRY_RUN=true` for testing without posting to rooms |
+| **Grafana Loki** | `https://loki.internal/loki/api/v1/query_range` | Selector: `{service_name="forticlient"}`<br>Profile: `security_events` (filters `type="utm"`, `type="event"`, and block/deny actions)<br>Basic Auth via `LOKI_USER` / `LOKI_PASSWORD` |
+| **Local Qwen 27B** | `http://vllm.internal:8000/v1` | vLLM OpenAI API, model `qwen3.8-27b` |
+| **PostgreSQL 16** | `postgres:5432` | DB: `forti_intelligence`, User: `forti_intel` |
+| **Google Chat** | Configured via `GCHAT_WEBHOOK_URL` | Set `GCHAT_DRY_RUN=true` to simulate deliveries |
 
 ---
 
-## 4. Setup & Running via Docker Compose
+## 4. Operational Setup
 
 ### Step 1: Configure Environment Variables
-Copy `.env.example` to `.env` and configure your settings:
+Copy `.env.example` to `.env` and configure credentials:
 ```bash
 cp .env.example .env
 ```
-*(To enable live Google Chat delivery, set `GCHAT_DRY_RUN=false` and provide your incoming webhook URL in `GCHAT_WEBHOOK_URL`)*.
+*(Ensure `CA_BUNDLE_PATH` points to your CA bundle file if custom TLS certificates are needed)*.
 
 ### Step 2: Build and Start Containers
 ```bash
-docker-compose up -d --build
+docker compose up -d --build
 ```
 
-### Step 3: Verify Status and Health
+### Step 3: Verify Health Probes
 ```bash
-# Check container status
-docker-compose ps
-
-# View service logs
-docker-compose logs -f app
-
-# Verify HTTP liveness and readiness
+# Liveness probe (HTTP 200 whenever the HTTP server answers; it does not inspect the supervisor tasks)
 curl http://localhost:8085/health/live
+
+# Readiness probe: 503 if the database is unreachable or the last successful poll is older than
+# 3x LOKI_POLL_INTERVAL_SECONDS; 200 {"status":"degraded"} after 3 consecutive model failures
+# (deterministic rules keep running); 200 {"status":"ready"} otherwise, including before the first poll
 curl http://localhost:8085/health/ready
 
-# View Prometheus metrics
+# Prometheus metrics
 curl http://localhost:8085/metrics
 ```
 
 ---
 
-## 5. Running Tests & Offline Replay Benchmark
+## 5. Testing & Validation
 
-The test suite runs with SQLite in-memory without needing PostgreSQL or network access:
+The test suite covers unit tests, PostgreSQL 16 integration tests, and full child-process end-to-end scenarios:
 
 ```bash
-# Run full unit and integration test suite (19 tests)
-pytest -v tests/
-
-# Run deterministic replay load benchmark
-python replay.py --count 100 --burst 20
+# Run full test suite against local PostgreSQL 16
+TEST_DATABASE_URL="postgresql://forti_intel:<password>@<db-host>:5432/forti_test" pytest -v tests/
 ```
 
----
-
-## 6. Grafana Dashboards
-
-Two production dashboards are located in `dashboards/`:
-1. **`dashboards/firewall_threat_overview.json`**:
-   - Security events rate by UTM subtype and action.
-   - Top attacking source IPs and top targeted destination VIPs.
-   - Triggered exploit signatures and live log stream drilldown.
-2. **`dashboards/agent_operations.json`**:
-   - Poller query duration (p95/p50) and lines/sec ingestion rate.
-   - Active memory episodes, leased queue processing, and local Qwen inference latency.
-   - Google Chat outbox delivery rate and failure counters.
+Refer to [docs/runbook.md](docs/runbook.md) for backup/restore, reprocessing, and troubleshooting procedures, and [docs/data-dictionary.md](docs/data-dictionary.md) for schema definitions. Phase reports are generated from a clean checkout with `scripts/make_phase_report.sh`.

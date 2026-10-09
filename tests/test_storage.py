@@ -47,6 +47,7 @@ async def test_event_deduplication(repo):
 
     # Second insert with identical fingerprint
     saved2 = await repo.save_events([ev])
+    assert saved2 == 0
     # Total count in database must remain 1
     total = await repo.db.fetch_one("SELECT COUNT(*) as cnt FROM selected_events")
     assert total["cnt"] == 1
