@@ -119,6 +119,43 @@ MODEL_CONSECUTIVE_FAILURES = _metric(
     "Consecutive failed or rejected model investigations; readiness reports degraded at 3",
 )
 
+# ADK investigator (plan C2.4, added in C.1). Incremented by the runtime wrapper after each run.
+AGENT_RUNS_TOTAL = _metric(
+    Counter,
+    "forti_agent_runs_total",
+    "ADK investigation runs by mode (shadow, live) and outcome",
+    ["mode", "outcome"],
+)
+AGENT_LLM_CALLS_TOTAL = _metric(
+    Counter,
+    "forti_agent_llm_calls_total",
+    "Model calls made by the ADK investigator, by agent",
+    ["agent"],
+)
+AGENT_TOOL_CALLS_TOTAL = _metric(
+    Counter,
+    "forti_agent_tool_calls_total",
+    "Tool calls made by the ADK investigator, by tool and outcome (success, refused, error)",
+    ["tool", "outcome"],
+)
+AGENT_RUN_DURATION = _metric(
+    Histogram,
+    "forti_agent_run_duration_seconds",
+    "Wall-clock duration of one ADK investigation run",
+    buckets=(1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120, 180),
+)
+AGENT_TOKENS_TOTAL = _metric(
+    Counter,
+    "forti_agent_tokens_total",
+    "Tokens reported by the model endpoint for ADK investigator calls, by direction (input, output)",
+    ["direction"],
+)
+AGENT_BUDGET_EXHAUSTED_TOTAL = _metric(
+    Counter,
+    "forti_agent_budget_exhausted_total",
+    "ADK investigation runs stopped by the AGENT_MAX_LLM_CALLS ceiling",
+)
+
 
 def create_app(db=None, service_state: Optional[dict] = None) -> FastAPI:
     app = FastAPI(title="FortiGate Firewall Intelligence Service")

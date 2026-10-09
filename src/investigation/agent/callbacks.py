@@ -153,6 +153,7 @@ def redact_and_delimit(tool, args: Dict[str, Any], tool_context, tool_response: 
             response_bytes=_size(result),
             refused=result.get("status") == "refused",
             latency_ms=latency_ms,
+            outcome=str(result.get("status", "success")),
         )
     return result
 
@@ -217,6 +218,7 @@ def budget_and_truncate(callback_context, llm_request):
         raise AgentBudgetExceeded("no active investigation run")
     if run.llm_calls >= run.max_llm_calls:
         run.budget_exhausted = True
+        run.add_event(agent_name=callback_context.agent_name, kind="llm", refused=True, args={"error": "AgentBudgetExceeded"})
         raise AgentBudgetExceeded(
             f"model call {run.llm_calls + 1} by {callback_context.agent_name} exceeds AGENT_MAX_LLM_CALLS={run.max_llm_calls}"
         )

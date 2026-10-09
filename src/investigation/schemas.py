@@ -58,6 +58,31 @@ class QwenAssessment(BaseModel):
         self._model_run = val
 
 
+class WriterAssessment(BaseModel):
+    """What the ADK assessment_writer must produce (ADR 005).
+
+    ADK sends ``output_schema`` as a strict JSON schema in which every property is required, so the
+    writer gets only the fields a model decides. The service-owned fields of ``QwenAssessment``
+    (visibility_scope, model_reported_enforcement, assessment_source, model_run) are set by the
+    runtime when it maps this object to a ``QwenAssessment`` before ``validate_assessment``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str
+    incident_revision: int
+    severity: SeverityLevel
+    attack_category: AttackCategory
+    exploitation_assessment: ExploitationAssessment
+    enforcement: EnforcementState
+    summary: str = Field(..., max_length=1200)
+    findings: List[FindingItem] = Field(..., max_length=10)
+    cve_references: List[str] = Field(..., max_length=10)
+    visibility_gaps: List[str] = Field(..., max_length=10)
+    recommended_action_ids: List[str] = Field(..., max_length=6)
+    analyst_follow_up: List[str] = Field(..., max_length=5)
+
+
 class IncidentPacket(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
