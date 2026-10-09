@@ -26,6 +26,18 @@ def _all_docs() -> str:
     return "\n".join(_read(rel) for rel in DOC_FILES)
 
 
+def _removed_by_the_legacy_patch():
+    """Files the prepared legacy-removal patch deletes and test functions it removes or renames. The docs
+    may name them as history, before the patch is applied (they exist) and after (they do not)."""
+    patch = ROOT / "docs" / "reports" / "gate-c3-legacy-removal.patch"
+    if not patch.exists():
+        return set(), set()
+    text = patch.read_text(encoding="utf-8", errors="replace")
+    files = set(re.findall(r"^diff --git a/(\S+) b/\S+\ndeleted file mode", text, re.M))
+    tests = set(re.findall(r"^-(?:async )?def (test_\w+)\(", text, re.M))
+    return files, tests
+
+
 def _section(text: str, start: str, end: str) -> str:
     return text[text.index(start): text.index(end, text.index(start))]
 
@@ -72,10 +84,13 @@ def test_metrics_named_in_the_docs_are_registered():
 
 def test_files_named_in_the_docs_exist():
     pattern = r"(?<![\w/.])((?:scripts|src|tests|docs|config|evals|dashboards|migrations)/[A-Za-z0-9_./-]*[A-Za-z0-9_]\.(?:py|sh|md|yml|yaml|json|txt|sql|patch))"
+    deleted_by_patch, _ = _removed_by_the_legacy_patch()
     missing = []
     for rel in sorted(set(re.findall(pattern, _all_docs()))):
         if re.fullmatch(r"docs/reports/gate-[a-z0-9]+-report\.md", rel):
             continue  # generated from the commit that follows the one it describes
+        if rel in deleted_by_patch:
+            continue  # history: the removal patch deletes it
         if not (ROOT / rel).exists():
             missing.append(rel)
     assert not missing, f"documented files that do not exist: {missing}"
@@ -84,8 +99,11 @@ def test_files_named_in_the_docs_exist():
 def test_tests_named_in_the_docs_exist():
     named = set(re.findall(r"(tests/[A-Za-z0-9_/]+\.py)::(test_\w+)", _all_docs()))
     assert named, "the docs name no test"
+    _, removed_tests = _removed_by_the_legacy_patch()
     missing = []
     for rel, name in sorted(named):
+        if name in removed_tests:
+            continue  # history: the removal patch removes or renames it
         path = ROOT / rel
         if not path.exists() or not re.search(rf"^(?:async )?def {name}\(", path.read_text(encoding="utf-8"), re.M):
             missing.append(f"{rel}::{name}")
