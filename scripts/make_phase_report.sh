@@ -98,7 +98,7 @@ MANIFEST="$WORK/manifest.txt"
   printf '%-20s %-14s %s\n' "package" "pinned" "installed"
   while IFS= read -r line; do
     case "$line" in ''|\#*) continue ;; esac
-    name="${line%%==*}"; pin="${line#*==}"
+    name="${line%%==*}"; pin="${line#*==}"; name="${name%%\[*}"  # pip show takes no extras
     inst="$("$PYTHON" -m pip show "$name" 2>/dev/null | awk '/^Version:/{print $2}')"
     printf '%-20s %-14s %s\n' "$name" "$pin" "${inst:-missing}"
   done < requirements.in

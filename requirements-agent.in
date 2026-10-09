@@ -1,13 +1,12 @@
-# Phase C.0 ADK spike pins. NOT installed in the runtime image: requirements.in, requirements.txt,
-# requirements.lock and the Dockerfile are unchanged. Whether these go into the image, and in which
-# form, is the C.1 size decision (see docs/reports/gate-c0-spike-report.md). Resolved on Python 3.13
-# on 2026-10-09; every pin below is the version the spike and tests/test_adk_spike_fake.py ran with.
+# Phase C.0 ADK spike pins, kept as the spike's record. Since Phase C.1 the runtime image carries the
+# slim agent set instead (see requirements.in and docs/adr/005-adk-investigator.md): google-adk 2.11.0
+# without [extensions], openai, google-genai, sqlalchemy[asyncio] and opentelemetry, and NOT litellm,
+# because ADK's native OpenAI-compatible model class (google.adk.integrations.openai.OpenAILlm) passed
+# the spike's steps 1 and 2 against scripts/adk_spike_fake_vllm.py. This file still installs the full
+# spike environment that scripts/adk_spike.py needs (it drives LiteLlm).
 #
-# This file is self-contained because google-adk 2.11.0 and litellm 1.104.2 do not resolve against
-# requirements.in (see "moved" below), so it cannot be combined with that file. Install it into a
-# scratch environment only, then add the test tools:
-#   python -m pip install -r requirements-agent.in
-#   python -m pip install pytest==8.4.2 pytest-asyncio==1.2.0
+# Original C.0 note: Resolved on Python 3.13 on 2026-10-09; every pin below is the version the spike
+# and tests/test_adk_spike_fake.py ran with.
 
 # Agent layer
 google-adk[extensions]==2.11.0

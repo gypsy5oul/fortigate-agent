@@ -1,12 +1,24 @@
 # Production runtime dependencies for FortiGate Firewall Intelligence Service
-# Dropped range specs and unused dependencies (google-adk deferred to Phase C)
+# Exact pins only; requirements.txt and the hashed requirements.lock are compiled from this
+# file with pip-tools 7.6.2 under Python 3.12 (the image's interpreter).
 pydantic==2.12.5
-pydantic-settings==2.11.0
+pydantic-settings==2.15.0
 pyyaml==6.0.3
 httpx==0.28.1
 asyncpg==0.31.0
 aiosqlite==0.22.1
 prometheus-client==0.26.0
-fastapi==0.128.8
+fastapi==0.141.1
+starlette==1.7.0
 uvicorn==0.39.0
 python-dotenv==1.0.1
+
+# Agent layer (Phase C.1, ADR 005). The slim set: no [extensions] extra and no litellm. ADK's
+# native OpenAI-compatible model class (google.adk.integrations.openai.OpenAILlm) needs only the
+# openai client; DatabaseSessionService needs SQLAlchemy's asyncio extra (asyncpg is above).
+google-adk==2.11.0
+openai==2.54.0
+google-genai==2.29.0
+sqlalchemy[asyncio]==2.1.4
+opentelemetry-api==1.42.1
+opentelemetry-sdk==1.42.1
