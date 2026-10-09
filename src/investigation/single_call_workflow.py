@@ -86,7 +86,7 @@ class SingleCallInvestigationWorkflow:
                 "id": a["id"],
                 "name": a.get("name", a["id"]),
                 "category": a.get("category", "REMEDIATION"),
-                "risk": a.get("risk", "LOW"),
+                "risk": a.get("risk_level", a.get("risk", "LOW")),
                 "requires_approval": a.get("requires_approval", True),
             }
             for a in eligible_actions
