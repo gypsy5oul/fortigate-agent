@@ -354,11 +354,14 @@ async def test_e2e_restart_never_lowers_incident_severity(fake_server, pg_clean)
 
     # Between the runs: three blocked probes on distinct services from the exploit source.
     # On their own these match only RULE_PORT_SCAN_MULTI_SERVICE (MEDIUM, DIGEST).
+    # Timestamps 4 s in the past: the poller's query window ends 5 s behind wall-clock time
+    # (query_end_delay), so probes stamped "now" only become visible several seconds into
+    # the second run. The replay overlap keeps them inside the window either way.
     now_ns = time.time_ns()
     probes = []
     for i, (port, svc) in enumerate([(22, "SSH"), (3389, "RDP"), (8080, "HTTP-ALT")]):
         probes.append((
-            now_ns - 1_000_000_000 + i * 10_000_000,
+            now_ns - 4_000_000_000 + i * 10_000_000,
             f'date=2026-10-08 time=12:02:0{i} devname="FGT" devid="FGT1" logid="0000000013" type="traffic" '
             f'subtype="forward" level="notice" vd="root" sessionid={500001 + i} srcip=198.51.100.45 '
             f'srcport={46000 + i} dstip=10.0.14.120 dstport={port} proto=6 service="{svc}" action="deny" policyid=0',
@@ -367,7 +370,7 @@ async def test_e2e_restart_never_lowers_incident_severity(fake_server, pg_clean)
         await client.post(f"{FAKE_BASE_URL}/stage_logs", json=probes)
 
     # Phase 2: restart on the same database (episodes and checkpoints restored), then SIGTERM.
-    await _run_service_then_sigterm(env, run_seconds=8.0)
+    await _run_service_then_sigterm(env, run_seconds=10.0)
 
     after = {
         row["id"]: row
