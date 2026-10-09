@@ -156,6 +156,30 @@ AGENT_BUDGET_EXHAUSTED_TOTAL = _metric(
     "ADK investigation runs stopped by the AGENT_MAX_LLM_CALLS ceiling",
 )
 
+# ADK investigator over the last 24 h, read from the audit tables (plan C2.4). Set by the operational
+# metrics updater every cycle, in every mode and whatever the runs' outcome (zero when there were
+# none), so the shadow-comparison panels and the agent alert rules never read a stale value.
+AGENT_RUN_MODES = ("shadow", "live")
+AGENT_RUN_OUTCOMES = ("VALID", "REJECTED", "BUDGET_EXHAUSTED", "TIMEOUT", "SCHEMA_INVALID", "ERROR")
+AGENT_AGREEMENT_FIELDS = ("severity", "action_set", "exploitation")
+AGENT_RUNS_24H = _metric(
+    Gauge,
+    "forti_agent_runs_24h",
+    "ADK investigation runs created in the last 24 h, by mode and outcome (agent_runs)",
+    ["mode", "outcome"],
+)
+AGENT_SHADOW_COMPARISONS_24H = _metric(
+    Gauge,
+    "forti_agent_shadow_comparisons_24h",
+    "Shadow-mode ADK assessments compared with the legacy assessment in the last 24 h (shadow_assessments)",
+)
+AGENT_SHADOW_AGREEING_24H = _metric(
+    Gauge,
+    "forti_agent_shadow_agreeing_24h",
+    "Shadow comparisons in the last 24 h that agree with the legacy assessment, by field (severity, action_set, exploitation)",
+    ["field"],
+)
+
 
 def create_app(db=None, service_state: Optional[dict] = None) -> FastAPI:
     app = FastAPI(title="FortiGate Firewall Intelligence Service")

@@ -40,6 +40,12 @@ from src.observability.metrics import (
     BACKLOG_PENDING_EVENTS,
     JOBS_OLDEST_PENDING_SECONDS,
     MODEL_CONSECUTIVE_FAILURES,
+    AGENT_AGREEMENT_FIELDS,
+    AGENT_RUN_MODES,
+    AGENT_RUN_OUTCOMES,
+    AGENT_RUNS_24H,
+    AGENT_SHADOW_AGREEING_24H,
+    AGENT_SHADOW_COMPARISONS_24H,
 )
 
 # Quiet HTTP transport logging to prevent credential exposure in URLs
@@ -784,6 +790,32 @@ class IntelligenceService:
             JOBS_OLDEST_PENDING_SECONDS.set(float(oldest_job["age_sec"]))
         else:
             JOBS_OLDEST_PENDING_SECONDS.set(0.0)
+
+        await self._update_agent_window_gauges()
+
+    async def _update_agent_window_gauges(self) -> None:
+        """ADK investigator over the last 24 h from the audit tables (plan C2.4): runs by mode and
+        outcome, shadow comparisons and agreements. Set every cycle, zero when there were no runs, so
+        the shadow-comparison panels and the agent alert rules never read a stale value."""
+        since = "datetime('now', '-24 hours')" if self.db.is_sqlite else "NOW() - INTERVAL '24 hours'"
+        rows = await self.db.fetch_all(
+            f"SELECT mode, outcome, COUNT(*) AS n FROM agent_runs WHERE created_at > {since} GROUP BY mode, outcome"
+        )
+        counts = {(r["mode"], r["outcome"]): int(r["n"]) for r in rows}
+        for mode in AGENT_RUN_MODES:
+            for outcome in AGENT_RUN_OUTCOMES:
+                counts.setdefault((mode, outcome), 0)
+        for (mode, outcome), n in counts.items():
+            AGENT_RUNS_24H.labels(mode=mode, outcome=outcome).set(n)
+
+        agreement = await self.db.fetch_one(
+            "SELECT COUNT(*) AS n, "
+            + ", ".join(f"COALESCE(SUM(CASE WHEN {f}_equal THEN 1 ELSE 0 END), 0) AS {f}" for f in AGENT_AGREEMENT_FIELDS)
+            + f" FROM shadow_assessments WHERE created_at > {since}"
+        ) or {}
+        AGENT_SHADOW_COMPARISONS_24H.set(int(agreement.get("n") or 0))
+        for field_name in AGENT_AGREEMENT_FIELDS:
+            AGENT_SHADOW_AGREEING_24H.labels(field=field_name).set(int(agreement.get(field_name) or 0))
 
     async def _run_metrics_updater(self):
         """Periodically refreshes operational lag and backlog gauges (M2)."""

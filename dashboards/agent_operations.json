@@ -333,6 +333,208 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "id": 17,
+      "title": "ADK Shadow Comparison (last 24 h, from the audit tables)",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 40
+      },
+      "id": 18,
+      "title": "Shadow Agreement with Legacy (24 h)",
+      "description": "Share of shadow comparisons in the last 24 h whose ADK assessment agrees with the legacy one, by field. C2.5 golden bars: severity 100%, action set at least 90%. Set by the operational metrics updater from shadow_assessments.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "forti_agent_shadow_agreeing_24h / ignoring(field) group_left forti_agent_shadow_comparisons_24h",
+          "legendFormat": "{{field}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.9
+              },
+              {
+                "color": "green",
+                "value": 1.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 8,
+        "y": 40
+      },
+      "id": 19,
+      "title": "Validator Hard-Reject Rate (24 h)",
+      "description": "Share of ADK runs in the last 24 h that the validator hard-rejected (outcome REJECTED). C2.5 bar: under 5%; alert FortiGateAgentHardRejectRate.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(forti_agent_runs_24h{outcome=\"REJECTED\"}) / clamp_min(sum(forti_agent_runs_24h), 1)",
+          "legendFormat": "Hard rejects",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 12,
+        "y": 40
+      },
+      "id": 20,
+      "title": "Budget Exhaustion Rate (24 h)",
+      "description": "Share of ADK runs in the last 24 h stopped by AGENT_MAX_LLM_CALLS. C2.5 bar: under 2%; alert FortiGateAgentBudgetExhaustion.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(forti_agent_runs_24h{outcome=\"BUDGET_EXHAUSTED\"}) / clamp_min(sum(forti_agent_runs_24h), 1)",
+          "legendFormat": "Budget exhausted",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.02
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 40
+      },
+      "id": 21,
+      "title": "Runs and Comparisons (24 h)",
+      "description": "ADK runs in the last 24 h by mode and outcome, and the number of shadow comparisons. The C2.5 lab criteria need at least 50 shadow runs.",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, outcome) (forti_agent_runs_24h)",
+          "legendFormat": "{{mode}} {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "forti_agent_shadow_comparisons_24h",
+          "legendFormat": "shadow comparisons",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "id": 22,
+      "title": "Tool Refusals by Tool (1 h)",
+      "description": "Refused tool calls in the last hour. Any lookup_asset refusal means the agent guessed an IP (C2.5: none allowed); review the instructions first.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (tool) (increase(forti_agent_tool_calls_total{outcome=\"refused\"}[1h]))",
+          "legendFormat": "{{tool}}",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
