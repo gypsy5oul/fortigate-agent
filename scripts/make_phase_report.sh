@@ -22,6 +22,8 @@ NOTES="${3:-}"
 PYTHON="${PYTHON:-python3}"
 # Interpreter directory, masked in transcripts (pytest prints it in its header line).
 case "$PYTHON" in */*) PYTHON_DIR="$(cd "$(dirname "$PYTHON")" && pwd)" ;; *) PYTHON_DIR="/nonexistent-python-dir" ;; esac
+# Interpreter prefix (site-packages paths in warnings), masked as well.
+PYTHON_PREFIX="$("$PYTHON" -c 'import sys; print(sys.prefix)' 2>/dev/null || echo /nonexistent-python-prefix)"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
@@ -51,6 +53,7 @@ redact() {
     -e "s#$CHECKOUT#<checkout>#g" \
     -e "s#$REPO_ROOT#<repo>#g" \
     -e "s#${PYTHON_DIR}#<python-bin>#g" \
+    -e "s#${PYTHON_PREFIX}#<python-prefix>#g" \
     -e "s#(postgres(ql)?://)[^[:space:]'\"]+#\1<redacted>#g" \
     -e "s#\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b#<private-ip>#g" \
     -e "s#\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b#<private-ip>#g" \
