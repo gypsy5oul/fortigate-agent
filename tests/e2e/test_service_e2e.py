@@ -71,7 +71,8 @@ async def pg_clean():
             """
             TRUNCATE TABLE selected_events, rejected_events, incidents,
                            incident_revisions, jobs, notification_outbox,
-                           query_checkpoints, coverage_gaps, episodes, model_runs CASCADE;
+                           query_checkpoints, coverage_gaps, episodes, model_runs,
+                           agent_runs, agent_events, shadow_assessments CASCADE;
             """
         )
     yield db
@@ -97,13 +98,21 @@ def _child_env(metrics_port: int) -> Dict[str, str]:
     return env
 
 
-async def _run_service_then_sigterm(env: Dict[str, str], run_seconds: float) -> float:
+async def _run_service_then_sigterm(env: Dict[str, str], run_seconds: float, ready=None) -> float:
     """Runs the real ``python -m src.main`` for ``run_seconds``, sends SIGTERM and enforces
     the D4 contract: the process exits on its own, within 5 s, with exit code 0. The
-    process is only killed to clean up after that assertion has already failed."""
+    process is only killed to clean up after that assertion has already failed.
+
+    With ``ready`` (an async callable returning a bool), SIGTERM is sent as soon as it returns True,
+    and ``run_seconds`` is only the ceiling."""
     proc = subprocess.Popen([sys.executable, "-m", "src.main"], env=env)
     try:
-        await asyncio.sleep(run_seconds)
+        if ready is None:
+            await asyncio.sleep(run_seconds)
+        else:
+            deadline = time.monotonic() + run_seconds
+            while time.monotonic() < deadline and not await ready():
+                await asyncio.sleep(0.25)
     finally:
         t0 = time.monotonic()
         proc.send_signal(signal.SIGTERM)
@@ -396,3 +405,127 @@ async def test_e2e_restart_never_lowers_incident_severity(fake_server, pg_clean)
     assert revisions[0]["revision"] == 1
     assert all(r["severity"] == "CRITICAL" for r in revisions), [dict(r) for r in revisions]
     assert [r["revision"] for r in revisions] == list(range(1, len(revisions) + 1))
+
+
+@pytest.mark.asyncio
+async def test_e2e_shadow_mode_records_agent_runs_and_never_a_card(fake_server, pg_clean):
+    """Phase C.1 exit (plan C1.8): the real process in INVESTIGATOR_MODE=shadow against the fake vLLM
+    answering OpenAI tool_calls. The legacy single call still writes revision 2 and the
+    INVESTIGATION_UPDATE card; the ADK pipeline then runs and leaves agent_runs, agent_events and
+    shadow_assessments rows, and nothing else: no revision, no outbox row, no chat message."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/reset")
+        scenarios = generate_scenario_logs(time.time_ns() - 25_000_000_000)
+        await client.post(f"{FAKE_BASE_URL}/stage_logs", json=scenarios["scenario_2_nonblocked_ips"])
+
+    env = _child_env(18883)
+    env["INVESTIGATOR_MODE"] = "shadow"
+
+    async def shadow_recorded() -> bool:
+        row = await pg_clean.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM shadow_assessments) AS shadows, "
+            "(SELECT COUNT(*) FROM notification_outbox WHERE status = 'PENDING') AS pending"
+        )
+        return row["shadows"] >= 1 and row["pending"] == 0
+
+    await _run_service_then_sigterm(env, run_seconds=30.0, ready=shadow_recorded)
+
+    inc = await pg_clean.fetch_one("SELECT * FROM incidents WHERE source_ip = '198.51.100.45'")
+    assert inc is not None and inc["severity"] == "CRITICAL" and inc["current_revision"] == 2
+
+    # Legacy path unchanged: revisions 1 (deterministic) and 2 (the single call), both cards.
+    revs = await pg_clean.fetch_all(
+        "SELECT revision, assessment_source, assessment_json FROM incident_revisions WHERE incident_id = $1 ORDER BY revision",
+        inc["id"],
+    )
+    assert [(r["revision"], r["assessment_source"]) for r in revs] == [(1, "DETERMINISTIC"), (2, "MODEL_VALIDATED")]
+    assert json.loads(revs[1]["assessment_json"])["summary"].startswith("Model analysis of exploit probe")
+    outbox = await pg_clean.fetch_all(
+        "SELECT revision, notification_type, payload_json FROM notification_outbox WHERE incident_id = $1 ORDER BY id", inc["id"]
+    )
+    assert [(o["revision"], o["notification_type"]) for o in outbox] == [(1, "URGENT"), (2, "INVESTIGATION_UPDATE")]
+    job = await pg_clean.fetch_one("SELECT status, attempts FROM jobs WHERE id = $1", f"JOB-{inc['id']}-1")
+    assert (job["status"], job["attempts"]) == ("COMPLETED", 1)
+    model_runs = await pg_clean.fetch_all("SELECT revision, commit_status FROM model_runs WHERE incident_id = $1", inc["id"])
+    assert [(m["revision"], m["commit_status"]) for m in model_runs] == [(2, "COMMITTED")]
+
+    # The ADK pipeline ran in shadow and was audited.
+    runs = await pg_clean.fetch_all("SELECT * FROM agent_runs WHERE incident_id = $1", inc["id"])
+    assert len(runs) == 1
+    run = runs[0]
+    assert (run["revision"], run["mode"], run["session_id"]) == (2, "shadow", f"{inc['id']}:2")
+    assert run["outcome"] == "VALID", list(run["reason_codes"])
+    assert run["total_llm_calls"] == 8 and run["total_tool_calls"] >= 7
+    events = await pg_clean.fetch_all("SELECT agent_name, kind, tool_name, refused FROM agent_events WHERE run_id = $1 ORDER BY seq", run["id"])
+    assert sum(e["kind"] == "llm" for e in events) == 8
+    assert {e["tool_name"] for e in events if e["kind"] == "tool"} >= {
+        "evidence_agent", "context_agent", "get_incident_packet", "query_traffic_context",
+        "lookup_asset", "lookup_signature", "recent_incidents_for_source", "get_action_catalog",
+    }
+    assert not any(e["refused"] for e in events)
+    shadows = await pg_clean.fetch_all("SELECT * FROM shadow_assessments WHERE incident_id = $1", inc["id"])
+    assert len(shadows) == 1
+    shadow = shadows[0]
+    assert (shadow["revision"], shadow["run_id"], shadow["assessment_source"]) == (2, run["id"], "MODEL_VALIDATED")
+    assert shadow["severity_equal"] is True and shadow["exploitation_equal"] is True and shadow["action_set_equal"] is True
+    assert shadow["findings_count"] == 1 and shadow["legacy_findings_count"] == 1
+    assert json.loads(shadow["assessment_json"])["summary"].startswith("ADK shadow assessment")
+
+    # The fake vLLM saw real tool-calling traffic from all four agents, and every chat message the
+    # webhook received is one of the two legacy cards: none carries the shadow summary.
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        capture = (await client.get(f"{FAKE_BASE_URL}/capture")).json()
+    agents = {r["agent"] for r in capture["adk_requests"]}
+    assert agents == {"incident_investigator", "evidence_agent", "context_agent", "assessment_writer"}
+    assert any(r["answered_with"] != "text" for r in capture["adk_requests"])
+    chats = [json.dumps(c) for c in capture["captured_chats"]]
+    assert len(chats) == 2
+    assert not any("ADK shadow assessment" in c for c in chats)
+    assert not any("ADK shadow assessment" in json.dumps(o["payload_json"]) for o in outbox)
+
+
+@pytest.mark.asyncio
+async def test_e2e_adk_mode_writes_the_agent_revision_through_the_same_transition(fake_server, pg_clean):
+    """INVESTIGATOR_MODE=adk: the ADK result is revision 2, committed through record_incident_transition
+    with the same CAS and job fence, with a model_runs row kept for backward compatibility and the
+    run audited as mode live. Nothing goes to shadow_assessments."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        await client.post(f"{FAKE_BASE_URL}/reset")
+        scenarios = generate_scenario_logs(time.time_ns() - 25_000_000_000)
+        await client.post(f"{FAKE_BASE_URL}/stage_logs", json=scenarios["scenario_2_nonblocked_ips"])
+
+    env = _child_env(18884)
+    env["INVESTIGATOR_MODE"] = "adk"
+
+    async def revision_committed() -> bool:
+        row = await pg_clean.fetch_one(
+            "SELECT (SELECT COUNT(*) FROM agent_runs) AS runs, "
+            "(SELECT COUNT(*) FROM jobs WHERE status = 'COMPLETED') AS done, "
+            "(SELECT COUNT(*) FROM notification_outbox WHERE status = 'PENDING') AS pending"
+        )
+        return row["runs"] >= 1 and row["done"] >= 1 and row["pending"] == 0
+
+    await _run_service_then_sigterm(env, run_seconds=30.0, ready=revision_committed)
+
+    inc = await pg_clean.fetch_one("SELECT * FROM incidents WHERE source_ip = '198.51.100.45'")
+    assert inc is not None and inc["current_revision"] == 2 and inc["severity"] == "CRITICAL"
+    assert inc["summary"].startswith("ADK shadow assessment")  # the agent's summary (scripted text)
+    revs = await pg_clean.fetch_all(
+        "SELECT revision, assessment_source, assessment_json FROM incident_revisions WHERE incident_id = $1 ORDER BY revision", inc["id"]
+    )
+    assert [(r["revision"], r["assessment_source"]) for r in revs] == [(1, "DETERMINISTIC"), (2, "MODEL_VALIDATED")]
+    rev2 = json.loads(revs[1]["assessment_json"])
+    assert rev2["summary"].startswith("ADK shadow assessment") and rev2["recommended_action_ids"] == ["ACT_INSPECT_APPLICATION_LOGS"]
+    job = await pg_clean.fetch_one("SELECT status, attempts FROM jobs WHERE id = $1", f"JOB-{inc['id']}-1")
+    assert (job["status"], job["attempts"]) == ("COMPLETED", 1)
+    mr = await pg_clean.fetch_all(
+        "SELECT revision, structured_output_mode, validation_result, commit_status FROM model_runs WHERE incident_id = $1", inc["id"]
+    )
+    assert [(m["revision"], m["structured_output_mode"], m["validation_result"], m["commit_status"]) for m in mr] == [
+        (2, "adk_json_schema", "VALID", "COMMITTED")
+    ]
+    runs = await pg_clean.fetch_all("SELECT mode, outcome, revision FROM agent_runs WHERE incident_id = $1", inc["id"])
+    assert [(r["mode"], r["outcome"], r["revision"]) for r in runs] == [("live", "VALID", 2)]
+    assert await pg_clean.fetch_all("SELECT id FROM shadow_assessments") == []
+    outbox = await pg_clean.fetch_all("SELECT revision, notification_type FROM notification_outbox WHERE incident_id = $1 ORDER BY id", inc["id"])
+    assert [(o["revision"], o["notification_type"]) for o in outbox] == [(1, "URGENT"), (2, "INVESTIGATION_UPDATE")]

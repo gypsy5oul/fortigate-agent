@@ -2,7 +2,8 @@
 
 Implements lightweight FastAPI mock endpoints for:
 1. Grafana Loki (GET /loki/api/v1/query_range)
-2. Local vLLM/Qwen OpenAI-compatible chat API (POST /v1/chat/completions)
+2. Local vLLM/Qwen OpenAI-compatible chat API (POST /v1/chat/completions), including the scripted
+   tool-calling answers for the ADK investigator (shadow and adk modes)
 3. Google Chat Incoming Webhook (POST /chat, POST /gchat)
 """
 
@@ -20,10 +21,12 @@ class FakeEndpointsState:
         self.captured_chats: List[Dict[str, Any]] = []
         self.chat_response_mode: str = "valid"  # valid, invalid_json, schema_invalid, injection_obeying, timeout
         self.loki_response_mode: str = "valid"  # valid, error
+        self.adk_requests: List[Dict[str, Any]] = []  # what the ADK agents sent, and what was answered
 
     def reset(self):
         self.staged_logs.clear()
         self.captured_chats.clear()
+        self.adk_requests.clear()
         self.chat_response_mode = "valid"
         self.loki_response_mode = "valid"
 
@@ -85,8 +88,129 @@ async def loki_query_range(
     }
 
 
+# ---------------------------------------------------------------------------------------------
+# Scripted ADK investigation (Phase C.1). The ADK agents are told apart by the tools they declare
+# (or by the WriterAssessment response schema); each answers with OpenAI-format tool_calls first and
+# a text (or JSON) answer once its tool results are in the conversation. Identity, evidence ids,
+# signatures and eligible actions are lifted from the tool results the service returned, so the
+# scripted assessment is grounded in what the real tools produced.
+# ---------------------------------------------------------------------------------------------
+
+_ADK_TOOL_OWNERS = {
+    "evidence_agent": "incident_investigator",
+    "get_incident_packet": "evidence_agent",
+    "lookup_asset": "context_agent",
+}
+
+
+def _adk_agent(body: Dict[str, Any]) -> Optional[str]:
+    rf = body.get("response_format") or {}
+    if isinstance(rf, dict) and (rf.get("json_schema") or {}).get("name") == "WriterAssessment":
+        return "assessment_writer"
+    for tool in body.get("tools") or []:
+        owner = _ADK_TOOL_OWNERS.get((tool.get("function") or {}).get("name"))
+        if owner:
+            return owner
+    return None
+
+
+def _text_of(content: Any) -> str:
+    if isinstance(content, list):
+        return " ".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+    return content or ""
+
+
+def _tool_call(index: int, calls: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": f"call_{index}_{i}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+            for i, (name, args) in enumerate(calls)
+        ],
+    }
+
+
+def _adk_answer(agent: str, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    tool_msgs = [_text_of(m.get("content")) for m in messages if m.get("role") == "tool"]
+    user_text = " ".join(_text_of(m.get("content")) for m in messages if m.get("role") == "user")
+    n = len(state.adk_requests)
+
+    if agent == "evidence_agent":
+        if not tool_msgs:
+            return _tool_call(n, [("get_incident_packet", {}), ("query_traffic_context", {"direction": "to_target", "minutes_before": 10})])
+        packet = next((json.loads(t) for t in tool_msgs if '"evidence_ids"' in t), {})
+        sigs = [re.sub(r"<<UNTRUSTED id=[^>]+>>\n|\n<</UNTRUSTED>>", "", x) for x in packet.get("signatures", [])]
+        return {"role": "assistant", "content": (
+            f"incident_id={packet.get('incident_id')} incident_revision={packet.get('revision')} "
+            f"source_ip={packet.get('source_ip')} target_ip={packet.get('target_ip')} "
+            f"enforcement={packet.get('enforcement')} floor={packet.get('deterministic_severity_floor')} "
+            f"signatures={'|'.join(sigs)} evidence_ids={','.join(packet.get('evidence_ids', [])[:3])}"
+        )}
+
+    if agent == "context_agent":
+        if not tool_msgs:
+            ips = re.findall(r"(?:source_ip|target_ip)=([0-9a-fA-F.:]+)", user_text)
+            sigs = (re.search(r"signatures=(\S*)", user_text) or [None, ""])[1].split("|")
+            calls = [("lookup_asset", {"ip": ip}) for ip in ips]
+            calls += [("lookup_signature", {"signature": sig}) for sig in sigs if sig]
+            calls += [("recent_incidents_for_source", {}), ("get_action_catalog", {})]
+            return _tool_call(n, calls)
+        catalog = next((json.loads(t) for t in tool_msgs if '"eligible_actions"' in t), {})
+        eligible = [a["id"] for a in catalog.get("eligible_actions", [])]
+        return {"role": "assistant", "content": f"eligible_actions={','.join(eligible)}"}
+
+    if agent == "incident_investigator":
+        if len(tool_msgs) == 0:
+            return _tool_call(n, [("evidence_agent", {"request": "Report what the firewall observed for this incident."})])
+        if len(tool_msgs) == 1:
+            evidence = json.loads(tool_msgs[0]).get("result", "")
+            return _tool_call(n, [("context_agent", {"request": f"Context for: {evidence}"})])
+        notes = " ".join(json.loads(t).get("result", "") for t in tool_msgs)
+        return {"role": "assistant", "content": f"INVESTIGATION NOTES: {notes}"}
+
+    # assessment_writer: one WriterAssessment object from the notes in its instruction.
+    text = " ".join(_text_of(m.get("content")) for m in messages)
+    def pick(pattern, default):
+        found = re.search(pattern, text)
+        return found.group(1) if found else default
+    evidence_ids = pick(r"evidence_ids=(\S+)", "EVID-1").split(",")
+    eligible = [a for a in pick(r"eligible_actions=(\S+)", "").split(",") if a]
+    return {"role": "assistant", "content": json.dumps({
+        "incident_id": pick(r"incident_id=(\S+)", "INC-MOCK-E2E"),
+        "incident_revision": int(pick(r"incident_revision=(\d+)", "1")),
+        "severity": pick(r"floor=(\w+)", "CRITICAL"),
+        "attack_category": "EXPLOITATION_ATTEMPT",
+        "exploitation_assessment": "ATTEMPT_OBSERVED",
+        "enforcement": pick(r"enforcement=(\w+)", "ALLOWED_OR_DETECTED"),
+        "summary": "ADK shadow assessment of the exploit probe (scripted fake).",
+        "findings": [{"kind": "OBSERVATION", "statement": "IPS signature observed by the firewall.", "evidence_ids": evidence_ids[:1]}],
+        "cve_references": [],
+        "visibility_gaps": ["No endpoint telemetry."],
+        "recommended_action_ids": [a for a in eligible if a == "ACT_INSPECT_APPLICATION_LOGS"][:1],
+        "analyst_follow_up": ["Verify application patch status"],
+    })}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    body_peek = await request.json()
+    adk_agent = _adk_agent(body_peek)
+    if adk_agent is not None and state.chat_response_mode == "valid":
+        message = _adk_answer(adk_agent, body_peek.get("messages") or [])
+        state.adk_requests.append({
+            "agent": adk_agent,
+            "tools": [(t.get("function") or {}).get("name") for t in body_peek.get("tools") or []],
+            "answered_with": [c["function"]["name"] for c in message.get("tool_calls", [])] or "text",
+        })
+        return {
+            "id": f"chatcmpl-adk-{len(state.adk_requests)}",
+            "object": "chat.completion",
+            "model": body_peek.get("model"),
+            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
+            "usage": {"prompt_tokens": 150, "completion_tokens": 40, "total_tokens": 190},
+        }
+
     if state.chat_response_mode == "timeout":
         await asyncio.sleep(15.0)
         raise HTTPException(status_code=504, detail="Simulated LLM Gateway Timeout")
@@ -224,6 +348,7 @@ async def get_capture():
     return {
         "captured_chats": state.captured_chats,
         "staged_logs_count": len(state.staged_logs),
+        "adk_requests": state.adk_requests,
     }
 
 
