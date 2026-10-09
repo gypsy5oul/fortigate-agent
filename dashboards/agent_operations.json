@@ -224,6 +224,115 @@
           "refId": "C"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "id": 10,
+      "title": "ADK Agent Investigator (shadow / adk modes)",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+      "id": 11,
+      "title": "Agent Runs by Mode and Outcome",
+      "description": "ADK investigation runs per second by mode (shadow, live) and outcome (VALID, REJECTED, BUDGET_EXHAUSTED, TIMEOUT, SCHEMA_INVALID, ERROR).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (mode, outcome) (rate(forti_agent_runs_total[5m]))",
+          "legendFormat": "{{mode}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
+      "id": 12,
+      "title": "Agent Run Duration (p95 / p50)",
+      "description": "Wall-clock duration of one whole ADK investigation (bounded by AGENT_TIMEOUT_SECONDS).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(forti_agent_run_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 Duration (s)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(forti_agent_run_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 Duration (s)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "id": 13,
+      "title": "Budget-Exhausted Runs (24 h)",
+      "description": "Runs stopped by the AGENT_MAX_LLM_CALLS ceiling in the last 24 hours.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "increase(forti_agent_budget_exhausted_total[24h])",
+          "legendFormat": "Budget exhausted",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 31 },
+      "id": 14,
+      "title": "Model Calls by Agent",
+      "description": "Model calls per second by agent (incident_investigator, evidence_agent, context_agent, assessment_writer).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (agent) (rate(forti_agent_llm_calls_total[5m]))",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 31 },
+      "id": 15,
+      "title": "Tool Calls by Tool and Outcome",
+      "description": "Read-only tool calls per second by tool and outcome (success, refused, error). Refused lookup_asset calls mean the agent is guessing IPs.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (tool, outcome) (rate(forti_agent_tool_calls_total[5m]))",
+          "legendFormat": "{{tool}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 31 },
+      "id": 16,
+      "title": "Agent Tokens",
+      "description": "Tokens per second reported by the model endpoint for agent calls, by direction.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (direction) (rate(forti_agent_tokens_total[5m]))",
+          "legendFormat": "{{direction}}",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,

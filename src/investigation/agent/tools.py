@@ -186,7 +186,7 @@ async def query_traffic_context(direction: str, minutes_before: int, tool_contex
     except Exception as exc:
         return {"status": "error", "reason": f"traffic context query failed ({type(exc).__name__})"}
 
-    # The profile's line filters are substring matches (dstip=10.0.0.1 also matches 10.0.0.10), so the
+    # The profile's line filters are substring matches (dstip=192.0.2.1 also matches 192.0.2.10), so the
     # parsed events are filtered again on the exact incident IP.
     ip_field, ip_value = ("dstip", st["target_ip"]) if direction == "to_target" else ("srcip", st["source_ip"])
     parsed = (normalize_event(ts, line, allow_accepted_traffic=True) for ts, line in lines[:TRAFFIC_MAX_LINES])

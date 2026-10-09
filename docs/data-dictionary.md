@@ -204,8 +204,8 @@ Complete audit trail for every LLM interaction, token usage, validation result, 
 | `input_tokens` | `INT` | No | `0` | Prompt token count consumed |
 | `output_tokens` | `INT` | No | `0` | Completion tokens generated |
 | `latency_ms` | `INT` | No | `0` | Model roundtrip latency in milliseconds |
-| `structured_output_mode` | `VARCHAR(32)` | No | `'json_schema'` | Mode used (`json_schema` or `json_object`) |
-| `validation_result` | `VARCHAR(32)` | No | - | Schema check result (`VALID`, `REPAIRED`, `REJECTED`, `TIMEOUT`, `ERROR`) |
+| `structured_output_mode` | `VARCHAR(32)` | No | `'json_schema'` | Mode used (`json_schema` or `json_object` by the legacy single call; `adk_json_schema` for an ADK revision in `INVESTIGATOR_MODE=adk`) |
+| `validation_result` | `VARCHAR(32)` | No | - | Schema check result (`VALID`, `REPAIRED`, `REJECTED`, `TIMEOUT`, `ERROR`); an ADK revision writes its `agent_runs.outcome` here (`VALID`, `REJECTED`, `BUDGET_EXHAUSTED`, `TIMEOUT`, `SCHEMA_INVALID`, `ERROR`) |
 | `reason_codes` | `TEXT[]` | Yes | `'{}'` | Guardrail rule violations or validator downgrade reasons |
 | `commit_status` | `VARCHAR(32)` | No | `'COMMITTED'` | State of transaction (`PENDING`, `COMMITTED`, `CONFLICT`, `FAILED`) |
 | `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Audit record creation timestamp |
@@ -242,6 +242,74 @@ Records which SQL files under `migrations/` have been applied; `Database.connect
 
 ---
 
+### 1.12 `agent_runs`
+One row per ADK investigation (migration 006, ADR 005), written by the runtime wrapper (`src/investigation/agent/audit.py`) after the run, whatever its outcome. In `shadow` mode this is the only record of the run besides `agent_events` and `shadow_assessments`; in `adk` mode the same run also produces the revision and a `model_runs` row.
+
+| Column | Data Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `SERIAL` | No | - | Surrogate primary key |
+| `incident_id` | `VARCHAR(64)` | No | - | Incident investigated |
+| `revision` | `INT` | No | - | Revision the run assessed (the revision the investigation produces or shadows) |
+| `session_id` | `VARCHAR(160)` | No | - | ADK session id, `<incident_id>:<revision>` (`adk.sessions.id`) |
+| `mode` | `VARCHAR(16)` | No | - | `shadow` (INVESTIGATOR_MODE=shadow) or `live` (INVESTIGATOR_MODE=adk) |
+| `adk_version` | `VARCHAR(32)` | No | - | Installed `google-adk` version |
+| `model_id` | `VARCHAR(128)` | No | - | Configured model (`LLM_MODEL`) |
+| `prompt_versions` | `JSONB` | No | `'{}'` | `# Version:` of each instruction file, keyed by agent name |
+| `total_llm_calls` | `INT` | No | `0` | Model calls that reached the model, all four agents together (a call refused by the budget is not counted) |
+| `total_tool_calls` | `INT` | No | `0` | Tool calls, including the master's two AgentTool calls and refused calls |
+| `input_tokens` | `INT` | No | `0` | Prompt tokens reported by the endpoint, summed over the run |
+| `output_tokens` | `INT` | No | `0` | Completion tokens reported by the endpoint, summed over the run |
+| `latency_ms` | `INT` | No | `0` | Wall-clock duration of the run |
+| `outcome` | `VARCHAR(32)` | No | - | `VALID`, `REJECTED`, `BUDGET_EXHAUSTED`, `TIMEOUT`, `SCHEMA_INVALID` or `ERROR` (section 2.6) |
+| `reason_codes` | `TEXT[]` | No | `'{}'` | Validator reason codes for `VALID`; `AGENT_VALIDATION_REJECTED` plus the validator's codes for `REJECTED`; `AGENT_BUDGET_EXHAUSTED`, `AGENT_TIMEOUT`, `AGENT_SCHEMA_INVALID`, or `AGENT_ERROR` plus the exception class or ADK error code otherwise |
+| `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Row creation timestamp |
+
+---
+
+### 1.13 `agent_events`
+One row per model call or tool call of an ADK run, in order: the trail an analyst reads to see why the agent said what it said.
+
+| Column | Data Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `run_id` | `INT` | No | - | `agent_runs(id)`, `ON DELETE CASCADE`; primary key with `seq` |
+| `seq` | `INT` | No | - | Order within the run, from 1 |
+| `agent_name` | `VARCHAR(64)` | No | - | `incident_investigator`, `evidence_agent`, `context_agent` or `assessment_writer` |
+| `kind` | `VARCHAR(8)` | No | - | `llm` or `tool` |
+| `tool_name` | `VARCHAR(64)` | Yes | - | For `tool`: `evidence_agent` and `context_agent` (the master's AgentTool calls), `get_incident_packet`, `query_traffic_context`, `lookup_asset`, `lookup_signature`, `recent_incidents_for_source`, `get_action_catalog` |
+| `args_json` | `JSONB` | Yes | - | For `tool`: the arguments after clamping and after undeclared arguments were dropped. For `llm`: `{"error": "<exception class>"}` when the call failed or was refused by the budget, otherwise null |
+| `response_bytes` | `INT` | No | `0` | Size of the serialized tool result after redaction, delimiting and the 6 KB cap, or of the model's response content |
+| `refused` | `BOOLEAN` | No | `FALSE` | Tool: the call was refused (allowlist, per-run cap of 3, invalid argument, IP or signature not part of the incident). LLM: the call was refused by the `AGENT_MAX_LLM_CALLS` ceiling |
+| `latency_ms` | `INT` | No | `0` | Duration of the call (for an AgentTool call, the whole specialist run) |
+| `tokens` | `INT` | No | `0` | `llm`: prompt plus completion tokens reported by the endpoint |
+| `request_hash` | `VARCHAR(64)` | Yes | - | `llm`: SHA256 of the request as sent (after truncation) |
+| `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Row creation timestamp |
+
+---
+
+### 1.14 `shadow_assessments`
+The ADK result of a `shadow` run next to its agreement with the legacy assessment of the same revision. Never shown to anyone: no revision and no card come from it.
+
+| Column | Data Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `SERIAL` | No | - | Surrogate primary key |
+| `incident_id` | `VARCHAR(64)` | No | - | Incident investigated |
+| `revision` | `INT` | No | - | Revision the legacy call wrote and the ADK run shadowed |
+| `run_id` | `INT` | Yes | - | `agent_runs(id)`, `ON DELETE SET NULL`; null if the audit write failed |
+| `assessment_json` | `JSONB` | No | - | The ADK assessment after the validator, or the deterministic fallback |
+| `assessment_source` | `VARCHAR(32)` | No | - | `MODEL_VALIDATED` or `MODEL_REJECTED_FALLBACK` |
+| `validation_reason_codes` | `TEXT[]` | No | `'{}'` | The validator's reason codes (or the run's AGENT_* codes when the validator never ran) |
+| `severity_equal` | `BOOLEAN` | No | - | ADK severity equals the legacy severity |
+| `action_set_equal` | `BOOLEAN` | No | - | Same set of recommended action ids |
+| `exploitation_equal` | `BOOLEAN` | No | - | Same `exploitation_assessment` |
+| `findings_count` | `INT` | No | - | Findings in the ADK assessment |
+| `legacy_findings_count` | `INT` | No | - | Findings in the legacy assessment |
+| `created_at` | `TIMESTAMPTZ` | No | `NOW()` | Row creation timestamp |
+
+### 1.15 Schema `adk`
+Created by migration 006 for ADK's `DatabaseSessionService`, which creates and owns its tables there on first use (`sessions`, `events`, `app_states`, `user_states`, `adk_internal_metadata`). One session per investigated revision, id `<incident_id>:<revision>`, app `forti-investigator`, user `system`; its state holds the incident identity and the redacted packet, and its events every model and tool turn. A retried job replaces the session. Nothing prunes these tables yet (see the runbook).
+
+---
+
 ## 2. Domain Enumerations
 
 ### 2.1 Severity Levels
@@ -273,3 +341,11 @@ Records which SQL files under `migrations/` have been applied; `Database.connect
 - `ALLOWED_OR_DETECTED`: Payload observed and permitted through to application backend.
 - `MIXED`: Inbound campaign exhibited both dropped probes and allowed sessions.
 - `UNKNOWN`: Unrecognized FortiOS action value requiring configuration review.
+
+### 2.6 ADK Investigation Outcomes (`agent_runs.outcome`)
+- `VALID`: the writer's object passed the schema and `validate_assessment`; the assessment is `MODEL_VALIDATED`.
+- `REJECTED`: the validator hard-rejected the writer's object (identity mismatch, forbidden claim, ungrounded evidence id); deterministic fallback.
+- `BUDGET_EXHAUSTED`: the run reached `AGENT_MAX_LLM_CALLS` model calls across all agents (or ADK raised `LlmCallsLimitExceededError`); deterministic fallback.
+- `TIMEOUT`: the run exceeded `AGENT_TIMEOUT_SECONDS`; deterministic fallback.
+- `SCHEMA_INVALID`: the writer produced no object, or one that does not validate as `WriterAssessment`; deterministic fallback.
+- `ERROR`: any other failure (for example the model endpoint unreachable); deterministic fallback.

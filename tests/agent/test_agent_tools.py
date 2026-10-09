@@ -125,10 +125,11 @@ async def test_traffic_context_clamps_minutes_before(state, minutes, expected):
 
 
 async def test_traffic_context_keeps_only_the_exact_incident_ip(state):
-    """LogQL |= is a substring match: dstip=10.0.14.12 lines also match dstip=10.0.14.120. Not counted."""
-    near_miss = TARGET_IP[:-1]  # 10.0.14.12, a different host whose address is a prefix of the target's
+    """LogQL |= is a substring match (a filter on dstip=192.0.2.15 also returns dstip=192.0.2.150 lines), so
+    lines Loki returns can belong to another host. They are parsed but not counted."""
+    near_miss = TARGET_IP[:-1]  # 192.0.2.15, a different host whose address is a prefix of the target's
     lines = staged_traffic(state, 2) + staged_traffic(state, 3, dst=near_miss)
-    # The fake Loki is told the near-miss lines match the filter, as real Loki would for dstip=10.0.14.12.
+    # The fake Loki is told the near-miss lines match the filter, as real Loki would for a prefix of the address.
     loki = FakeLoki([(ts, line.replace(f"dstip={near_miss} ", f"dstip={near_miss} x=dstip={TARGET_IP} ")) for ts, line in lines])
     configure_tools(ToolDeps(loki=loki))
     out = await query_traffic_context("to_target", 5, ctx(state))

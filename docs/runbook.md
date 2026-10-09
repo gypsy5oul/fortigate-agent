@@ -107,3 +107,56 @@ docker compose restart app
 - **Action**:
   - Inspect dead-lettered alerts: `SELECT * FROM notification_outbox WHERE status = 'DEAD_LETTER';`.
   - Validate webhook key and space permissions.
+
+---
+
+## 5. Investigator Modes (ADK agent investigator)
+
+`INVESTIGATOR_MODE` (`legacy` default, `shadow`, `adk`) selects who writes the investigation revision; see README section 5 and `docs/adr/005-adk-investigator.md`. Detection, URGENT cards, the outbox and checkpoints do not depend on it.
+
+### 5.1 Enabling shadow mode
+1. vLLM must serve the model with `--enable-auto-tool-choice --tool-call-parser hermes` (Qwen tool calling). Without it the specialists cannot call tools and shadow runs end `ERROR` or `SCHEMA_INVALID`; the legacy path is unaffected.
+2. Set `INVESTIGATOR_MODE=shadow` in `.env` (optionally `AGENT_MAX_LLM_CALLS`, default 8, and `AGENT_TIMEOUT_SECONDS`, default 120) and restart: `docker compose up -d app`.
+3. Check the start-up log for `Investigator mode: shadow` and that migration `006_agent_audit` is applied: `SELECT version FROM schema_migrations;`.
+
+Shadow runs happen in the investigation loop after the legacy revision is committed, so each investigated revision takes up to `AGENT_TIMEOUT_SECONDS` longer to clear from the queue (`forti_jobs_oldest_pending_seconds`). They never produce a revision, a card or an outbox row, and their failure never fails the job.
+
+### 5.2 Reading shadow results
+```sql
+-- Outcomes of the last day
+SELECT mode, outcome, COUNT(*), PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms
+FROM agent_runs WHERE created_at > NOW() - INTERVAL '1 day' GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- Agreement with the legacy assessment
+SELECT COUNT(*) AS runs,
+       AVG(severity_equal::int) AS severity_agreement,
+       AVG(action_set_equal::int) AS action_set_agreement,
+       AVG(exploitation_equal::int) AS exploitation_agreement,
+       AVG((assessment_source = 'MODEL_REJECTED_FALLBACK')::int) AS fallback_rate
+FROM shadow_assessments WHERE created_at > NOW() - INTERVAL '1 day';
+
+-- Why the agent said what it said: the ordered trail of one run
+SELECT seq, agent_name, kind, tool_name, args_json, refused, latency_ms, tokens
+FROM agent_events WHERE run_id = <agent_runs.id> ORDER BY seq;
+```
+Metrics: `forti_agent_runs_total{mode,outcome}`, `forti_agent_llm_calls_total{agent}`, `forti_agent_tool_calls_total{tool,outcome}`, `forti_agent_run_duration_seconds`, `forti_agent_tokens_total{direction}`, `forti_agent_budget_exhausted_total` (Grafana row "ADK Agent Investigator" of `dashboards/agent_operations.json`). Repeated `lookup_asset` refusals mean the agent is guessing IPs; review the instructions before anything else.
+
+### 5.3 Run outcomes
+| `agent_runs.outcome` | Meaning | What to check |
+|---|---|---|
+| `VALID` | the writer's assessment passed the validator | nothing |
+| `REJECTED` | the validator hard-rejected it (identity, forbidden claim, ungrounded evidence id); fallback used | `reason_codes`, then the run's `agent_events` |
+| `BUDGET_EXHAUSTED` | `AGENT_MAX_LLM_CALLS` model calls used before the writer finished | the last `agent_events` row (refused `llm`) shows which agent asked for one more; raise the budget only with evidence |
+| `TIMEOUT` | the run exceeded `AGENT_TIMEOUT_SECONDS` | vLLM latency (`latency_ms` per `llm` event) |
+| `SCHEMA_INVALID` | the writer produced no object or an invalid one | vLLM guided decoding for `json_schema`; the writer's request in `adk.events` |
+| `ERROR` | anything else, e.g. the endpoint was unreachable | `reason_codes` (exception class) and the service log |
+
+### 5.4 ADK session store
+ADK keeps one session per investigated revision (`<incident_id>:<revision>`, app `forti-investigator`, user `system`) in schema `adk` of the service database (tables created by ADK on first use). Its state holds the incident identity and the redacted packet; its events, every model and tool turn. Nothing prunes it automatically yet. To keep 30 days (events cascade):
+```sql
+DELETE FROM adk.sessions WHERE app_name = 'forti-investigator' AND update_time < NOW() - INTERVAL '30 days';
+```
+`agent_runs` and `agent_events` are the audit record and are not touched by this statement.
+
+### 5.5 Rolling back and `adk` mode
+Rollback is `INVESTIGATOR_MODE=legacy` and a restart; legacy mode does not load ADK at all, and the audit tables stay as a record. `INVESTIGATOR_MODE=adk` makes the agent's validated assessment (or the deterministic fallback) the investigation revision and card, committed through the same CAS and job fence, with a `model_runs` row (`structured_output_mode = adk_json_schema`). It is promoted to default only in Phase C.3, after the C.2 shadow criteria are met; do not enable it in production before that.

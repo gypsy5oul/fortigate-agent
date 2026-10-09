@@ -85,7 +85,7 @@ def test_invalid_arguments_are_refused_and_undeclared_ones_dropped(run, state):
 
 
 def test_allowlist_refuses_a_tool_outside_the_agents_set(run, state):
-    out = enforce_tool_bounds(Tool("lookup_asset"), {"ip": "10.0.14.120"}, tctx(state, "evidence_agent"))
+    out = enforce_tool_bounds(Tool("lookup_asset"), {"ip": "192.0.2.150"}, tctx(state, "evidence_agent"))
     assert out == {"status": "refused", "reason": "tool lookup_asset is not allowed for evidence_agent"}
     out = enforce_tool_bounds(Tool("query_traffic_context"), {}, tctx(state, "incident_investigator"))
     assert out["status"] == "refused"
