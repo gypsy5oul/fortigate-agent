@@ -15,6 +15,10 @@
 #   EVAL_PYTHON        optional interpreter that also has google-adk[eval]: the golden set is then run
 #                      with `adk eval` against the scripted fake vLLM and the result is included
 #   SKIP_DOCKER=1      do not attempt the container build even if a daemon is available
+#   REMOVAL_PATCH      path (relative to the repository root) of a legacy-removal patch to verify; default
+#                      docs/reports/gate-c3-legacy-removal.patch when that file exists. It is applied to a
+#                      second detached worktree of the same commit and the suite is run there
+#   SKIP_REMOVAL_SUITE=1  only check that the patch applies and print the accounting; do not run its suite
 #
 # Tests may write Markdown files to $PHASE_REPORT_ARTIFACTS during the suite run (for example the
 # shadow comparison harness output of the offline shadow run); each is included verbatim.
@@ -47,6 +51,7 @@ FAKE_PID=""
 cleanup() {
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" >/dev/null 2>&1 || true
   git -C "$REPO_ROOT" worktree remove --force "$CHECKOUT" >/dev/null 2>&1 || true
+  [ -n "${REMOVAL_TREE:-}" ] && git -C "$REPO_ROOT" worktree remove --force "$REMOVAL_TREE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -60,6 +65,7 @@ cd "$CHECKOUT"
 # loopback are kept because they are not site information.
 redact() {
   sed -E \
+    -e "s#${REMOVAL_TREE:-/nonexistent-removal-tree}#<patched-checkout>#g" \
     -e "s#$CHECKOUT#<checkout>#g" \
     -e "s#$REPO_ROOT#<repo>#g" \
     -e "s#${PYTHON_DIR}#<python-bin>#g" \
@@ -163,6 +169,62 @@ else
   echo "SKIPPED: no Docker daemon reachable from this host (or SKIP_DOCKER=1)." >"$DOCKER_LOG"
 fi
 
+# ---- code accounting (plan C.3): only when the repository has the script ----
+ACCOUNTING_LOG="$WORK/code_accounting.log"
+REMOVAL_PATCH="${REMOVAL_PATCH:-docs/reports/gate-c3-legacy-removal.patch}"
+if [ -f scripts/code_accounting.py ]; then
+  {
+    echo "### The tree at this commit"
+    echo
+    echo "\$ python scripts/code_accounting.py$([ -f "$REMOVAL_PATCH" ] && echo " --patch $REMOVAL_PATCH")"
+    echo
+    if [ -f "$REMOVAL_PATCH" ]; then
+      "$PYTHON" scripts/code_accounting.py --patch "$REMOVAL_PATCH" | sed -E 's/^## /#### /'
+    else
+      "$PYTHON" scripts/code_accounting.py | sed -E 's/^## /#### /'
+    fi
+  } >"$ACCOUNTING_LOG" 2>&1 || true
+else
+  echo "SKIPPED: scripts/code_accounting.py does not exist at this commit." >"$ACCOUNTING_LOG"
+fi
+
+# ---- the legacy removal patch: applied to a second detached worktree, suite run there ----
+REMOVAL_LOG="$WORK/removal.log"
+REMOVAL_SUITE_LOG="$WORK/removal_suite.log"
+REMOVAL_STATUS="no removal patch at this commit"
+REMOVAL_TREE="$WORK/removal-checkout"
+if [ -f "$REMOVAL_PATCH" ]; then
+  git -C "$REPO_ROOT" worktree add --detach "$REMOVAL_TREE" "$HEAD_SHA" >/dev/null 2>&1
+  if (cd "$REMOVAL_TREE" && git apply --check "$REMOVAL_PATCH") >"$REMOVAL_LOG" 2>&1; then
+    (cd "$REMOVAL_TREE" && git apply "$REMOVAL_PATCH")
+    {
+      echo "\$ git apply --check $REMOVAL_PATCH   # applies cleanly to this commit; patched in a second worktree"
+      echo
+      echo "### The tree after the patch"
+      echo
+      echo "\$ python scripts/code_accounting.py --root <patched worktree>"
+      echo
+      "$PYTHON" scripts/code_accounting.py --root "$REMOVAL_TREE" | sed -E 's/^## /#### /'
+    } >>"$ACCOUNTING_LOG" 2>&1 || true
+    if [ "${SKIP_REMOVAL_SUITE:-0}" = "1" ]; then
+      REMOVAL_STATUS="applies cleanly; suite not run (SKIP_REMOVAL_SUITE=1)"
+      echo "SKIPPED: SKIP_REMOVAL_SUITE=1." >"$REMOVAL_SUITE_LOG"
+    else
+      set +e
+      (cd "$REMOVAL_TREE" && GCHAT_DRY_RUN=true "$PYTHON" -m pytest -q -p no:cacheprovider -o log_cli=false --tb=short tests/) >"$REMOVAL_SUITE_LOG" 2>&1
+      RSTATUS=$?
+      set -e
+      RSUMMARY="$(grep -E '^[0-9]+ (passed|failed|error).*in [0-9.]+s' "$REMOVAL_SUITE_LOG" | tail -1)"
+      REMOVAL_STATUS="applies cleanly; patched tree suite: ${RSUMMARY:-see transcript} (exit ${RSTATUS})"
+    fi
+  else
+    REMOVAL_STATUS="DOES NOT APPLY to this commit (git apply --check failed)"
+    cp "$REMOVAL_LOG" "$REMOVAL_SUITE_LOG"
+  fi
+else
+  echo "No $REMOVAL_PATCH at this commit." >"$REMOVAL_SUITE_LOG"
+fi
+
 # ---- version manifest: what is pinned vs what the interpreter actually has ----
 MANIFEST="$WORK/manifest.txt"
 {
@@ -195,6 +257,7 @@ MANIFEST="$WORK/manifest.txt"
   echo "| Suite result | ${SUITE_SUMMARY:-see transcript} (exit ${SUITE_STATUS}) |"
   echo "| Offline adk eval | ${EVAL_STATUS} |"
   echo "| Container build | ${DOCKER_STATUS} |"
+  echo "| Legacy removal patch | ${REMOVAL_STATUS} |"
   echo
   if [ -n "$NOTES" ] && [ -f "$NOTES" ]; then
     echo "## Notes (hand-written, supplied as \`$(basename "$NOTES")\`)"
@@ -215,6 +278,20 @@ MANIFEST="$WORK/manifest.txt"
     sed -E 's/^(#+) /\1## /' "$artifact"
     echo
   done
+  echo "## Code accounting (\`scripts/code_accounting.py\`)"
+  echo
+  cat "$ACCOUNTING_LOG"
+  echo
+  if [ -f "$REMOVAL_PATCH" ]; then
+    echo "## Legacy removal patch: suite on the patched tree"
+    echo
+    echo "The patch \`$REMOVAL_PATCH\` was applied to a second detached worktree of this commit and the whole suite was run there with the same database and environment (\`pytest -q\`; the last 60 lines of its output follow)."
+    echo
+    echo '```'
+    tail -n 60 "$REMOVAL_SUITE_LOG"
+    echo '```'
+    echo
+  fi
   echo "## Offline adk eval of the golden set (scripted fake vLLM)"
   echo
   echo '```'
