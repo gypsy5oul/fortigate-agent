@@ -12,7 +12,16 @@
 # Environment:
 #   TEST_DATABASE_URL  scratch PostgreSQL 16 database for the suite (required)
 #   PYTHON             interpreter with the dev requirements installed (default: python3)
+#   EVAL_PYTHON        optional interpreter that also has google-adk[eval]: the golden set is then run
+#                      with `adk eval` against the scripted fake vLLM and the result is included
 #   SKIP_DOCKER=1      do not attempt the container build even if a daemon is available
+#   REMOVAL_PATCH      path (relative to the repository root) of a legacy-removal patch to verify; default
+#                      docs/reports/gate-c3-legacy-removal.patch when that file exists. It is applied to a
+#                      second detached worktree of the same commit and the suite is run there
+#   SKIP_REMOVAL_SUITE=1  only check that the patch applies and print the accounting; do not run its suite
+#
+# Tests may write Markdown files to $PHASE_REPORT_ARTIFACTS during the suite run (for example the
+# shadow comparison harness output of the offline shadow run); each is included verbatim.
 set -euo pipefail
 
 PHASE="${1:?usage: make_phase_report.sh <phase> <output.md> [notes.md]}"
@@ -22,6 +31,11 @@ NOTES="${3:-}"
 PYTHON="${PYTHON:-python3}"
 # Interpreter directory, masked in transcripts (pytest prints it in its header line).
 case "$PYTHON" in */*) PYTHON_DIR="$(cd "$(dirname "$PYTHON")" && pwd)" ;; *) PYTHON_DIR="/nonexistent-python-dir" ;; esac
+# Interpreter prefix (site-packages paths in warnings), masked as well.
+PYTHON_PREFIX="$("$PYTHON" -c 'import sys; print(sys.prefix)' 2>/dev/null || echo /nonexistent-python-prefix)"
+EVAL_PYTHON="${EVAL_PYTHON:-}"
+EVAL_PREFIX="/nonexistent-eval-prefix"
+[ -n "$EVAL_PYTHON" ] && EVAL_PREFIX="$("$EVAL_PYTHON" -c 'import sys; print(sys.prefix)')"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 HEAD_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
@@ -33,8 +47,11 @@ OUT_ABS="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 
 WORK="$(mktemp -d)"
 CHECKOUT="$WORK/checkout"
+FAKE_PID=""
 cleanup() {
+  [ -n "$FAKE_PID" ] && kill "$FAKE_PID" >/dev/null 2>&1 || true
   git -C "$REPO_ROOT" worktree remove --force "$CHECKOUT" >/dev/null 2>&1 || true
+  [ -n "${REMOVAL_TREE:-}" ] && git -C "$REPO_ROOT" worktree remove --force "$REMOVAL_TREE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -48,9 +65,12 @@ cd "$CHECKOUT"
 # loopback are kept because they are not site information.
 redact() {
   sed -E \
+    -e "s#${REMOVAL_TREE:-/nonexistent-removal-tree}#<patched-checkout>#g" \
     -e "s#$CHECKOUT#<checkout>#g" \
     -e "s#$REPO_ROOT#<repo>#g" \
     -e "s#${PYTHON_DIR}#<python-bin>#g" \
+    -e "s#${PYTHON_PREFIX}#<python-prefix>#g" \
+    -e "s#${EVAL_PREFIX}#<eval-python-prefix>#g" \
     -e "s#(postgres(ql)?://)[^[:space:]'\"]+#\1<redacted>#g" \
     -e "s#\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b#<private-ip>#g" \
     -e "s#\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b#<private-ip>#g" \
@@ -71,13 +91,70 @@ PYEOF
 
 # ---- test suite (full listing, so every test id in the report exists at this commit) ----
 SUITE_LOG="$WORK/suite.log"
+ARTIFACTS="$WORK/artifacts"
+mkdir -p "$ARTIFACTS"
 set +e
-GCHAT_DRY_RUN=true "$PYTHON" -m pytest -v -p no:cacheprovider -o log_cli=false --tb=short \
+GCHAT_DRY_RUN=true PHASE_REPORT_ARTIFACTS="$ARTIFACTS" "$PYTHON" -m pytest -v -p no:cacheprovider -o log_cli=false --tb=short \
   --junitxml="$WORK/junit.xml" tests/ >"$SUITE_LOG" 2>&1
 SUITE_STATUS=$?
 set -e
 SUITE_SUMMARY="$(grep -E '^(=+ .*(passed|failed|error).* =+)$' "$SUITE_LOG" | tail -1 | sed -E 's/^=+ //; s/ =+$//')"
 COLLECTED="$("$PYTHON" -m pytest --collect-only -q -p no:cacheprovider tests/ 2>/dev/null | grep -cE '::' || true)"
+
+# ---- offline adk eval of the golden set against the scripted fake vLLM (only with EVAL_PYTHON) ----
+EVAL_LOG="$WORK/adk_eval.log"
+EVAL_STATUS="SKIPPED"
+if [ -n "$EVAL_PYTHON" ]; then
+  FAKE_PORT="$("$PYTHON" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  "$PYTHON" -c "import sys, uvicorn; sys.path.insert(0, '.'); from tests.e2e.fake_endpoints import app; uvicorn.run(app, host='127.0.0.1', port=${FAKE_PORT}, log_level='warning')" \
+    >"$WORK/fake_vllm.log" 2>&1 &
+  FAKE_PID=$!
+  "$PYTHON" -c "
+import time, urllib.request
+for _ in range(100):
+    try:
+        urllib.request.urlopen('http://127.0.0.1:${FAKE_PORT}/capture', timeout=1); break
+    except Exception:
+        time.sleep(0.1)
+"
+  set +e
+  PYTHONPATH=. LLM_BASE_URL="http://127.0.0.1:${FAKE_PORT}/v1" LLM_MODEL=scripted-fake \
+    "$EVAL_PYTHON" -m google.adk.cli eval src/investigation/agent evals/golden/*.test.json \
+    --config_file_path evals/test_config.json >"$WORK/adk_eval_raw.log" 2>&1
+  EVAL_RC=$?
+  set -e
+  kill "$FAKE_PID" >/dev/null 2>&1 || true
+  FAKE_PID=""
+  {
+    echo "\$ PYTHONPATH=. LLM_BASE_URL=http://127.0.0.1:<port>/v1 LLM_MODEL=scripted-fake python -m google.adk.cli eval src/investigation/agent evals/golden/*.test.json --config_file_path evals/test_config.json"
+    echo "exit status: ${EVAL_RC}"
+    "$EVAL_PYTHON" -c 'import importlib.metadata as m; print("google-adk " + m.version("google-adk") + ", google-cloud-aiplatform " + m.version("google-cloud-aiplatform") + " (eval extras)")'
+    echo
+    sed -n '/^Eval Run Summary/,$p' "$WORK/adk_eval_raw.log"
+    echo
+    echo "Per case, from the eval results adk eval wrote (src/investigation/agent/.adk/eval_history):"
+    "$EVAL_PYTHON" - <<'PYEOF'
+import glob, json
+from google.adk.evaluation.evaluator import EvalStatus
+print(f"{'case':32} {'overall':8} {'tool_trajectory_avg_score':>26} {'response_match_score':>21}")
+passed = total = 0
+for path in sorted(glob.glob("src/investigation/agent/.adk/eval_history/*.evalset_result.json")):
+    for case in json.load(open(path, encoding="utf-8"))["eval_case_results"]:
+        m = {r["metric_name"]: r for r in case["overall_eval_metric_results"]}
+        def cell(name):
+            r = m.get(name) or {}
+            return f"{r.get('score', float('nan')):.3f} {EvalStatus(r['eval_status']).name}" if r else "n/a"
+        overall = EvalStatus(case["final_eval_status"]).name
+        total += 1
+        passed += overall == "PASSED"
+        print(f"{case['eval_id']:32} {overall:8} {cell('tool_trajectory_avg_score'):>26} {cell('response_match_score'):>21}")
+print(f"cases passing every criterion: {passed} of {total}")
+PYEOF
+  } >"$EVAL_LOG" 2>&1
+  EVAL_STATUS="ran (exit ${EVAL_RC}); $(grep -E '^cases passing every criterion' "$EVAL_LOG" || echo 'no per-case results')"
+else
+  echo "SKIPPED: set EVAL_PYTHON to an interpreter with google-adk[eval] to run the golden set with adk eval." >"$EVAL_LOG"
+fi
 
 # ---- container build (only when a daemon is reachable) ----
 DOCKER_LOG="$WORK/docker.log"
@@ -92,13 +169,69 @@ else
   echo "SKIPPED: no Docker daemon reachable from this host (or SKIP_DOCKER=1)." >"$DOCKER_LOG"
 fi
 
+# ---- code accounting (plan C.3): only when the repository has the script ----
+ACCOUNTING_LOG="$WORK/code_accounting.log"
+REMOVAL_PATCH="${REMOVAL_PATCH:-docs/reports/gate-c3-legacy-removal.patch}"
+if [ -f scripts/code_accounting.py ]; then
+  {
+    echo "### The tree at this commit"
+    echo
+    echo "\$ python scripts/code_accounting.py$([ -f "$REMOVAL_PATCH" ] && echo " --patch $REMOVAL_PATCH")"
+    echo
+    if [ -f "$REMOVAL_PATCH" ]; then
+      "$PYTHON" scripts/code_accounting.py --patch "$REMOVAL_PATCH" | sed -E 's/^## /#### /'
+    else
+      "$PYTHON" scripts/code_accounting.py | sed -E 's/^## /#### /'
+    fi
+  } >"$ACCOUNTING_LOG" 2>&1 || true
+else
+  echo "SKIPPED: scripts/code_accounting.py does not exist at this commit." >"$ACCOUNTING_LOG"
+fi
+
+# ---- the legacy removal patch: applied to a second detached worktree, suite run there ----
+REMOVAL_LOG="$WORK/removal.log"
+REMOVAL_SUITE_LOG="$WORK/removal_suite.log"
+REMOVAL_STATUS="no removal patch at this commit"
+REMOVAL_TREE="$WORK/removal-checkout"
+if [ -f "$REMOVAL_PATCH" ]; then
+  git -C "$REPO_ROOT" worktree add --detach "$REMOVAL_TREE" "$HEAD_SHA" >/dev/null 2>&1
+  if (cd "$REMOVAL_TREE" && git apply --check "$REMOVAL_PATCH") >"$REMOVAL_LOG" 2>&1; then
+    (cd "$REMOVAL_TREE" && git apply "$REMOVAL_PATCH")
+    {
+      echo "\$ git apply --check $REMOVAL_PATCH   # applies cleanly to this commit; patched in a second worktree"
+      echo
+      echo "### The tree after the patch"
+      echo
+      echo "\$ python scripts/code_accounting.py --root <patched worktree>"
+      echo
+      "$PYTHON" scripts/code_accounting.py --root "$REMOVAL_TREE" | sed -E 's/^## /#### /'
+    } >>"$ACCOUNTING_LOG" 2>&1 || true
+    if [ "${SKIP_REMOVAL_SUITE:-0}" = "1" ]; then
+      REMOVAL_STATUS="applies cleanly; suite not run (SKIP_REMOVAL_SUITE=1)"
+      echo "SKIPPED: SKIP_REMOVAL_SUITE=1." >"$REMOVAL_SUITE_LOG"
+    else
+      set +e
+      (cd "$REMOVAL_TREE" && GCHAT_DRY_RUN=true "$PYTHON" -m pytest -q -p no:cacheprovider -o log_cli=false --tb=short tests/) >"$REMOVAL_SUITE_LOG" 2>&1
+      RSTATUS=$?
+      set -e
+      RSUMMARY="$(grep -E '^[0-9]+ (passed|failed|error).*in [0-9.]+s' "$REMOVAL_SUITE_LOG" | tail -1)"
+      REMOVAL_STATUS="applies cleanly; patched tree suite: ${RSUMMARY:-see transcript} (exit ${RSTATUS})"
+    fi
+  else
+    REMOVAL_STATUS="DOES NOT APPLY to this commit (git apply --check failed)"
+    cp "$REMOVAL_LOG" "$REMOVAL_SUITE_LOG"
+  fi
+else
+  echo "No $REMOVAL_PATCH at this commit." >"$REMOVAL_SUITE_LOG"
+fi
+
 # ---- version manifest: what is pinned vs what the interpreter actually has ----
 MANIFEST="$WORK/manifest.txt"
 {
   printf '%-20s %-14s %s\n' "package" "pinned" "installed"
   while IFS= read -r line; do
     case "$line" in ''|\#*) continue ;; esac
-    name="${line%%==*}"; pin="${line#*==}"
+    name="${line%%==*}"; pin="${line#*==}"; name="${name%%\[*}"  # pip show takes no extras
     inst="$("$PYTHON" -m pip show "$name" 2>/dev/null | awk '/^Version:/{print $2}')"
     printf '%-20s %-14s %s\n' "$name" "$pin" "${inst:-missing}"
   done < requirements.in
@@ -122,7 +255,9 @@ MANIFEST="$WORK/manifest.txt"
   echo "| Kernel | $(uname -sr) |"
   echo "| Tests collected | ${COLLECTED} |"
   echo "| Suite result | ${SUITE_SUMMARY:-see transcript} (exit ${SUITE_STATUS}) |"
+  echo "| Offline adk eval | ${EVAL_STATUS} |"
   echo "| Container build | ${DOCKER_STATUS} |"
+  echo "| Legacy removal patch | ${REMOVAL_STATUS} |"
   echo
   if [ -n "$NOTES" ] && [ -f "$NOTES" ]; then
     echo "## Notes (hand-written, supplied as \`$(basename "$NOTES")\`)"
@@ -134,6 +269,33 @@ MANIFEST="$WORK/manifest.txt"
   echo
   echo '```'
   cat "$MANIFEST"
+  echo '```'
+  echo
+  for artifact in "$ARTIFACTS"/*.md; do
+    [ -f "$artifact" ] || continue
+    echo "## Written by the suite: \`$(basename "$artifact")\`"
+    echo
+    sed -E 's/^(#+) /\1## /' "$artifact"
+    echo
+  done
+  echo "## Code accounting (\`scripts/code_accounting.py\`)"
+  echo
+  cat "$ACCOUNTING_LOG"
+  echo
+  if [ -f "$REMOVAL_PATCH" ]; then
+    echo "## Legacy removal patch: suite on the patched tree"
+    echo
+    echo "The patch \`$REMOVAL_PATCH\` was applied to a second detached worktree of this commit and the whole suite was run there with the same database and environment (\`pytest -q\`; the last 60 lines of its output follow)."
+    echo
+    echo '```'
+    tail -n 60 "$REMOVAL_SUITE_LOG"
+    echo '```'
+    echo
+  fi
+  echo "## Offline adk eval of the golden set (scripted fake vLLM)"
+  echo
+  echo '```'
+  cat "$EVAL_LOG"
   echo '```'
   echo
   echo "## Test suite transcript"

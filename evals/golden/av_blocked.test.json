@@ -1,0 +1,139 @@
+{
+  "eval_set_id": "golden_av_blocked",
+  "name": "golden av_blocked",
+  "description": "Golden case av_blocked from e2e scenario scenario_4_internal_av_blocked; not routed to an investigation by the service (DIGEST or no rule). Built by scripts/build_golden_set.py; do not edit by hand.",
+  "eval_cases": [
+    {
+      "eval_id": "av_blocked",
+      "conversation": [
+        {
+          "invocation_id": "golden-av_blocked",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Investigate the incident bound to this session."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "{\"incident_id\":\"INC-4AAB1D09F2DF\",\"incident_revision\":2,\"severity\":\"MEDIUM\",\"attack_category\":\"MALWARE_TRANSFER\",\"exploitation_assessment\":\"INSUFFICIENT_EVIDENCE\",\"enforcement\":\"BLOCKED\",\"summary\":\"Antivirus blocked a download of the EICAR test file by an internal host.\",\"findings\":[{\"kind\":\"OBSERVATION\",\"statement\":\"Antivirus detected Eicar-Test-Signature in an outbound HTTP download and blocked it.\",\"evidence_ids\":[\"d3e7e6e2c0969cbfd32c71c5e614c587a700aa00710c6e9779df81079da3f80e\"]}],\"cve_references\":[],\"visibility_gaps\":[\"Firewall logs cannot show why the host requested the file.\"],\"recommended_action_ids\":[\"ACT_MONITOR_AND_DIGEST\"],\"analyst_follow_up\":[\"Confirm with the host owner whether this was an antivirus test.\"]}"
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "evidence_agent",
+                "args": {}
+              },
+              {
+                "name": "context_agent",
+                "args": {}
+              }
+            ],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "forti-investigator",
+        "user_id": "system",
+        "state": {
+          "incident_id": "INC-4AAB1D09F2DF",
+          "revision": 2,
+          "source_ip": "10.0.1.50",
+          "target_ip": "203.0.113.10",
+          "window_start_ns": 1791271945000000000,
+          "window_end_ns": 1791271945000000000,
+          "packet": {
+            "incident_id": "INC-4AAB1D09F2DF",
+            "incident_revision": 2,
+            "visibility_scope": "FIREWALL_ONLY",
+            "source_ip": "10.0.1.50",
+            "target_ip": "203.0.113.10",
+            "target_app": "HTTP",
+            "first_seen": "2026-10-06 07:32:25+00:00",
+            "last_seen": "2026-10-06 07:32:25+00:00",
+            "event_count": 1,
+            "enforcement": "BLOCKED",
+            "enforcement_counts": {
+              "BLOCKED": 1,
+              "ALLOWED": 0,
+              "ALLOWED_OR_DETECTED": 0,
+              "SESSION_CLOSED": 0,
+              "UNKNOWN": 0
+            },
+            "deterministic_rule_ids": [
+              "RULE_ANTIVIRUS_BLOCKED"
+            ],
+            "deterministic_severity_floor": "MEDIUM",
+            "deterministic_reasons": [
+              "Antivirus inspection blocked malware transfer: Eicar-Test-Signature"
+            ],
+            "signatures": [
+              "Eicar-Test-Signature"
+            ],
+            "evidence_events": [
+              {
+                "id": "d3e7e6e2c0969cbfd32c71c5e614c587a700aa00710c6e9779df81079da3f80e",
+                "loki_ts_ns": 1791271945000000000,
+                "log_type": "utm",
+                "subtype": "virus",
+                "action_normalized": "BLOCKED",
+                "action_raw": "blocked",
+                "utmaction": "blocked",
+                "direction": "OUTBOUND",
+                "srcport": 54321,
+                "dstport": 80,
+                "proto": 6,
+                "service": "HTTP",
+                "policyid": 5,
+                "sessionid": 200005,
+                "signature": "Eicar-Test-Signature",
+                "severity_raw": "warning"
+              }
+            ],
+            "action_catalog": [
+              {
+                "id": "ACT_SWITCH_IPS_TO_BLOCK",
+                "name": "Switch IPS Profile from Monitor to Protect",
+                "category": "PROFILE_TUNING",
+                "description": "Tune policy security profile to actively drop matching exploit signatures rather than monitor/passthrough.",
+                "risk_level": "MEDIUM",
+                "requires_approval": true
+              },
+              {
+                "id": "ACT_INSPECT_APPLICATION_LOGS",
+                "name": "Inspect Backend Web Application Logs",
+                "category": "INVESTIGATION_STEP",
+                "description": "Correlate FortiGate DPI timestamp with application access logs to verify backend HTTP response code.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              },
+              {
+                "id": "ACT_MONITOR_AND_DIGEST",
+                "name": "Log and Monitor in Weekly Threat Digest",
+                "category": "OBSERVATION",
+                "description": "No perimeter changes required; signature was contained by existing firewall drop rules.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              }
+            ]
+          },
+          "eval_fixture": {
+            "traffic_lines": [],
+            "recent_incidents": []
+          }
+        }
+      },
+      "creation_timestamp": 0.0
+    }
+  ],
+  "creation_timestamp": 0.0
+}

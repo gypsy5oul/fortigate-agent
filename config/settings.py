@@ -1,6 +1,6 @@
 """Application settings for FortiGate Firewall Intelligence Service."""
 
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -58,6 +58,25 @@ class Settings(BaseSettings):
     urgent_cooldown_seconds: int = Field(default=900, description="Cooldown in seconds before sending another URGENT card for the same incident")
     investigation_rate_limit_per_source_hour: int = Field(default=3, description="Max investigation jobs per hour per source IP")
     investigation_rate_limit_per_target_hour: int = Field(default=10, description="Max investigation jobs per hour per target IP")
+
+    # Investigation mode and the ADK agent investigator (Phase C.1, ADR 005)
+    investigator_mode: Literal["legacy", "shadow", "adk"] = Field(
+        default="legacy",
+        description=(
+            "legacy: the single-call workflow writes the revision; shadow: legacy writes the revision, "
+            "then the ADK pipeline runs and writes only shadow_assessments; adk: the ADK result is the revision"
+        ),
+    )
+    agent_max_llm_calls: int = Field(
+        default=8, ge=1, description="Ceiling on model calls per investigation across all four agents"
+    )
+    agent_timeout_seconds: float = Field(
+        default=120.0, gt=0, description="Wall-clock deadline for one whole ADK investigation"
+    )
+    adk_session_db_url: Optional[str] = Field(
+        default=None,
+        description="SQLAlchemy async URL for ADK sessions; derived from DATABASE_URL (postgresql+asyncpg, schema adk) when unset",
+    )
 
     # Google Chat
     gchat_webhook_url: Optional[str] = Field(default=None, description="Google Chat webhook incoming URL")

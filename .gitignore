@@ -5,3 +5,6 @@ __pycache__/
 .coverage
 htmlcov/
 .env
+
+# ADK eval results (adk eval writes <agent dir>/.adk/eval_history)
+.adk/

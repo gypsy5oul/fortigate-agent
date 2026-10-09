@@ -38,3 +38,15 @@ def test_alert_rules_cover_model_degradation():
         doc = yaml.safe_load(f)
     exprs = " ".join(rule["expr"] for group in doc["groups"] for rule in group["rules"])
     assert "forti_model_consecutive_failures" in exprs
+
+
+def test_alert_rules_cover_agent_budget_exhaustion_and_hard_rejects():
+    """Plan C2.4/C2.5: the two ADK investigator rates alert, from the updater-set 24 h gauges."""
+    with open(ALERTS_PATH, "r", encoding="utf-8") as f:
+        doc = yaml.safe_load(f)
+    rules = {rule["alert"]: rule for group in doc["groups"] for rule in group["rules"]}
+    budget = rules["FortiGateAgentBudgetExhaustion"]["expr"]
+    reject = rules["FortiGateAgentHardRejectRate"]["expr"]
+    assert 'forti_agent_runs_24h{outcome="BUDGET_EXHAUSTED"}' in budget and "> 0.02" in budget
+    assert 'forti_agent_runs_24h{outcome="REJECTED"}' in reject and "> 0.05" in reject
+    assert all("sum(forti_agent_runs_24h) >= 20" in e for e in (budget, reject))

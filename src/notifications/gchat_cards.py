@@ -188,7 +188,7 @@ def build_digest_gchat_card(
         "card": {
             "header": {
                 "title": "🛡️ FortiGate Security Activity Digest",
-                "subtitle": f"Aggregated {total_incidents} events in interval • FortiGate DPI Monitor",
+                "subtitle": f"Aggregated {total_incidents} incidents in interval • FortiGate DPI Monitor",
             },
             "sections": [
                 {
@@ -229,7 +229,7 @@ def build_digest_gchat_card(
 
     plain_text = (
         f"[DIGEST] FortiGate Security Activity Digest\n"
-        f"Total Events: {total_incidents}\n"
+        f"Total Incidents: {total_incidents}\n"
         f"Top Sources: {src_text}\n"
         f"Top Targets: {dst_text}\n"
         f"Rules: {rule_text}\n"

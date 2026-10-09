@@ -107,3 +107,169 @@ docker compose restart app
 - **Action**:
   - Inspect dead-lettered alerts: `SELECT * FROM notification_outbox WHERE status = 'DEAD_LETTER';`.
   - Validate webhook key and space permissions.
+
+---
+
+## 5. Investigator Modes (ADK agent investigator)
+
+`INVESTIGATOR_MODE` (`legacy` default, `shadow`, `adk`) selects who writes the investigation revision; see README section 5 and `docs/adr/005-adk-investigator.md`. Detection, URGENT cards, the outbox and checkpoints do not depend on it. `legacy` stays the default until an operator flips it: 5.5 is the evidence and the gate table, 5.7 the flip and the first hour, 5.6 the way back. The flip and the rollback are each one setting and a container recreate.
+
+### 5.1 Enabling shadow mode
+1. vLLM must serve the model with `--enable-auto-tool-choice --tool-call-parser hermes` (Qwen tool calling). Without it the specialists cannot call tools and shadow runs end `ERROR` or `SCHEMA_INVALID`; the legacy path is unaffected.
+2. Set `INVESTIGATOR_MODE=shadow` in `.env` (optionally `AGENT_MAX_LLM_CALLS`, default 8, and `AGENT_TIMEOUT_SECONDS`, default 120) and restart: `docker compose up -d app`.
+3. Check the start-up log for `Investigator mode: shadow` and that migration `006_agent_audit` is applied: `SELECT version FROM schema_migrations;`. The error `ADK investigator unavailable; shadow runs are disabled` means the agent could not be set up; the service then runs legacy-only (in `adk` mode the same failure stops the service).
+
+Shadow runs happen in the investigation loop after the legacy revision is committed, so each investigated revision takes up to `AGENT_TIMEOUT_SECONDS` longer to clear from the queue (`forti_jobs_oldest_pending_seconds`). They never produce a revision, a card or an outbox row, and their failure never fails the job.
+
+### 5.2 Reading shadow results
+The comparison harness reads the audit tables (read-only) and prints agreement with the legacy assessment, outcomes and the validator hard-reject rate, p50/p95 latency, tokens and model calls per run, tool calls and refusals, and the plan C2.5 criteria with what was measured:
+```bash
+docker compose exec -T app python scripts/shadow_report.py --hours 24            # Markdown
+docker compose exec -T app python scripts/shadow_report.py --since 2026-10-10T00:00:00Z --json
+```
+`--check lab` (or `--check golden`) exits 1 when that criteria set is not met. The default window mode is `shadow`; the runs of `adk` mode are mode `live`, so after a flip read them with `--mode live` (5.7). A live run has no shadow comparison: the agreement table reads 0/0, and `--check golden` reads not met by construction. The outcome, hard-reject, latency, token, tool and refusal numbers are the live ones, and `--mode live --check lab` confirms the lab bars on the first 50 live runs. The same numbers as SQL:
+```sql
+-- Outcomes of the last day
+SELECT mode, outcome, COUNT(*), PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms
+FROM agent_runs WHERE created_at > NOW() - INTERVAL '1 day' GROUP BY 1, 2 ORDER BY 1, 2;
+
+-- Agreement with the legacy assessment
+SELECT COUNT(*) AS runs,
+       AVG(severity_equal::int) AS severity_agreement,
+       AVG(action_set_equal::int) AS action_set_agreement,
+       AVG(exploitation_equal::int) AS exploitation_agreement,
+       AVG((assessment_source = 'MODEL_REJECTED_FALLBACK')::int) AS fallback_rate
+FROM shadow_assessments WHERE created_at > NOW() - INTERVAL '1 day';
+
+-- Why the agent said what it said: the ordered trail of one run
+SELECT seq, agent_name, kind, tool_name, args_json, refused, latency_ms, tokens
+FROM agent_events WHERE run_id = <agent_runs.id> ORDER BY seq;
+```
+Metrics: `forti_agent_runs_total{mode,outcome}`, `forti_agent_llm_calls_total{agent}`, `forti_agent_tool_calls_total{tool,outcome}`, `forti_agent_run_duration_seconds`, `forti_agent_tokens_total{direction}`, `forti_agent_budget_exhausted_total` (incremented after each run; Grafana row "ADK Agent Investigator" of `dashboards/agent_operations.json`), and the last-24-hour gauges `forti_agent_runs_24h{mode,outcome}`, `forti_agent_shadow_comparisons_24h` and `forti_agent_shadow_agreeing_24h{field}`, which the operational metrics updater sets from the audit tables every 5 s in every mode (row "ADK Shadow Comparison"). Alerts: `FortiGateAgentHardRejectRate` (more than 5% of the last 24 h's runs hard-rejected) and `FortiGateAgentBudgetExhaustion` (more than 2% stopped by the budget), both only once there are at least 20 runs in the window. Repeated `lookup_asset` refusals mean the agent is guessing IPs; review the instructions before anything else.
+
+### 5.3 Run outcomes
+| `agent_runs.outcome` | Meaning | What to check |
+|---|---|---|
+| `VALID` | the writer's assessment passed the validator | nothing |
+| `REJECTED` | the validator hard-rejected it (identity, forbidden claim, ungrounded evidence id); fallback used | `reason_codes`, then the run's `agent_events` |
+| `BUDGET_EXHAUSTED` | `AGENT_MAX_LLM_CALLS` model calls used before the writer finished | the last `agent_events` row (refused `llm`) shows which agent asked for one more; raise the budget only with evidence |
+| `TIMEOUT` | the run exceeded `AGENT_TIMEOUT_SECONDS` | vLLM latency (`latency_ms` per `llm` event) |
+| `SCHEMA_INVALID` | the writer produced no object or an invalid one | vLLM guided decoding for `json_schema`; the writer's request in `adk.events` |
+| `ERROR` | anything else, e.g. the endpoint was unreachable | `reason_codes` (exception class) and the service log |
+
+### 5.4 ADK session store
+ADK keeps one session per investigated revision (`<incident_id>:<revision>`, app `forti-investigator`, user `system`) in schema `adk` of the service database (tables created by ADK on first use). Its state holds the incident identity and the redacted packet; its events, every model and tool turn. Nothing prunes it automatically yet. To keep 30 days (events cascade):
+```sql
+DELETE FROM adk.sessions WHERE app_name = 'forti-investigator' AND update_time < NOW() - INTERVAL '30 days';
+```
+`agent_runs` and `agent_events` are the audit record and are not touched by this statement.
+
+### 5.5 Promotion evidence (plan C2.5)
+Phase C.3 ships the flip as a setting; it does not make `adk` the default. The default flips (and the legacy code goes, 5.7) only when the C2.5 criteria hold on the golden set and on at least 50 real shadow runs. The offline part runs in CI (`tests/agent/test_golden_set.py`, `tests/e2e/test_service_e2e.py::test_e2e_offline_shadow_run_over_the_golden_scenarios`, and the adk-mode cases beside it). In the lab:
+
+1. Collect: run in shadow mode (5.1) until at least 50 incidents have been investigated, then
+   ```bash
+   docker compose exec -T app python scripts/shadow_report.py --since <shadow start, ISO 8601> --check lab
+   ```
+   exit status 0 means: at least 50 shadow runs, hard-reject rate under 5%, p95 latency under 90 s, budget exhaustion under 2%, no `lookup_asset` refusal.
+2. Evaluate the golden set against the lab model from a checkout with `requirements-dev.txt` plus `google-adk[eval]==2.11.0` (README section 6):
+   ```bash
+   RUN_LAB_EVALS=1 LLM_BASE_URL=http://<vllm-host>:8000/v1 LLM_MODEL=<served-model> \
+     pytest -m lab -v tests/agent/test_golden_eval_lab.py
+   ```
+3. Add two reviewed real incidents to the golden set: `docker compose exec -T app python scripts/export_golden_incident.py <incident_id> <revision> > evals/lab/<name>.test.json`, review the file (`evals/lab/README.md`), commit it, and repeat step 2.
+
+Evaluation reads tool data from the evalset only (no Loki, no database) and writes nothing.
+
+#### Gate table (copy it into the change ticket; one copy per promotion attempt)
+Fill the last two columns. Every row must read `yes` before the flip; a row that does not is an exception the reviewer signs for by name, with the reason. The "Offline" column is what CI proves against the scripted fake at the commit being deployed (it says nothing about the real model); only the "Lab" column counts.
+
+| # | Criterion (plan) | Bar | Where it is measured | Offline (CI, scripted fake) | Lab (measured) | Met |
+|---|---|---|---|---|---|---|
+| 1 | Golden set: validator hard rejects (C2.5) | 0 | `shadow_report.py --check golden` (note a) | 0 of 4 shadow runs; 7 of 7 golden cases VALID through the investigator | | |
+| 2 | Golden set: severity agreement (C2.5) | 100% | same command | 4 of 4 | | |
+| 3 | Golden set: action-set agreement (C2.5) | at least 90% | same command | 4 of 4 | | |
+| 4 | Real shadow runs (C2.5) | at least 50 | `shadow_report.py --since <shadow start> --check lab` | not applicable | | |
+| 5 | Hard-reject rate over those runs (C2.5) | under 5% | same command | 0% of 4 | | |
+| 6 | p95 latency over those runs (C2.5) | under 90 s | same command | not comparable (fake) | | |
+| 7 | Budget exhaustion over those runs (C2.5) | under 2% | same command | 0% of 4 | | |
+| 8 | `lookup_asset` refusals over those runs (C2.5) | 0 | same command | 0 | | |
+| 9 | No tool ever issued a write (C2.5) | none | CI at the commit to deploy: `tests/agent/test_agent_tools.py`, the repository spy in `test_e2e_offline_shadow_run_over_the_golden_scenarios` | pass | CI run of the deployed commit: | |
+| 10 | Golden set against the lab model: trajectory and response match (C2.2) | trajectory 1.0, response match 0.6 (`evals/test_config.json`) | `RUN_LAB_EVALS=1 pytest -m lab tests/agent/test_golden_eval_lab.py` | trajectory 1.0 on 7 of 7; response match 0.514 to 0.621 (scripted prose) | | |
+| 11 | Two real redacted incidents in `evals/lab/` (C2.2) | 2 reviewed files | step 3 above | placeholder only | | |
+
+(a) The harness computes agreement by comparing each shadow run with the legacy assessment of the same revision. In CI the golden criteria are read from the offline shadow run over the seven golden scenarios. In the lab, run the command on a window that holds the golden cases, or on the 50-run window as the stricter reading, and say which in the ticket. Rows 4 to 8 are the same report, read on the real-incident window.
+
+Sign-off (the same fields Phase D records for a promotion in `mode_promotions`, surface `INVESTIGATOR`, so the evidence carries over when that exists; until then they live in the ticket):
+
+| Field | Value |
+|---|---|
+| Operator (name) | |
+| Reviewer (name, not the operator) | |
+| Commit deployed (`git rev-parse HEAD` of the image) | |
+| Shadow window (`--since` value) and number of runs | |
+| `shadow_report.py` output, saved as (file, sha256) | |
+| CI run of the commit (link) | |
+| Exceptions and who accepted them | |
+| Date and time of the flip (UTC) | |
+
+### 5.6 Rolling back
+Rollback is one setting and a container recreate, and it loses no data.
+1. In `.env` set `INVESTIGATOR_MODE=legacy` (or `shadow`, to keep collecting evidence while the legacy call writes the revisions).
+2. `docker compose up -d app`. `docker compose restart` does not re-read `.env`; recreating the container does.
+
+What happens to work in flight: the container gets SIGTERM, the service abandons an ADK run in progress, exits with code 0 within 5 s and leaves that job leased. After its 90 s lease runs out the restarted service leases it again and the legacy call completes it; that counts as one more attempt of the job's three. Nothing is migrated or deleted: the revisions and cards the ADK path wrote stay as incident history (tell them apart with `model_runs.structured_output_mode = 'adk_json_schema'`; the legacy call writes `json_schema` or `json_object`), `agent_runs`, `agent_events`, `shadow_assessments` and the `adk` schema stay as the audit record, and migration 006 stays applied (it only adds tables). Legacy mode does not load ADK at all.
+
+Check afterwards: the start-up log reads `Investigator mode: legacy`, `forti_agent_runs_total` stops increasing, and the next investigated revision has a `model_runs` row with `structured_output_mode` `json_schema`.
+
+Limit: the setting can only go back while the legacy code exists. After the removal patch (5.7, step 8) the service accepts only `INVESTIGATOR_MODE=adk` and refuses to start with anything else, rather than silently running the agent. The way back from there is `git revert` of the removal commit, `docker compose up -d --build app` and then the setting above.
+
+### 5.7 Promoting the investigator
+The sequence, with the gate table of 5.5 as its input. Steps 1 to 3 are in shadow mode and change nothing a human sees; step 4 is the only change to behaviour; step 8 is a separate, later change.
+
+**1. Preconditions.** vLLM serves the model with `--enable-auto-tool-choice --tool-call-parser hermes` (5.1). Migration `006_agent_audit` is applied (`SELECT version FROM schema_migrations;`). `dashboards/alerts.yml` is loaded, with `FortiGateAgentHardRejectRate`, `FortiGateAgentBudgetExhaustion` and `FortiGateModelDegraded`. A backup exists (2.1). Nobody is changing vLLM, Loki or Chat in the same window.
+
+**2. Collect.** Shadow mode for as long as it takes to investigate 50 real incidents (5.1, 5.5 step 1). Keep the start time: it is `--since` in every later command.
+
+**3. Decide.** Run the commands of 5.5, fill the gate table, get the reviewer's name on it. If any row is `no`, stop here; fix the instructions or the model server and collect again. Nothing is promoted on an offline number.
+
+**4. Flip.** Exactly one change to `.env`, then recreate the container:
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ                 # FLIP_TIME: write it in the ticket, it is --since below
+docker compose exec -T app python scripts/shadow_report.py --hours 24 > shadow_before_flip.md
+# .env:   INVESTIGATOR_MODE=shadow   ->   INVESTIGATOR_MODE=adk
+docker compose up -d app
+docker compose logs --tail 100 app | grep -E "Investigator mode|Traceback"   # expect: Investigator mode: adk
+curl -s http://localhost:8085/health/ready                                   # expect HTTP 200 {"status":"ready",...}
+```
+`AGENT_MAX_LLM_CALLS` (8) and `AGENT_TIMEOUT_SECONDS` (120) stay as shadow ran them; change them only with the evidence of `shadow_report.py`. In `adk` mode a broken agent set-up stops the service at start-up (shadow mode would only disable the shadow runs), so a crash loop right after the flip is the first rollback trigger.
+
+**5. Watch the first hour.** Ports are the compose defaults (`METRICS_PORT` 8085). `FLIP_TIME` is the timestamp from step 4.
+
+| Look at | How | Healthy | Roll back if |
+|---|---|---|---|
+| Readiness | `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8085/health/ready` and the body | 200 `ready` | 503, or `degraded` for 15 minutes (3 consecutive fallbacks or failures) |
+| Run outcomes | `docker compose exec -T app python scripts/shadow_report.py --mode live --since $FLIP_TIME`; or `curl -s localhost:8085/metrics \| grep '^forti_agent_runs_total'` | `VALID` is nearly every row; the `live` counters move once per investigated revision | `REJECTED`, `TIMEOUT`, `SCHEMA_INVALID` or `ERROR` is more than 1 in 20 after the first 20 runs; `FortiGateAgentHardRejectRate` fires |
+| Latency | `shadow_report.py` p95 row, or `histogram_quantile(0.95, sum by (le) (rate(forti_agent_run_duration_seconds_bucket[1h])))` | p95 under 90 s | p95 over 90 s |
+| Budget | `forti_agent_budget_exhausted_total`, `BUDGET_EXHAUSTED` row | 0 | more than 1 in 50 runs (`FortiGateAgentBudgetExhaustion`) |
+| Guessed addresses | `forti_agent_tool_calls_total{tool="lookup_asset",outcome="refused"}`; the refusal line of the report | 0 | any (the agent is inventing IPs; read the instructions first) |
+| Model failures | `forti_model_consecutive_failures`, `forti_model_failures_total` | 0, occasionally 1 or 2 | reaches 3 and stays there (`FortiGateModelDegraded`) |
+| Queue | `forti_jobs_oldest_pending_seconds` | flat or falling; investigations are serial, a run takes up to `AGENT_TIMEOUT_SECONDS` | climbs steadily, i.e. runs are slower than incidents arrive |
+| What analysts see | the first INVESTIGATION_UPDATE cards in Chat; `SELECT r.revision, r.assessment_source, m.structured_output_mode, m.validation_result, m.commit_status FROM incident_revisions r LEFT JOIN model_runs m ON m.incident_id = r.incident_id AND m.revision = r.revision WHERE r.created_at > '<FLIP_TIME>' ORDER BY r.created_at;` | `MODEL_VALIDATED` with `adk_json_schema` and `COMMITTED` | cards that are wrong, empty or unsafe to act on; many `MODEL_REJECTED_FALLBACK`; `CONFLICT` rows (another writer took the revision first; the job retries) beyond the odd one |
+| One run in detail | `SELECT seq, agent_name, kind, tool_name, refused, latency_ms FROM agent_events WHERE run_id = (SELECT MAX(id) FROM agent_runs) ORDER BY seq;` | all four agents appear, the two specialists are called through the master, the model calls stay within `AGENT_MAX_LLM_CALLS`, no row is refused | a run that stops early, repeats one tool, or has refused rows |
+
+Detection, severity floors and URGENT cards do not depend on the agent, so nothing here delays or suppresses an alert: the worst case of a bad investigation is a deterministic fallback card (`MODEL_REJECTED_FALLBACK`) in place of an agent-written one.
+
+**6. Roll back** on any trigger above: 5.6. It takes one setting and about a minute; do not wait for a second occurrence of a crash loop or an unsafe card.
+
+**7. After the first hour.** Repeat the report at the end of the first day (`--mode live --hours 24`) and, once there are 50 live runs, `--mode live --check lab`: exit 0 means the lab bars hold on the live runs too. Keep the report with the ticket.
+
+**8. Remove the legacy code (a later, separate change).** `docs/reports/gate-c3-legacy-removal.patch` deletes the single-call workflow and its prompts, makes `adk` the only accepted value (and so the default) of `INVESTIGATOR_MODE`, removes the shadow plumbing that needed the legacy assessment (`shadow_assessments` and `scripts/shadow_report.py` stay, to read the evidence already collected; read the live runs with `--mode live` from then on), and updates the tests. It is not applied by this repository: apply it only after the flip has soaked for as long as the ticket says, because from then on 5.6 is a `git revert` and an image rebuild instead of a setting.
+```bash
+git switch -c chore/remove-legacy-investigator
+git apply --check docs/reports/gate-c3-legacy-removal.patch && git apply docs/reports/gate-c3-legacy-removal.patch
+TEST_DATABASE_URL=postgresql://<user>:<password>@<db-host>:5432/<scratch-db> pytest -v tests/    # must be green
+git add -A && git commit -m "feat: remove the legacy single-call investigator"
+docker compose up -d --build app                                                    # the image carries the code
+```
+The patch was generated against the commit that carries it, and the Phase C.3 report records that it applies and that the whole suite passes on the patched tree; `git apply --check` tells you if the tree has moved since. `scripts/code_accounting.py --patch docs/reports/gate-c3-legacy-removal.patch` prints what it removes and adds.

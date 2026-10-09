@@ -1,0 +1,138 @@
+{
+  "eval_set_id": "golden_model_silence",
+  "name": "golden model_silence",
+  "description": "Golden case model_silence from e2e scenario scenario_8_model_silence; investigated by the service. Built by scripts/build_golden_set.py; do not edit by hand.",
+  "eval_cases": [
+    {
+      "eval_id": "model_silence",
+      "conversation": [
+        {
+          "invocation_id": "golden-model_silence",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Investigate the incident bound to this session."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "{\"incident_id\":\"INC-F126A66E948C\",\"incident_revision\":2,\"severity\":\"CRITICAL\",\"attack_category\":\"EXPLOITATION_ATTEMPT\",\"exploitation_assessment\":\"ATTEMPT_OBSERVED\",\"enforcement\":\"ALLOWED_OR_DETECTED\",\"summary\":\"Inbound OpenSSL Heartbleed attempt against the VIP was detected by IPS and not blocked; no traffic logs exist for the window.\",\"findings\":[{\"kind\":\"OBSERVATION\",\"statement\":\"IPS matched OpenSSL.Heartbleed.Information.Disclosure on HTTPS to the target and only detected it.\",\"evidence_ids\":[\"e31e03543affbffb992de388503f3187be8d41c0c9cef18a4875b3cc56387ca8\"]}],\"cve_references\":[\"CVE-2014-0160\"],\"visibility_gaps\":[\"Traffic context returned nothing for the incident window.\"],\"recommended_action_ids\":[\"ACT_INSPECT_APPLICATION_LOGS\",\"ACT_SWITCH_IPS_TO_BLOCK\"],\"analyst_follow_up\":[\"Check the TLS service's OpenSSL version.\"]}"
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "evidence_agent",
+                "args": {}
+              },
+              {
+                "name": "context_agent",
+                "args": {}
+              }
+            ],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "forti-investigator",
+        "user_id": "system",
+        "state": {
+          "incident_id": "INC-F126A66E948C",
+          "revision": 2,
+          "source_ip": "198.51.100.49",
+          "target_ip": "192.0.2.150",
+          "window_start_ns": 1791271949000000000,
+          "window_end_ns": 1791271949000000000,
+          "packet": {
+            "incident_id": "INC-F126A66E948C",
+            "incident_revision": 2,
+            "visibility_scope": "FIREWALL_ONLY",
+            "source_ip": "198.51.100.49",
+            "target_ip": "192.0.2.150",
+            "target_app": "HTTPS",
+            "first_seen": "2026-10-06 07:32:29+00:00",
+            "last_seen": "2026-10-06 07:32:29+00:00",
+            "event_count": 1,
+            "enforcement": "ALLOWED_OR_DETECTED",
+            "enforcement_counts": {
+              "BLOCKED": 0,
+              "ALLOWED": 0,
+              "ALLOWED_OR_DETECTED": 1,
+              "SESSION_CLOSED": 0,
+              "UNKNOWN": 0
+            },
+            "deterministic_rule_ids": [
+              "RULE_NONBLOCKED_EXPLOIT_ATTEMPT"
+            ],
+            "deterministic_severity_floor": "CRITICAL",
+            "deterministic_reasons": [
+              "FortiGate DPI detected high-impact attack payload (OpenSSL.Heartbleed.Information.Disclosure) reaching application without perimeter blocking."
+            ],
+            "signatures": [
+              "OpenSSL.Heartbleed.Information.Disclosure"
+            ],
+            "evidence_events": [
+              {
+                "id": "e31e03543affbffb992de388503f3187be8d41c0c9cef18a4875b3cc56387ca8",
+                "loki_ts_ns": 1791271949000000000,
+                "log_type": "utm",
+                "subtype": "ips",
+                "action_normalized": "ALLOWED_OR_DETECTED",
+                "action_raw": "detected",
+                "direction": "INBOUND",
+                "srcport": 49001,
+                "dstport": 443,
+                "proto": 6,
+                "service": "HTTPS",
+                "policyid": 10,
+                "sessionid": 230001,
+                "signature": "OpenSSL.Heartbleed.Information.Disclosure",
+                "severity_raw": "critical"
+              }
+            ],
+            "action_catalog": [
+              {
+                "id": "ACT_SWITCH_IPS_TO_BLOCK",
+                "name": "Switch IPS Profile from Monitor to Protect",
+                "category": "PROFILE_TUNING",
+                "description": "Tune policy security profile to actively drop matching exploit signatures rather than monitor/passthrough.",
+                "risk_level": "MEDIUM",
+                "requires_approval": true
+              },
+              {
+                "id": "ACT_INSPECT_APPLICATION_LOGS",
+                "name": "Inspect Backend Web Application Logs",
+                "category": "INVESTIGATION_STEP",
+                "description": "Correlate FortiGate DPI timestamp with application access logs to verify backend HTTP response code.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              },
+              {
+                "id": "ACT_MONITOR_AND_DIGEST",
+                "name": "Log and Monitor in Weekly Threat Digest",
+                "category": "OBSERVATION",
+                "description": "No perimeter changes required; signature was contained by existing firewall drop rules.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              }
+            ]
+          },
+          "eval_fixture": {
+            "traffic_lines": [],
+            "recent_incidents": []
+          }
+        }
+      },
+      "creation_timestamp": 0.0
+    }
+  ],
+  "creation_timestamp": 0.0
+}

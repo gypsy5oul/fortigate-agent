@@ -45,3 +45,30 @@ groups:
         annotations:
           summary: "Investigation model degraded"
           description: "LLM endpoint has failed 3 or more consecutive calls; service is using deterministic fallback."
+
+  - name: fortigate_intel_agent_alerts
+    rules:
+      # ADK investigator (plan C2.4/C2.5). forti_agent_runs_24h is set from agent_runs by the
+      # operational metrics updater every cycle; the rules need 20 runs in the window so a single
+      # failure on a quiet day does not page.
+      - alert: FortiGateAgentBudgetExhaustion
+        expr: >-
+          sum(forti_agent_runs_24h{outcome="BUDGET_EXHAUSTED"}) / clamp_min(sum(forti_agent_runs_24h), 1) > 0.02
+          and sum(forti_agent_runs_24h) >= 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ADK investigator budget exhaustion above 2%"
+          description: "More than 2% of ADK investigation runs in the last 24 h hit AGENT_MAX_LLM_CALLS and fell back to the deterministic assessment (C2.5 bar: under 2%). Check which agent asked for the extra call (runbook 5.3)."
+
+      - alert: FortiGateAgentHardRejectRate
+        expr: >-
+          sum(forti_agent_runs_24h{outcome="REJECTED"}) / clamp_min(sum(forti_agent_runs_24h), 1) > 0.05
+          and sum(forti_agent_runs_24h) >= 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ADK investigator validator hard-reject rate above 5%"
+          description: "More than 5% of ADK investigation runs in the last 24 h were hard-rejected by the validator (C2.5 bar: under 5%). Read the reason codes with scripts/shadow_report.py (runbook 5.2)."

@@ -40,8 +40,8 @@ MIGRATION_CHECK=$(docker compose exec -T postgres psql -U "${POSTGRES_USER:-fort
 echo "Applied migrations:"
 echo "${MIGRATION_CHECK}"
 
-if ! echo "${MIGRATION_CHECK}" | grep -q "005_episode_utm_subtypes"; then
-  echo "ERROR: 005_episode_utm_subtypes migration missing from schema_migrations"
+if ! echo "${MIGRATION_CHECK}" | grep -q "006_agent_audit"; then
+  echo "ERROR: 006_agent_audit migration missing from schema_migrations"
   docker compose down
   exit 1
 fi

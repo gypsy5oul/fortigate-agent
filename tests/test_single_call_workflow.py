@@ -197,3 +197,26 @@ async def test_model_run_metadata_populated(base_packet):
     assert mrun["output_tokens"] == 45
     assert mrun["latency_ms"] >= 0
     assert mrun["validation_result"] == "VALID"
+
+
+def test_prompt_catalog_carries_catalog_risk_level():
+    """The catalog key is risk_level; the prompt must not show every action as LOW risk."""
+    from src.investigation.single_call_workflow import SingleCallInvestigationWorkflow
+    from src.investigation.schemas import IncidentPacket
+    from src.investigation.eligibility import load_action_catalog
+
+    catalog = {a["id"]: a for a in load_action_catalog() if "id" in a}
+    workflow = SingleCallInvestigationWorkflow(base_url="http://127.0.0.1:9999/v1")
+    packet = IncidentPacket(
+        incident_id="INC-RISK-1", incident_revision=2, source_ip="198.51.100.45", target_ip="10.0.14.120",
+        target_app="Portal", first_seen="2026-10-08T12:00:00Z", last_seen="2026-10-08T12:01:00Z",
+        event_count=1, enforcement="ALLOWED_OR_DETECTED", enforcement_counts={"ALLOWED_OR_DETECTED": 1},
+        deterministic_rule_ids=["RULE_NONBLOCKED_EXPLOIT_ATTEMPT"],
+        deterministic_severity_floor="CRITICAL", deterministic_reasons=["probe"], signatures=[], evidence_events=[],
+        action_catalog=[dict(a) for a in catalog.values()],
+    )
+    prompt_catalog, _, _ = workflow._prepare_evidence_and_catalog(packet)
+    assert prompt_catalog, "catalog must not be empty"
+    for entry in prompt_catalog:
+        assert entry["risk"] == catalog[entry["id"]].get("risk_level", "LOW"), entry
+    assert {e["risk"] for e in prompt_catalog} != {"LOW"}

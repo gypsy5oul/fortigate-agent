@@ -31,6 +31,9 @@ COPY config/ /app/config/
 COPY src/ /app/src/
 COPY migrations/ /app/migrations/
 COPY replay.py /app/replay.py
+# Operator tools for the ADK shadow phase (read-only against the database): the comparison harness
+# and the golden-incident export (docs/runbook.md section 5).
+COPY scripts/shadow_report.py scripts/export_golden_incident.py /app/scripts/
 
 # Create writable temp directory for appuser
 RUN mkdir -p /app/data /tmp/scratch && \

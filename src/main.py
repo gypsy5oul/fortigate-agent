@@ -40,6 +40,12 @@ from src.observability.metrics import (
     BACKLOG_PENDING_EVENTS,
     JOBS_OLDEST_PENDING_SECONDS,
     MODEL_CONSECUTIVE_FAILURES,
+    AGENT_AGREEMENT_FIELDS,
+    AGENT_RUN_MODES,
+    AGENT_RUN_OUTCOMES,
+    AGENT_RUNS_24H,
+    AGENT_SHADOW_AGREEING_24H,
+    AGENT_SHADOW_COMPARISONS_24H,
 )
 
 # Quiet HTTP transport logging to prevent credential exposure in URLs
@@ -132,6 +138,21 @@ class IntelligenceService:
             timeout_seconds=self.settings.llm_timeout_seconds,
             max_output_tokens=self.settings.llm_max_output_tokens,
         )
+
+        # ADK investigator (ADR 005), imported only when a mode needs it: legacy never loads ADK.
+        # In shadow mode a broken agent set-up must not stop the service: it runs legacy-only and
+        # says so. In adk mode the agent is the investigator, so a broken set-up is fatal.
+        self.agent_investigator = None
+        if self.settings.investigator_mode in ("shadow", "adk"):
+            try:
+                from src.investigation.agent.runtime import AgentInvestigator
+
+                self.agent_investigator = AgentInvestigator(self.settings, self.db, self.loki_client)
+            except Exception as e:
+                if self.settings.investigator_mode == "adk":
+                    raise
+                logger.error("ADK investigator unavailable; shadow runs are disabled: %s", e)
+        logger.info("Investigator mode: %s", self.settings.investigator_mode)
 
         self.outbox_worker = OutboxWorker(
             repository=self.repo,
@@ -226,6 +247,8 @@ class IntelligenceService:
             self._server.should_exit = True
         await self.loki_client.close()
         await self.investigation_workflow.close()
+        if self.agent_investigator is not None:
+            await self.agent_investigator.close()
         await self.outbox_worker.close()
         await self.db.close()
         logger.info("Service terminated gracefully.")
@@ -526,7 +549,14 @@ class IntelligenceService:
                 )
 
                 t0 = time.time()
-                assessment = await self.investigation_workflow.investigate_packet(packet)
+                if self.settings.investigator_mode == "adk":
+                    agent_result = await self._agent_run_unless_stopping(packet, "live")
+                    if agent_result is None:
+                        logger.info("Service stopping; job %s is left to its lease", job_id)
+                        continue
+                    assessment = agent_result.assessment
+                else:
+                    assessment = await self.investigation_workflow.investigate_packet(packet)
                 MODEL_INFERENCE_DURATION.observe(time.time() - t0)
 
                 # Track model degradation and success
@@ -613,6 +643,9 @@ class IntelligenceService:
                 )
                 logger.info("Investigation job %s completed and committed successfully", job_id)
 
+                if self.settings.investigator_mode == "shadow" and self.agent_investigator is not None:
+                    await self._run_shadow(packet, assessment)
+
             except Exception as e:
                 logger.error("Error in investigation worker loop: %s", e, exc_info=True)
                 self._note_model_failure()
@@ -622,6 +655,50 @@ class IntelligenceService:
                     except Exception as fail_err:
                         logger.error("Failed to fail_job %s: %s", job["id"], fail_err)
                 await self._sleep(2.0)
+
+    async def _agent_run_unless_stopping(self, packet: IncidentPacket, mode: str):
+        """Run the ADK investigator; abandon the run (return None) if the service starts stopping."""
+        run = asyncio.ensure_future(self.agent_investigator.investigate(packet, mode))
+        stop = asyncio.ensure_future(self.stop_event.wait())
+        try:
+            await asyncio.wait({run, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+        if run.done():
+            return run.result()
+        run.cancel()
+        try:
+            await run
+        except (asyncio.CancelledError, Exception):
+            pass
+        return None
+
+    async def _run_shadow(self, packet: IncidentPacket, legacy_assessment) -> None:
+        """Shadow mode: run the ADK pipeline after the legacy revision is committed and record only
+        agent_runs, agent_events and shadow_assessments. Never a revision or a card, and a failure
+        here never fails the job or the legacy write."""
+        from src.investigation.agent.audit import write_shadow_assessment
+
+        try:
+            result = await self._agent_run_unless_stopping(packet, "shadow")
+            if result is None:
+                return
+            await write_shadow_assessment(
+                self.db,
+                incident_id=packet.incident_id,
+                revision=packet.incident_revision,
+                run_id=result.run_id,
+                assessment=result.assessment,
+                validation_reason_codes=result.validation_reason_codes or result.reason_codes,
+                legacy=legacy_assessment,
+            )
+            logger.info(
+                "Shadow ADK investigation for %s rev %s: %s", packet.incident_id, packet.incident_revision, result.outcome
+            )
+        except Exception as e:
+            logger.warning(
+                "Shadow ADK investigation failed for %s rev %s: %s", packet.incident_id, packet.incident_revision, e
+            )
 
     async def _run_outbox_loop(self):
         """Processes outgoing notifications to Google Chat with rate-limiting."""
@@ -713,6 +790,32 @@ class IntelligenceService:
             JOBS_OLDEST_PENDING_SECONDS.set(float(oldest_job["age_sec"]))
         else:
             JOBS_OLDEST_PENDING_SECONDS.set(0.0)
+
+        await self._update_agent_window_gauges()
+
+    async def _update_agent_window_gauges(self) -> None:
+        """ADK investigator over the last 24 h from the audit tables (plan C2.4): runs by mode and
+        outcome, shadow comparisons and agreements. Set every cycle, zero when there were no runs, so
+        the shadow-comparison panels and the agent alert rules never read a stale value."""
+        since = "datetime('now', '-24 hours')" if self.db.is_sqlite else "NOW() - INTERVAL '24 hours'"
+        rows = await self.db.fetch_all(
+            f"SELECT mode, outcome, COUNT(*) AS n FROM agent_runs WHERE created_at > {since} GROUP BY mode, outcome"
+        )
+        counts = {(r["mode"], r["outcome"]): int(r["n"]) for r in rows}
+        for mode in AGENT_RUN_MODES:
+            for outcome in AGENT_RUN_OUTCOMES:
+                counts.setdefault((mode, outcome), 0)
+        for (mode, outcome), n in counts.items():
+            AGENT_RUNS_24H.labels(mode=mode, outcome=outcome).set(n)
+
+        agreement = await self.db.fetch_one(
+            "SELECT COUNT(*) AS n, "
+            + ", ".join(f"COALESCE(SUM(CASE WHEN {f}_equal THEN 1 ELSE 0 END), 0) AS {f}" for f in AGENT_AGREEMENT_FIELDS)
+            + f" FROM shadow_assessments WHERE created_at > {since}"
+        ) or {}
+        AGENT_SHADOW_COMPARISONS_24H.set(int(agreement.get("n") or 0))
+        for field_name in AGENT_AGREEMENT_FIELDS:
+            AGENT_SHADOW_AGREEING_24H.labels(field=field_name).set(int(agreement.get(field_name) or 0))
 
     async def _run_metrics_updater(self):
         """Periodically refreshes operational lag and backlog gauges (M2)."""

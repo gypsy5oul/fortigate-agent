@@ -224,6 +224,521 @@
           "refId": "C"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "id": 10,
+      "title": "ADK Agent Investigator (shadow / adk modes)",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+      "id": 11,
+      "title": "Agent Runs by Mode and Outcome",
+      "description": "ADK investigation runs per second by mode (shadow, live) and outcome (VALID, REJECTED, BUDGET_EXHAUSTED, TIMEOUT, SCHEMA_INVALID, ERROR).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (mode, outcome) (rate(forti_agent_runs_total[5m]))",
+          "legendFormat": "{{mode}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
+      "id": 12,
+      "title": "Agent Run Duration (p95 / p50)",
+      "description": "Wall-clock duration of one whole ADK investigation (bounded by AGENT_TIMEOUT_SECONDS).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(forti_agent_run_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 Duration (s)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(forti_agent_run_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 Duration (s)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "id": 13,
+      "title": "Budget-Exhausted Runs (24 h)",
+      "description": "Runs stopped by the AGENT_MAX_LLM_CALLS ceiling in the last 24 hours.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "increase(forti_agent_budget_exhausted_total[24h])",
+          "legendFormat": "Budget exhausted",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 31 },
+      "id": 14,
+      "title": "Model Calls by Agent",
+      "description": "Model calls per second by agent (incident_investigator, evidence_agent, context_agent, assessment_writer).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (agent) (rate(forti_agent_llm_calls_total[5m]))",
+          "legendFormat": "{{agent}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 31 },
+      "id": 15,
+      "title": "Tool Calls by Tool and Outcome",
+      "description": "Read-only tool calls per second by tool and outcome (success, refused, error). Refused lookup_asset calls mean the agent is guessing IPs.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (tool, outcome) (rate(forti_agent_tool_calls_total[5m]))",
+          "legendFormat": "{{tool}} {{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 31 },
+      "id": 16,
+      "title": "Agent Tokens",
+      "description": "Tokens per second reported by the model endpoint for agent calls, by direction.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (direction) (rate(forti_agent_tokens_total[5m]))",
+          "legendFormat": "{{direction}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "id": 17,
+      "title": "ADK Shadow Comparison (last 24 h, from the audit tables)",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 40
+      },
+      "id": 18,
+      "title": "Shadow Agreement with Legacy (24 h)",
+      "description": "Share of shadow comparisons in the last 24 h whose ADK assessment agrees with the legacy one, by field. C2.5 golden bars: severity 100%, action set at least 90%. Set by the operational metrics updater from shadow_assessments.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "forti_agent_shadow_agreeing_24h / ignoring(field) group_left forti_agent_shadow_comparisons_24h",
+          "legendFormat": "{{field}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.9
+              },
+              {
+                "color": "green",
+                "value": 1.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 8,
+        "y": 40
+      },
+      "id": 19,
+      "title": "Validator Hard-Reject Rate (24 h)",
+      "description": "Share of ADK runs in the last 24 h that the validator hard-rejected (outcome REJECTED). C2.5 bar: under 5%; alert FortiGateAgentHardRejectRate.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(forti_agent_runs_24h{outcome=\"REJECTED\"}) / clamp_min(sum(forti_agent_runs_24h), 1)",
+          "legendFormat": "Hard rejects",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 12,
+        "y": 40
+      },
+      "id": 20,
+      "title": "Budget Exhaustion Rate (24 h)",
+      "description": "Share of ADK runs in the last 24 h stopped by AGENT_MAX_LLM_CALLS. C2.5 bar: under 2%; alert FortiGateAgentBudgetExhaustion.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(forti_agent_runs_24h{outcome=\"BUDGET_EXHAUSTED\"}) / clamp_min(sum(forti_agent_runs_24h), 1)",
+          "legendFormat": "Budget exhausted",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.02
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 40
+      },
+      "id": 21,
+      "title": "Runs and Comparisons (24 h)",
+      "description": "ADK runs in the last 24 h by mode and outcome, and the number of shadow comparisons. The C2.5 lab criteria need at least 50 shadow runs.",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, outcome) (forti_agent_runs_24h)",
+          "legendFormat": "{{mode}} {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "forti_agent_shadow_comparisons_24h",
+          "legendFormat": "shadow comparisons",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "id": 22,
+      "title": "Tool Refusals by Tool (1 h)",
+      "description": "Refused tool calls in the last hour. Any lookup_asset refusal means the agent guessed an IP (C2.5: none allowed); review the instructions first.",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (tool) (increase(forti_agent_tool_calls_total{outcome=\"refused\"}[1h]))",
+          "legendFormat": "{{tool}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      },
+      "id": 23,
+      "title": "ADK Live Mode (INVESTIGATOR_MODE=adk, last 24 h from the audit tables)",
+      "type": "row",
+      "panels": []
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 0,
+        "y": 57
+      },
+      "id": 24,
+      "title": "Live Runs (24 h)",
+      "description": "ADK investigations that wrote the revision (mode live) in the last 24 h. Zero while the service runs in legacy or shadow mode. Set by the operational metrics updater from agent_runs.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(forti_agent_runs_24h{mode=\"live\"})",
+          "legendFormat": "Live runs",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 4,
+        "y": 57
+      },
+      "id": 25,
+      "title": "Live Fallback Rate (24 h)",
+      "description": "Share of live runs in the last 24 h that ended in any outcome but VALID, i.e. the card carried the deterministic fallback (MODEL_REJECTED_FALLBACK) instead of an agent-written assessment. There is no plan bar for the total; the parts have one: hard rejects under 5%, budget exhaustion under 2%. Colours are starting values.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(forti_agent_runs_24h{mode=\"live\",outcome!=\"VALID\"}) / clamp_min(sum(forti_agent_runs_24h{mode=\"live\"}), 1)",
+          "legendFormat": "Fallback",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.05
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 57
+      },
+      "id": 26,
+      "title": "Live Outcomes (24 h)",
+      "description": "Live runs in the last 24 h by outcome: VALID, REJECTED (validator hard reject), BUDGET_EXHAUSTED, TIMEOUT, SCHEMA_INVALID (the writer's output was not a valid object), ERROR.",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (forti_agent_runs_24h{mode=\"live\"})",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 57
+      },
+      "id": 27,
+      "title": "Live Runs by Outcome (15 min)",
+      "description": "Live runs in each 15 minute window by outcome, from the run counter. Watch it for the first hour after the flip (runbook 5.7).",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(forti_agent_runs_total{mode=\"live\"}[15m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 65
+      },
+      "id": 28,
+      "title": "Consecutive Model Failures",
+      "description": "Consecutive investigations that ended in a fallback or failed. /health/ready reports degraded at 3 and FortiGateModelDegraded fires; it resets on the next valid run.",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "forti_model_consecutive_failures",
+          "legendFormat": "Consecutive failures",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 8,
+        "w": 18,
+        "x": 6,
+        "y": 65
+      },
+      "id": 29,
+      "title": "Oldest Pending Investigation Job (s)",
+      "description": "Age of the oldest PENDING investigation job. Investigations run one at a time and each takes up to AGENT_TIMEOUT_SECONDS; a steady climb means runs are slower than incidents arrive (runbook 5.7).",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "forti_jobs_oldest_pending_seconds",
+          "legendFormat": "Oldest pending",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,

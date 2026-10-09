@@ -1,0 +1,362 @@
+{
+  "eval_set_id": "golden_blocked_scanner",
+  "name": "golden blocked_scanner",
+  "description": "Golden case blocked_scanner from e2e scenario scenario_5_blocked_scanner; not routed to an investigation by the service (DIGEST or no rule). Built by scripts/build_golden_set.py; do not edit by hand.",
+  "eval_cases": [
+    {
+      "eval_id": "blocked_scanner",
+      "conversation": [
+        {
+          "invocation_id": "golden-blocked_scanner",
+          "user_content": {
+            "role": "user",
+            "parts": [
+              {
+                "text": "Investigate the incident bound to this session."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "{\"incident_id\":\"INC-F120640D0EFF\",\"incident_revision\":2,\"severity\":\"MEDIUM\",\"attack_category\":\"RECONNAISSANCE\",\"exploitation_assessment\":\"INSUFFICIENT_EVIDENCE\",\"enforcement\":\"BLOCKED\",\"summary\":\"An external source made twelve connection attempts across twelve ports of the VIP; policy denied every one.\",\"findings\":[{\"kind\":\"OBSERVATION\",\"statement\":\"Twelve connection attempts to distinct ports were denied by policy.\",\"evidence_ids\":[\"2813d40b1142a71b925ea5a9d130e89bb5baf1834a04aae7ff90031d69a31db5\",\"81874b0f07bf9b88125900b3e725f3fa42f8af5124f97970bd146421c5368b5c\",\"1d26e39ed8f5d02b6f50c8832db1f3c24ac24ddd1378afb89aae4df492951863\",\"771627cc4d487607a00c0755333441dc5ebb84f9448726cf8bd77f44548cd2f6\",\"2fce3dd6f8f8e645fbd83295d2a9a6f89787c446ab9bd7448756423d09847c6b\",\"49740679727090dcd8a415ac08fab8e4844001e5a286a11ea8c890a79947f65f\",\"6f75519656d33a67487eb646ce64f43dca1d59b60c7fdd19424ca4780ce9aac7\",\"1939918c9cab2ad5d35868a231270719fcd1bde71f6931d47970c772fd01ce0a\",\"06768cfbe6f26a38c03706b5e19bfccadd67bfafbf60bff14fec915eb1c65bf1\",\"a3afa9795c9618f7a551ace4762be264f846ff6b1fbe5a33af99ff02b0c4c76b\"]}],\"cve_references\":[],\"visibility_gaps\":[\"Firewall logs cannot show the scanner's intent.\"],\"recommended_action_ids\":[\"ACT_MONITOR_AND_DIGEST\"],\"analyst_follow_up\":[\"Keep the source in the weekly digest.\"]}"
+              }
+            ]
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "evidence_agent",
+                "args": {}
+              },
+              {
+                "name": "context_agent",
+                "args": {}
+              }
+            ],
+            "tool_responses": [],
+            "intermediate_responses": []
+          },
+          "creation_timestamp": 0.0
+        }
+      ],
+      "session_input": {
+        "app_name": "forti-investigator",
+        "user_id": "system",
+        "state": {
+          "incident_id": "INC-F120640D0EFF",
+          "revision": 2,
+          "source_ip": "198.51.100.99",
+          "target_ip": "10.0.14.120",
+          "window_start_ns": 1791271946000000000,
+          "window_end_ns": 1791271947100000000,
+          "packet": {
+            "incident_id": "INC-F120640D0EFF",
+            "incident_revision": 2,
+            "visibility_scope": "FIREWALL_ONLY",
+            "source_ip": "198.51.100.99",
+            "target_ip": "10.0.14.120",
+            "target_app": "TCP/1000",
+            "first_seen": "2026-10-06 07:32:26+00:00",
+            "last_seen": "2026-10-06 07:32:27.100000+00:00",
+            "event_count": 12,
+            "enforcement": "BLOCKED",
+            "enforcement_counts": {
+              "BLOCKED": 12,
+              "ALLOWED": 0,
+              "ALLOWED_OR_DETECTED": 0,
+              "SESSION_CLOSED": 0,
+              "UNKNOWN": 0
+            },
+            "deterministic_rule_ids": [
+              "RULE_HIGH_FREQUENCY_SCANNER",
+              "RULE_PORT_SCAN_MULTI_SERVICE"
+            ],
+            "deterministic_severity_floor": "MEDIUM",
+            "deterministic_reasons": [
+              "Persistent external automated scanner detected (12 blocked attempts).",
+              "Source IP probed multiple distinct network services (12 events across multiple ports)."
+            ],
+            "signatures": [],
+            "evidence_events": [
+              {
+                "id": "2813d40b1142a71b925ea5a9d130e89bb5baf1834a04aae7ff90031d69a31db5",
+                "loki_ts_ns": 1791271946000000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40000,
+                "dstport": 1000,
+                "proto": 6,
+                "service": "TCP/1000",
+                "policyid": 0,
+                "sessionid": 200010,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "81874b0f07bf9b88125900b3e725f3fa42f8af5124f97970bd146421c5368b5c",
+                "loki_ts_ns": 1791271946100000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40001,
+                "dstport": 1001,
+                "proto": 6,
+                "service": "TCP/1001",
+                "policyid": 0,
+                "sessionid": 200011,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "1d26e39ed8f5d02b6f50c8832db1f3c24ac24ddd1378afb89aae4df492951863",
+                "loki_ts_ns": 1791271946200000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40002,
+                "dstport": 1002,
+                "proto": 6,
+                "service": "TCP/1002",
+                "policyid": 0,
+                "sessionid": 200012,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "771627cc4d487607a00c0755333441dc5ebb84f9448726cf8bd77f44548cd2f6",
+                "loki_ts_ns": 1791271946300000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40003,
+                "dstport": 1003,
+                "proto": 6,
+                "service": "TCP/1003",
+                "policyid": 0,
+                "sessionid": 200013,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "2fce3dd6f8f8e645fbd83295d2a9a6f89787c446ab9bd7448756423d09847c6b",
+                "loki_ts_ns": 1791271946400000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40004,
+                "dstport": 1004,
+                "proto": 6,
+                "service": "TCP/1004",
+                "policyid": 0,
+                "sessionid": 200014,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "49740679727090dcd8a415ac08fab8e4844001e5a286a11ea8c890a79947f65f",
+                "loki_ts_ns": 1791271946500000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40005,
+                "dstport": 1005,
+                "proto": 6,
+                "service": "TCP/1005",
+                "policyid": 0,
+                "sessionid": 200015,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "6f75519656d33a67487eb646ce64f43dca1d59b60c7fdd19424ca4780ce9aac7",
+                "loki_ts_ns": 1791271946600000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40006,
+                "dstport": 1006,
+                "proto": 6,
+                "service": "TCP/1006",
+                "policyid": 0,
+                "sessionid": 200016,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "1939918c9cab2ad5d35868a231270719fcd1bde71f6931d47970c772fd01ce0a",
+                "loki_ts_ns": 1791271946700000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40007,
+                "dstport": 1007,
+                "proto": 6,
+                "service": "TCP/1007",
+                "policyid": 0,
+                "sessionid": 200017,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "06768cfbe6f26a38c03706b5e19bfccadd67bfafbf60bff14fec915eb1c65bf1",
+                "loki_ts_ns": 1791271946800000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40008,
+                "dstport": 1008,
+                "proto": 6,
+                "service": "TCP/1008",
+                "policyid": 0,
+                "sessionid": 200018,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "a3afa9795c9618f7a551ace4762be264f846ff6b1fbe5a33af99ff02b0c4c76b",
+                "loki_ts_ns": 1791271946900000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40009,
+                "dstport": 1009,
+                "proto": 6,
+                "service": "TCP/1009",
+                "policyid": 0,
+                "sessionid": 200019,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "76fcb6c05b1c5ae0d5cdc0636bfa1c84c71fbed97f1852823efa2951103b8e0c",
+                "loki_ts_ns": 1791271947000000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40010,
+                "dstport": 1010,
+                "proto": 6,
+                "service": "TCP/1010",
+                "policyid": 0,
+                "sessionid": 200020,
+                "severity_raw": "notice"
+              },
+              {
+                "id": "62494f08b7825548b935926a47f4bc7b9360f24b710d569375e0d5e2b5b0498e",
+                "loki_ts_ns": 1791271947100000000,
+                "log_type": "traffic",
+                "subtype": "forward",
+                "action_normalized": "BLOCKED",
+                "action_raw": "deny",
+                "direction": "INBOUND",
+                "srcport": 40011,
+                "dstport": 1011,
+                "proto": 6,
+                "service": "TCP/1011",
+                "policyid": 0,
+                "sessionid": 200021,
+                "severity_raw": "notice"
+              }
+            ],
+            "action_catalog": [
+              {
+                "id": "ACT_SWITCH_IPS_TO_BLOCK",
+                "name": "Switch IPS Profile from Monitor to Protect",
+                "category": "PROFILE_TUNING",
+                "description": "Tune policy security profile to actively drop matching exploit signatures rather than monitor/passthrough.",
+                "risk_level": "MEDIUM",
+                "requires_approval": true
+              },
+              {
+                "id": "ACT_INSPECT_APPLICATION_LOGS",
+                "name": "Inspect Backend Web Application Logs",
+                "category": "INVESTIGATION_STEP",
+                "description": "Correlate FortiGate DPI timestamp with application access logs to verify backend HTTP response code.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              },
+              {
+                "id": "ACT_MONITOR_AND_DIGEST",
+                "name": "Log and Monitor in Weekly Threat Digest",
+                "category": "OBSERVATION",
+                "description": "No perimeter changes required; signature was contained by existing firewall drop rules.",
+                "risk_level": "LOW",
+                "requires_approval": false
+              }
+            ]
+          },
+          "eval_fixture": {
+            "traffic_lines": [
+              [
+                1791271946000000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200010 srcip=198.51.100.99 srcport=40000 dstip=10.0.14.120 dstport=1000 proto=6 service=\"TCP/1000\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946100000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200011 srcip=198.51.100.99 srcport=40001 dstip=10.0.14.120 dstport=1001 proto=6 service=\"TCP/1001\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946200000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200012 srcip=198.51.100.99 srcport=40002 dstip=10.0.14.120 dstport=1002 proto=6 service=\"TCP/1002\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946300000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200013 srcip=198.51.100.99 srcport=40003 dstip=10.0.14.120 dstport=1003 proto=6 service=\"TCP/1003\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946400000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200014 srcip=198.51.100.99 srcport=40004 dstip=10.0.14.120 dstport=1004 proto=6 service=\"TCP/1004\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946500000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200015 srcip=198.51.100.99 srcport=40005 dstip=10.0.14.120 dstport=1005 proto=6 service=\"TCP/1005\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946600000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200016 srcip=198.51.100.99 srcport=40006 dstip=10.0.14.120 dstport=1006 proto=6 service=\"TCP/1006\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946700000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200017 srcip=198.51.100.99 srcport=40007 dstip=10.0.14.120 dstport=1007 proto=6 service=\"TCP/1007\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946800000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200018 srcip=198.51.100.99 srcport=40008 dstip=10.0.14.120 dstport=1008 proto=6 service=\"TCP/1008\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271946900000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200019 srcip=198.51.100.99 srcport=40009 dstip=10.0.14.120 dstport=1009 proto=6 service=\"TCP/1009\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271947000000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200020 srcip=198.51.100.99 srcport=40010 dstip=10.0.14.120 dstport=1010 proto=6 service=\"TCP/1010\" action=\"deny\" policyid=0"
+              ],
+              [
+                1791271947100000000,
+                "date=2026-10-06 time=12:00:05 devname=\"FGT\" devid=\"FGT1\" logid=\"0000000013\" type=\"traffic\" subtype=\"forward\" level=\"notice\" vd=\"root\" sessionid=200021 srcip=198.51.100.99 srcport=40011 dstip=10.0.14.120 dstport=1011 proto=6 service=\"TCP/1011\" action=\"deny\" policyid=0"
+              ]
+            ],
+            "recent_incidents": []
+          }
+        }
+      },
+      "creation_timestamp": 0.0
+    }
+  ],
+  "creation_timestamp": 0.0
+}
